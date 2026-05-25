@@ -1,0 +1,63 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# ── PyInstaller build artefacts ───────────────────────────────────────────────
+build/
+dist/
+*.spec
+
+# ── Database — never commit live data ────────────────────────────────────────
+united_mobile.db
+backups/
+
+# ── Installer output ──────────────────────────────────────────────────────────
+installer/
+
+# ── Update packages ───────────────────────────────────────────────────────────
+UnitedMobile_Update_*/
+UnitedMobile_Update_*.zip
+
+# ── React Native / Node ───────────────────────────────────────────────────────
+mobile_app/UnitedMobileApp/node_modules/
+mobile_app/UnitedMobileApp/.gradle/
+mobile_app/UnitedMobileApp/android/.gradle/
+mobile_app/UnitedMobileApp/android/build/
+mobile_app/UnitedMobileApp/android/app/build/
+mobile_app/UnitedMobileApp/android/local.properties
+
+# ── Pre-built APKs (build from source instead) ───────────────────────────────
+*.apk
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+rn_build*.log
+
+# ── Screenshots / temp images (not source) ───────────────────────────────────
+home.png
+screen.png
+t1.png
+t2.png
+t3.png
+t4.png
+um_s*.png
+um_v2*.png
+um_screen*.png
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/
+
+# ── Misc UI exports ───────────────────────────────────────────────────────────
+ui.xml
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
