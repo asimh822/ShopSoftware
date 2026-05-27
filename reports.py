@@ -328,6 +328,69 @@ def db_profit_report(from_iso=None, to_iso=None):
     return rows
 
 
+def db_expenses_by_category(from_iso: str, to_iso: str, category: str = "") -> dict:
+    """
+    Returns expense totals grouped by category for a date range.
+
+    Parameters
+    ----------
+    from_iso, to_iso : str   e.g. "2026-01-01"
+    category         : str   empty = all categories
+
+    Returns
+    -------
+    {
+      "rows": [{"category": str, "count": int, "total": float}, ...],
+      "grand_total": float,
+      "grand_count": int,
+    }
+    """
+    de = "substr(e.date,7,4)||'-'||substr(e.date,4,2)||'-'||substr(e.date,1,2)"
+    conds  = [f"{de} >= ?", f"{de} <= ?"]
+    params = [from_iso, to_iso]
+    if category:
+        conds.append("e.category = ?")
+        params.append(category)
+    where = "WHERE " + " AND ".join(conds)
+
+    conn = get_connection()
+    rows = conn.execute(f"""
+        SELECT e.category,
+               COUNT(*)       AS cnt,
+               SUM(e.amount)  AS total
+        FROM expenses e
+        {where}
+        GROUP BY e.category
+        ORDER BY total DESC
+    """, params).fetchall()
+
+    detail = conn.execute(f"""
+        SELECT e.expense_number, e.date, e.category,
+               COALESCE(e.description,'') AS description,
+               e.amount, e.payment_method,
+               COALESCE(ba.name,'') AS bank_name
+        FROM expenses e
+        LEFT JOIN bank_accounts ba ON ba.id = e.bank_account_id
+        {where}
+        ORDER BY {de}, e.expense_number
+    """, params).fetchall()
+
+    conn.close()
+
+    grouped = [{"category": r["category"],
+                "count":    int(r["cnt"]),
+                "total":    float(r["total"] or 0)} for r in rows]
+    grand_total = sum(g["total"] for g in grouped)
+    grand_count = sum(g["count"] for g in grouped)
+
+    return {
+        "rows":        grouped,
+        "detail":      [dict(d) for d in detail],
+        "grand_total": grand_total,
+        "grand_count": grand_count,
+    }
+
+
 def db_cash_book(date_str: str) -> dict:
     """
     Returns cash book data for a single date (DD/MM/YYYY).
@@ -380,6 +443,9 @@ def db_cash_book(date_str: str) -> dict:
              f" WHERE cjl.direction='out' AND {de_cjl}<?", (iso,))
         - _q(f"SELECT COALESCE(SUM(pv.cash_amount),0) FROM purchase_vouchers pv"
              f" WHERE pv.purchase_type='cash' AND pv.cash_amount>0 AND {de_pv}<?", (iso,))
+        - _q(f"SELECT COALESCE(SUM(e.amount),0) FROM expenses e"
+             f" WHERE e.payment_method='cash'"
+             f" AND {_de('e.date')}<?", (iso,))
     )
 
     # ── Opening Bank — all bank movements BEFORE iso ──────────────────────
@@ -522,6 +588,37 @@ def db_cash_book(date_str: str) -> dict:
                          "cash_in": 0.0, "cash_out": camnt})
             rows.append({"date": date, "voucher": pv_no,
                          "description": f"Cash Purchase (Split-Bank/{bname}) — {ref}",
+                         "cash_in": 0.0, "cash_out": 0.0})
+
+    # 5. Expenses
+    de_e = _de("e.date")
+    exp_rows = conn.execute(f"""
+        SELECT e.expense_number, e.date, e.category,
+               COALESCE(e.description, '') AS description,
+               e.amount, e.payment_method,
+               COALESCE(ba.name, 'Bank') AS bank_name
+        FROM expenses e
+        LEFT JOIN bank_accounts ba ON ba.id = e.bank_account_id
+        WHERE {de_e}=?
+        ORDER BY e.expense_number
+    """, (iso,)).fetchall()
+
+    for ex in exp_rows:
+        desc_part = f" ({ex['description']})" if ex['description'] else ''
+        pm        = ex['payment_method']
+        cat       = ex['category']
+        amt       = float(ex['amount'] or 0)
+        bname     = ex['bank_name']
+        exp_no    = ex['expense_number']
+        date      = ex['date']
+
+        if pm == 'cash':
+            rows.append({"date": date, "voucher": exp_no,
+                         "description": f"Expense — {cat}{desc_part} (Cash)",
+                         "cash_in": 0.0, "cash_out": amt})
+        else:  # bank — informational only; bank balance tracked via bank_transactions
+            rows.append({"date": date, "voucher": exp_no,
+                         "description": f"Expense — {cat}{desc_part} (Bank/{bname})",
                          "cash_in": 0.0, "cash_out": 0.0})
 
     # Keep rows in voucher-number order
@@ -1024,6 +1121,24 @@ class PurchaseReportTab(QWidget):
 
 # ── Tab 5: Profit Report ──────────────────────────────────────────────────────
 
+def _profit_summary_card(title: str) -> tuple:
+    """Return (QFrame card, value QLabel) for one profit summary metric."""
+    card = QFrame()
+    card.setStyleSheet(
+        "background:#ffffff; border:1px solid #e2e8f0; border-radius:8px;"
+    )
+    vl = QVBoxLayout(card)
+    vl.setContentsMargins(14, 10, 14, 10)
+    vl.setSpacing(4)
+    lbl_title = QLabel(title)
+    lbl_title.setStyleSheet("color:#64748b; font-size:9pt; border:none;")
+    lbl_val = QLabel("Rs. 0")
+    lbl_val.setStyleSheet("color:#1e293b; font-size:11pt; font-weight:bold; border:none;")
+    vl.addWidget(lbl_title)
+    vl.addWidget(lbl_val)
+    return card, lbl_val
+
+
 class ProfitReportTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1050,6 +1165,22 @@ class ProfitReportTab(QWidget):
             btn_search, None,
         ))
 
+        # ── Summary cards row ─────────────────────────────────────────────
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+
+        c1, self._lbl_revenue  = _profit_summary_card("Sales Revenue")
+        c2, self._lbl_cost     = _profit_summary_card("Purchase Cost")
+        c3, self._lbl_gross    = _profit_summary_card("Gross Profit")
+        c4, self._lbl_expenses = _profit_summary_card("Total Expenses")
+        c5, self._lbl_net      = _profit_summary_card("Net Profit")
+
+        for c in (c1, c2, c3, c4, c5):
+            cards_row.addWidget(c)
+
+        layout.addLayout(cards_row)
+
+        # ── Detail table ──────────────────────────────────────────────────
         self.table = _make_table(
             ["Date Sold", "Brand", "Model", "IMEI",
              "Purchase Price (PKR)", "Sale Price (PKR)", "Profit (PKR)"]
@@ -1067,11 +1198,15 @@ class ProfitReportTab(QWidget):
 
     def refresh(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
-        to_iso = self.to_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
         rows = db_profit_report(from_iso, to_iso)
+
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        total_profit = 0.0
+        total_revenue = 0.0
+        total_cost    = 0.0
+        total_profit  = 0.0
+
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
@@ -1091,13 +1226,52 @@ class ProfitReportTab(QWidget):
                     )
                     item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
                 self.table.setItem(row, col, item)
-            total_profit += r["profit"] or 0
+            total_revenue += float(r["final_price"]    or 0)
+            total_cost    += float(r["purchase_price"] or 0)
+            total_profit  += float(r["profit"]         or 0)
+
         self.table.setSortingEnabled(True)
+
+        # ── Expenses for the same date range ──────────────────────────────
+        conn = get_connection()
+        de_e = "substr(e.date,7,4)||'-'||substr(e.date,4,2)||'-'||substr(e.date,1,2)"
+        total_expenses = float(conn.execute(
+            f"SELECT COALESCE(SUM(e.amount),0) FROM expenses e"
+            f" WHERE {de_e} >= ? AND {de_e} <= ?",
+            (from_iso, to_iso),
+        ).fetchone()[0] or 0)
+        conn.close()
+
+        net_profit = total_profit - total_expenses
+
+        # ── Update summary cards ──────────────────────────────────────────
+        def _color_val(lbl: QLabel, amount: float, neutral: bool = False):
+            if neutral:
+                color = "#1e293b"
+            else:
+                color = "#16a34a" if amount >= 0 else "#dc2626"
+            lbl.setStyleSheet(
+                f"color:{color}; font-size:11pt; font-weight:bold; border:none;"
+            )
+            lbl.setText(f"Rs. {fmt_pkr(amount)}")
+
+        _color_val(self._lbl_revenue,  total_revenue,  neutral=True)
+        _color_val(self._lbl_cost,     total_cost,     neutral=True)
+        _color_val(self._lbl_gross,    total_profit)
+        _color_val(self._lbl_expenses, total_expenses, neutral=True)
+        _color_val(self._lbl_net,      net_profit)
+
+        # ── Footer ───────────────────────────────────────────────────────
         n = len(rows)
         profit_color = "#16a34a" if total_profit >= 0 else "#dc2626"
         self.footer.setText(
             f"{n} item{'s' if n != 1 else ''} sold    |    "
-            f"<span style='color:{profit_color};'>Total Profit: PKR {fmt_pkr(total_profit)}</span>"
+            f"<span style='color:{profit_color};'>Gross Profit: Rs. {fmt_pkr(total_profit)}</span>"
+            f"    |    "
+            f"Expenses: Rs. {fmt_pkr(total_expenses)}"
+            f"    |    "
+            f"<span style='color:{'#16a34a' if net_profit >= 0 else '#dc2626'};'>"
+            f"Net Profit: Rs. {fmt_pkr(net_profit)}</span>"
         )
         self.footer.setTextFormat(Qt.TextFormat.RichText)
 
@@ -1740,6 +1914,206 @@ class CustomerInsightsTab(QWidget):
         _export_table_csv(self.table, f"CustomerInsights_{today}.csv", self)
 
 
+# ── Tab 9: Expenses by Category ───────────────────────────────────────────────
+
+_EXPENSE_CATEGORIES = [
+    "Rent", "Salaries", "Electricity", "Internet", "Travel", "Miscellaneous"
+]
+
+
+class ExpensesReportTab(QWidget):
+    """
+    Shows expenses grouped by category for a date range.
+    Summary table: Category | Count | Total Amount.
+    Expandable detail section below (all individual rows for the period).
+    CSV export.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        self._detail_data = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # ── Filter card ──────────────────────────────────────────────────
+        filter_card = QFrame()
+        filter_card.setStyleSheet(CARD_STYLE)
+        fl = QHBoxLayout(filter_card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(10)
+
+        fl.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        fl.addWidget(self.from_date)
+
+        fl.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        fl.addWidget(self.to_date)
+
+        fl.addWidget(QLabel("Category:"))
+        self.cat_combo = QComboBox()
+        self.cat_combo.addItem("All Categories", "")
+        for c in _EXPENSE_CATEGORIES:
+            self.cat_combo.addItem(c, c)
+        self.cat_combo.setMinimumWidth(140)
+        fl.addWidget(self.cat_combo)
+
+        btn_search = QPushButton("Search")
+        btn_search.setStyleSheet(BTN_SECONDARY)
+        btn_search.clicked.connect(self.refresh)
+        fl.addWidget(btn_search)
+
+        fl.addStretch()
+
+        btn_export = QPushButton("⬇ Export CSV")
+        btn_export.setStyleSheet(BTN_PRIMARY)
+        btn_export.clicked.connect(self._export)
+        fl.addWidget(btn_export)
+
+        layout.addWidget(filter_card)
+
+        # ── Summary table (by category) ──────────────────────────────────
+        self.summary_table = _make_table(["Category", "No. of Expenses", "Total Amount (Rs.)"])
+        self.summary_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.summary_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.summary_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.summary_table.horizontalHeader().setStretchLastSection(False)
+        self.summary_table.setMaximumHeight(260)
+        layout.addWidget(self.summary_table)
+
+        # ── Total footer ─────────────────────────────────────────────────
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+        # ── Detail table (all individual expenses) ────────────────────────
+        detail_label = QLabel("Individual Expenses")
+        detail_label.setStyleSheet("color:#475569; font-size:9pt; font-weight:bold;")
+        layout.addWidget(detail_label)
+
+        self.detail_table = _make_table(
+            ["Date", "Expense #", "Category", "Description",
+             "Amount (Rs.)", "Payment", "Bank"]
+        )
+        hdr = self.detail_table.horizontalHeader()
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setStretchLastSection(False)
+        layout.addWidget(self.detail_table, stretch=1)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        category = self.cat_combo.currentData()
+
+        data = db_expenses_by_category(from_iso, to_iso, category)
+
+        # ── Populate summary table ────────────────────────────────────────
+        self.summary_table.setSortingEnabled(False)
+        self.summary_table.setRowCount(0)
+
+        max_total = max((r["total"] for r in data["rows"]), default=1) or 1
+
+        for r in data["rows"]:
+            row = self.summary_table.rowCount()
+            self.summary_table.insertRow(row)
+
+            # Category name with a subtle bar indicator
+            pct   = int(r["total"] / max_total * 100)
+            bar   = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            cat_item = QTableWidgetItem(f"{r['category']}  {bar}")
+            cat_item.setForeground(QBrush(QColor("#1e293b")))
+            self.summary_table.setItem(row, 0, cat_item)
+
+            cnt_item = QTableWidgetItem(str(r["count"]))
+            cnt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.summary_table.setItem(row, 1, cnt_item)
+
+            amt_item = QTableWidgetItem(fmt_pkr(r["total"]))
+            amt_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            amt_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            self.summary_table.setItem(row, 2, amt_item)
+
+        self.summary_table.setSortingEnabled(True)
+
+        # Footer
+        n = data["grand_count"]
+        t = data["grand_total"]
+        self.footer.setText(
+            f"{n} expense{'s' if n != 1 else ''}    |    "
+            f"Grand Total:  Rs. {fmt_pkr(t)}"
+        )
+
+        # ── Populate detail table ─────────────────────────────────────────
+        self.detail_table.setSortingEnabled(False)
+        self.detail_table.setRowCount(0)
+        self._detail_data = data["detail"]
+
+        for d in data["detail"]:
+            row = self.detail_table.rowCount()
+            self.detail_table.insertRow(row)
+            self.detail_table.setItem(row, 0, QTableWidgetItem(d["date"]))
+            self.detail_table.setItem(row, 1, QTableWidgetItem(d["expense_number"]))
+            self.detail_table.setItem(row, 2, QTableWidgetItem(d["category"]))
+            self.detail_table.setItem(row, 3, QTableWidgetItem(d["description"]))
+            amt = QTableWidgetItem(fmt_pkr(d["amount"]))
+            amt.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.detail_table.setItem(row, 4, amt)
+            self.detail_table.setItem(row, 5, QTableWidgetItem(
+                d["payment_method"].capitalize()
+            ))
+            self.detail_table.setItem(row, 6, QTableWidgetItem(d["bank_name"]))
+
+        self.detail_table.setSortingEnabled(True)
+
+    def _export(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        default  = f"Expenses_{from_iso}_to_{to_iso}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Expenses", default, "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    ["Date", "Expense #", "Category", "Description",
+                     "Amount", "Payment Method", "Bank"]
+                )
+                for d in self._detail_data:
+                    writer.writerow([
+                        d["date"], d["expense_number"], d["category"],
+                        d["description"], d["amount"],
+                        d["payment_method"], d["bank_name"],
+                    ])
+            QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
+        except Exception as ex:
+            QMessageBox.warning(self, "Export Error", str(ex))
+
+
 # ── Reports Page ──────────────────────────────────────────────────────────────
 
 class ReportsPage(QWidget):
@@ -1781,6 +2155,7 @@ class ReportsPage(QWidget):
         self._tab_profit     = ProfitReportTab()
         self._tab_cashbook   = CashBookTab()
         self._tab_customers  = CustomerInsightsTab()
+        self._tab_expenses   = ExpensesReportTab()
 
         self.tabs.addTab(self._tab_stock,      "Stock Summary")
         self.tabs.addTab(self._tab_imei_stock, "IMEI Stock")
@@ -1790,6 +2165,7 @@ class ReportsPage(QWidget):
         self.tabs.addTab(self._tab_profit,     "Profit")
         self.tabs.addTab(self._tab_cashbook,   "Cash Book")
         self.tabs.addTab(self._tab_customers,  "Customer Insights")
+        self.tabs.addTab(self._tab_expenses,   "Expenses")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
         layout.addWidget(self.tabs)

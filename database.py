@@ -5,7 +5,7 @@ import os
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 # Increment this whenever a new _migrate_vN function is added below.
-CURRENT_DB_VERSION = 3
+CURRENT_DB_VERSION = 4
 
 
 def get_connection():
@@ -211,6 +211,7 @@ def _run_migrations(conn) -> None:
         1: _migrate_v1,
         2: _migrate_v2,
         3: _migrate_v3,
+        4: _migrate_v4,
     }
 
     current = _get_db_version(conn)
@@ -459,6 +460,224 @@ def _migrate_v3(conn) -> None:
         INSERT OR IGNORE INTO suppliers (id, name, contact, opening_balance)
         VALUES (0, 'Cash Purchase', '', 0)
     """)
+
+
+def _migrate_v4(conn) -> None:
+    """
+    Version 4 — Expenses module.
+    Creates the expenses table and seeds the EXP number counter.
+    Do NOT add a conn.commit() here — _run_migrations() commits per version.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            expense_number  TEXT UNIQUE NOT NULL,
+            date            TEXT NOT NULL,
+            category        TEXT NOT NULL,
+            description     TEXT,
+            amount          REAL NOT NULL,
+            payment_method  TEXT CHECK(payment_method IN ('cash', 'bank')),
+            bank_account_id INTEGER REFERENCES bank_accounts(id),
+            bank_ref        TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('last_exp_number', '0')"
+    )
+
+
+# ── Expense helpers ───────────────────────────────────────────────────────────
+
+EXPENSE_CATEGORIES = [
+    "Rent",
+    "Salaries",
+    "Electricity",
+    "Internet",
+    "Travel",
+    "Miscellaneous",
+]
+
+
+def db_save_expense(date_str: str, category: str, description: str,
+                    amount: float, payment_method: str,
+                    bank_account_id=None, bank_ref: str = "",
+                    expense_id=None) -> dict:
+    """
+    Insert a new expense or update an existing one.
+    On insert: auto-generates EXP-XXXX number, adjusts cash/bank balance.
+    On update: reverses the old balance effect, applies the new one.
+    Returns {'ok': True, 'expense_number': '...'} or {'ok': False, 'error': '...'}.
+    """
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+
+        if expense_id:
+            # ── Edit mode — fetch old record to reverse its balance effect ────
+            old = c.execute(
+                "SELECT payment_method, bank_account_id, amount FROM expenses WHERE id=?",
+                (expense_id,)
+            ).fetchone()
+            if not old:
+                conn.close()
+                return {'ok': False, 'error': 'Expense not found.'}
+
+            # Reverse old bank transaction if it was a bank expense
+            if old['payment_method'] == 'bank' and old['bank_account_id']:
+                # Old entry was CR (bank ↓); to reverse, delete that bank_transaction row
+                c.execute(
+                    "DELETE FROM bank_transactions WHERE voucher_number=("
+                    "  SELECT expense_number FROM expenses WHERE id=?)",
+                    (expense_id,)
+                )
+
+            # Update the expense record
+            c.execute("""
+                UPDATE expenses
+                SET date=?, category=?, description=?, amount=?,
+                    payment_method=?, bank_account_id=?, bank_ref=?
+                WHERE id=?
+            """, (date_str, category, description or '', amount,
+                  payment_method, bank_account_id, bank_ref or '', expense_id))
+
+            # Fetch updated expense_number for bank re-entry
+            exp_num = c.execute(
+                "SELECT expense_number FROM expenses WHERE id=?", (expense_id,)
+            ).fetchone()[0]
+
+        else:
+            # ── Insert mode — generate EXP number ────────────────────────────
+            row = c.execute(
+                "SELECT value FROM settings WHERE key='last_exp_number'"
+            ).fetchone()
+            n = int(row['value']) + 1 if row else 1
+            c.execute(
+                "UPDATE settings SET value=? WHERE key='last_exp_number'", (str(n),)
+            )
+            exp_num = f"EXP-{n:04d}"
+            c.execute("""
+                INSERT INTO expenses
+                (expense_number, date, category, description, amount,
+                 payment_method, bank_account_id, bank_ref)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (exp_num, date_str, category, description or '', amount,
+                  payment_method, bank_account_id, bank_ref or ''))
+
+        # ── Record bank outflow for bank expenses ─────────────────────────────
+        # Uses expense_number as the voucher_number for traceability.
+        # CR = money OUT of bank (expense paid from bank).
+        if payment_method == 'bank' and bank_account_id:
+            c.execute("""
+                INSERT OR REPLACE INTO bank_transactions
+                (voucher_number, type, bank_account_id, source, date, amount, notes)
+                VALUES (?,?,?,?,?,?,?)
+            """, (exp_num, 'CR', bank_account_id, 'expense',
+                  date_str, amount,
+                  f"Expense — {category}" + (f" ({description})" if description else '')))
+
+        conn.commit()
+        return {'ok': True, 'expense_number': exp_num}
+    except Exception as e:
+        conn.rollback()
+        return {'ok': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+def db_delete_expense(expense_id: int) -> dict:
+    """
+    Delete an expense and reverse its balance effect.
+    Returns {'ok': True} or {'ok': False, 'error': '...'}.
+    """
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT expense_number, payment_method, bank_account_id FROM expenses WHERE id=?",
+            (expense_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return {'ok': False, 'error': 'Expense not found.'}
+
+        # Remove bank_transaction record if it was a bank expense
+        if row['payment_method'] == 'bank' and row['bank_account_id']:
+            c.execute(
+                "DELETE FROM bank_transactions WHERE voucher_number=?",
+                (row['expense_number'],)
+            )
+
+        c.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+        conn.commit()
+        return {'ok': True}
+    except Exception as e:
+        conn.rollback()
+        return {'ok': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+def db_expenses(date_from: str = '', date_to: str = '',
+                category: str = '', search: str = '') -> list:
+    """
+    Fetch expenses with optional filters.
+    date_from / date_to: DD/MM/YYYY strings (empty = no bound).
+    Returns list of dicts.
+    """
+    conn = get_connection()
+
+    # Convert DD/MM/YYYY → YYYY-MM-DD for ISO comparison
+    def _to_iso(ddmmyyyy: str) -> str:
+        try:
+            d, m, y = ddmmyyyy.strip().split('/')
+            return f"{y}-{m}-{d}"
+        except Exception:
+            return ''
+
+    def _date_expr(col: str) -> str:
+        return (f"substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2)")
+
+    where = []
+    params = []
+
+    if date_from:
+        iso = _to_iso(date_from)
+        if iso:
+            where.append(f"{_date_expr('date')} >= ?")
+            params.append(iso)
+    if date_to:
+        iso = _to_iso(date_to)
+        if iso:
+            where.append(f"{_date_expr('date')} <= ?")
+            params.append(iso)
+    if category:
+        where.append("category = ?")
+        params.append(category)
+    if search:
+        where.append("description LIKE ?")
+        params.append(f"%{search}%")
+
+    sql = "SELECT e.*, ba.name AS bank_name FROM expenses e LEFT JOIN bank_accounts ba ON ba.id=e.bank_account_id"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY " + _date_expr('e.date') + " DESC, e.id DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def db_expense_by_id(expense_id: int) -> dict | None:
+    """Fetch a single expense record by id."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT e.*, ba.name AS bank_name FROM expenses e "
+        "LEFT JOIN bank_accounts ba ON ba.id=e.bank_account_id "
+        "WHERE e.id=?",
+        (expense_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def next_voucher_number(prefix: str, counter_key: str) -> str:
@@ -710,6 +929,8 @@ def db_cash_in_hand() -> float:
             - COALESCE((SELECT SUM(amount) FROM cash_journal_lines WHERE direction='out'), 0)
             - COALESCE((SELECT SUM(cash_amount) FROM purchase_vouchers
                         WHERE purchase_type='cash' AND cash_amount > 0), 0)
+            - COALESCE((SELECT SUM(amount) FROM expenses
+                        WHERE payment_method='cash'), 0)
     """).fetchone()[0]
     conn.close()
     return cash_ob + float(result or 0.0)
@@ -960,6 +1181,7 @@ def db_perform_year_end_close(archive_path: str):
             "purchase_lines", "purchase_vouchers",
             "payments", "journal_entries",
             "bank_transactions", "cash_journal_lines",
+            "expenses",
         ]:
             c.execute(f"DELETE FROM {tbl}")
 
@@ -971,6 +1193,7 @@ def db_perform_year_end_close(archive_path: str):
             "last_pv_number", "last_sv_number",
             "last_cp_number", "last_cr_number",
             "last_jv_number", "last_sr_number", "last_pr_number",
+            "last_exp_number",
         ]:
             c.execute("UPDATE settings SET value='0' WHERE key=?", (key,))
 
