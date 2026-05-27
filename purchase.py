@@ -118,8 +118,11 @@ def _make_table(headers):
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def db_suppliers_list():
+    """Returns all real suppliers. Excludes id=0 (system 'Cash Purchase' record)."""
     conn = get_connection()
-    rows = conn.execute("SELECT id, name FROM suppliers ORDER BY name").fetchall()
+    rows = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
     conn.close()
     return rows
 
@@ -182,7 +185,7 @@ def db_save_purchase(date_str, supplier_id, notes, lines,
                       bank_account_id=None, bank_ref=""):
     """
     lines = [(model_id, imei, price), ...]  Returns pv_number.
-    For cash purchases: supplier_id=None, egadget_ref required.
+    For cash purchases: supplier_id=0 (system record), egadget_ref required.
     Bank outflow (if bank_amount > 0) is recorded in bank_transactions.
     """
     conn = get_connection()
@@ -1564,7 +1567,7 @@ class PurchaseForm(QWidget):
 
             try:
                 pv_number = db_save_purchase(
-                    date_str, None, notes, db_lines,
+                    date_str, 0, notes, db_lines,
                     purchase_type="cash",
                     egadget_ref=egadget_ref,
                     payment_method=pm,

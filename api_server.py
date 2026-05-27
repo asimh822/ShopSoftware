@@ -577,7 +577,7 @@ def api_purchase():
             return jsonify({"success": False, "error": "supplier_id is required"}), 400
 
     elif purchase_type == "cash":
-        supplier_id    = None
+        supplier_id    = 0   # system 'Cash Purchase' supplier — id=0, never NULL
         egadget_ref    = (data.get("egadget_ref") or "").strip()
         payment_method = (data.get("payment_method") or "cash").strip().lower()
         cash_amount    = float(data.get("cash_amount") or 0)

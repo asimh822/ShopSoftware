@@ -83,10 +83,11 @@ def _to_iso(ddmmyyyy: str) -> str:
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def db_parties_list(party_type: str):
+    """id=0 is the system 'Cash Purchase' supplier — excluded from all party lists."""
     conn = get_connection()
     if party_type == "supplier":
         rows = conn.execute(
-            "SELECT id, name FROM suppliers ORDER BY name"
+            "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -826,7 +827,7 @@ def _build_accounts_combo(combo: QComboBox):
         combo.addItem(f"Bank — {a['name']}", {"type": "bank", "id": a["id"]})
     conn = get_connection()
     suppliers = conn.execute(
-        "SELECT id, name FROM suppliers ORDER BY name"
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
     ).fetchall()
     customers = conn.execute(
         "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"

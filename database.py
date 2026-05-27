@@ -5,7 +5,7 @@ import os
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 # Increment this whenever a new _migrate_vN function is added below.
-CURRENT_DB_VERSION = 2
+CURRENT_DB_VERSION = 3
 
 
 def get_connection():
@@ -210,6 +210,7 @@ def _run_migrations(conn) -> None:
     _MIGRATIONS: dict[int, callable] = {
         1: _migrate_v1,
         2: _migrate_v2,
+        3: _migrate_v3,
     }
 
     current = _get_db_version(conn)
@@ -418,7 +419,11 @@ def _migrate_v1(conn) -> None:
 def _migrate_v2(conn) -> None:
     """
     Version 2 — Cash Purchase support.
-    Adds columns to purchase_vouchers for buying from walk-in sellers (no supplier).
+    1. Adds columns to purchase_vouchers for buying from walk-in sellers.
+    2. Inserts the system 'Cash Purchase' supplier with id=0 — this record is
+       used as supplier_id for all cash purchases instead of NULL, so every
+       purchase_voucher always has a valid supplier_id.  id=0 is filtered out
+       of every user-facing supplier dropdown and ledger list.
     Do NOT add a conn.commit() here — _run_migrations() commits per version.
     """
     c = conn.cursor()
@@ -437,6 +442,23 @@ def _migrate_v2(conn) -> None:
             )
         except Exception:
             pass  # column already exists — safe to ignore
+
+    # NOTE: id=0 supplier INSERT was moved to _migrate_v3 so it runs as a
+    # separate idempotent migration step on databases that already completed v2.
+
+
+def _migrate_v3(conn) -> None:
+    """
+    Version 3 — Insert system 'Cash Purchase' supplier (id=0).
+    Uses INSERT OR IGNORE so re-running is always safe.
+    id=0 is excluded from every user-facing supplier dropdown and ledger query;
+    it exists purely so that purchase_vouchers.supplier_id is never NULL.
+    Do NOT add a conn.commit() here — _run_migrations() commits per version.
+    """
+    conn.execute("""
+        INSERT OR IGNORE INTO suppliers (id, name, contact, opening_balance)
+        VALUES (0, 'Cash Purchase', '', 0)
+    """)
 
 
 def next_voucher_number(prefix: str, counter_key: str) -> str:
@@ -826,7 +848,7 @@ def db_year_end_summary(year_start_iso: str, year_end_iso: str) -> dict:
     ).fetchone()[0]
 
     suppliers = conn.execute(
-        "SELECT id, name FROM suppliers ORDER BY name"
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
     ).fetchall()
     customers = conn.execute(
         "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
@@ -890,7 +912,8 @@ def db_perform_year_end_close(archive_path: str):
     c = conn.cursor()
     try:
         # ── 2a. Carry forward supplier balances ──────────────────────────────
-        suppliers = c.execute("SELECT id FROM suppliers").fetchall()
+        # id=0 is the system 'Cash Purchase' supplier — no balance to carry.
+        suppliers = c.execute("SELECT id FROM suppliers WHERE id != 0").fetchall()
         for sup in suppliers:
             bal = _party_closing_balance(conn, "supplier", sup["id"])
             c.execute(

@@ -144,8 +144,11 @@ def db_models_list(brand_id=None):
 
 
 def db_suppliers_list():
+    """Returns all real suppliers. Excludes id=0 (system 'Cash Purchase' record)."""
     conn = get_connection()
-    rows = conn.execute("SELECT id, name FROM suppliers ORDER BY name").fetchall()
+    rows = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
     conn.close()
     return rows
 

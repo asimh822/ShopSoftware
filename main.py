@@ -420,8 +420,8 @@ class DashboardPage(QWidget):
 
             sup_outstanding = conn.execute("""
                 SELECT
-                    COALESCE((SELECT SUM(opening_balance) FROM suppliers), 0) +
-                    COALESCE((SELECT SUM(total_amount) FROM purchase_vouchers), 0) -
+                    COALESCE((SELECT SUM(opening_balance) FROM suppliers WHERE id != 0), 0) +
+                    COALESCE((SELECT SUM(total_amount) FROM purchase_vouchers WHERE supplier_id != 0), 0) -
                     COALESCE((SELECT SUM(amount) FROM payments WHERE party_type='supplier' AND type='CP'), 0) +
                     COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='supplier' AND type='debit'), 0) -
                     COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='supplier' AND type='credit'), 0)

@@ -204,9 +204,11 @@ def db_delete_model(model_id):
 
 
 def db_suppliers():
+    """Returns all real suppliers. Excludes id=0 (system 'Cash Purchase' record)."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, name, contact, opening_balance FROM suppliers ORDER BY name"
+        "SELECT id, name, contact, opening_balance FROM suppliers"
+        " WHERE id != 0 ORDER BY name"
     ).fetchall()
     conn.close()
     return rows
