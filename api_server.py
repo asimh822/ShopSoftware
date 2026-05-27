@@ -536,8 +536,17 @@ def api_sale():
 
 # ═════════════════════════════════════════════════════════════════════════════
 # POST /api/purchase
-# Payload: { supplier_id, date, salesman_id, notes?,
-#            lines: [{ imei, model_id, purchase_price }] }
+#
+# Supplier purchase payload:
+#   { purchase_type:"supplier", supplier_id, date, salesman_id, notes?,
+#     lines: [{ imei, model_id, purchase_price }] }
+#
+# Cash purchase payload (walk-in seller, no supplier):
+#   { purchase_type:"cash", egadget_ref, date, salesman_id,
+#     payment_method:"cash"|"bank"|"split",
+#     cash_amount, bank_amount, bank_account_id, bank_ref?,
+#     lines: [{ imei, model_id, purchase_price }] }
+#
 # Returns: { success, pv_number }
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -546,27 +555,67 @@ def api_sale():
 def api_purchase():
     data = request.get_json(force=True, silent=True) or {}
 
-    salesman_id  = data.get("salesman_id")
-    supplier_id  = data.get("supplier_id")
-    date_str     = (data.get("date") or _date.today().strftime("%d/%m/%Y")).strip()
-    notes        = (data.get("notes") or "").strip()
-    lines        = data.get("lines") or []
+    purchase_type = (data.get("purchase_type") or "supplier").strip().lower()
+    salesman_id   = data.get("salesman_id")
+    date_str      = (data.get("date") or _date.today().strftime("%d/%m/%Y")).strip()
+    notes         = (data.get("notes") or "").strip()
+    lines         = data.get("lines") or []
 
-    if not supplier_id:
-        return jsonify({"success": False, "error": "supplier_id is required"}), 400
     if not lines:
         return jsonify({"success": False, "error": "At least one item is required"}), 400
+
+    # ── Validate by purchase type ─────────────────────────────────────────────
+    if purchase_type == "supplier":
+        supplier_id    = data.get("supplier_id")
+        egadget_ref    = ""
+        payment_method = ""
+        cash_amount    = 0.0
+        bank_amount    = 0.0
+        bank_account_id = None
+        bank_ref       = ""
+        if not supplier_id:
+            return jsonify({"success": False, "error": "supplier_id is required"}), 400
+
+    elif purchase_type == "cash":
+        supplier_id    = None
+        egadget_ref    = (data.get("egadget_ref") or "").strip()
+        payment_method = (data.get("payment_method") or "cash").strip().lower()
+        cash_amount    = float(data.get("cash_amount") or 0)
+        bank_amount    = float(data.get("bank_amount") or 0)
+        bank_account_id = data.get("bank_account_id")
+        bank_ref       = (data.get("bank_ref") or "").strip()
+
+        if not egadget_ref:
+            return jsonify({"success": False,
+                            "error": "egadget_ref is required for cash purchases"}), 400
+        if payment_method not in ("cash", "bank", "split"):
+            return jsonify({"success": False,
+                            "error": "payment_method must be cash, bank, or split"}), 400
+        if payment_method in ("bank", "split") and not bank_account_id:
+            return jsonify({"success": False,
+                            "error": "bank_account_id is required for bank/split payments"}), 400
+        # Split total validation
+        if payment_method == "split":
+            total_check = sum(float(ln.get("purchase_price") or 0) for ln in lines)
+            if abs((cash_amount + bank_amount) - total_check) > 1:
+                return jsonify({"success": False,
+                    "error": f"Split: cash + bank ({cash_amount + bank_amount:.0f}) "
+                             f"must equal total ({total_check:.0f})"}), 400
+    else:
+        return jsonify({"success": False,
+                        "error": f"Invalid purchase_type: {purchase_type}"}), 400
 
     conn = get_conn()
     try:
         c = conn.cursor()
 
-        # Validate no IMEI already exists in stock
+        # Validate no IMEI already in_stock (allow re-purchase of sold/returned)
         duplicate_imeis = []
         for line in lines:
             imei = str(line.get("imei", "")).strip()
             existing = c.execute(
-                "SELECT id FROM stock_items WHERE TRIM(imei)=?", (imei,)
+                "SELECT id FROM stock_items WHERE TRIM(imei)=? AND status='in_stock'",
+                (imei,)
             ).fetchone()
             if existing:
                 duplicate_imeis.append(imei)
@@ -575,7 +624,7 @@ def api_purchase():
             conn.close()
             return jsonify({
                 "success": False,
-                "error": f"These IMEIs already exist: {', '.join(duplicate_imeis)}"
+                "error": f"Already in stock: {', '.join(duplicate_imeis)}"
             }), 400
 
         # Generate PV number
@@ -584,13 +633,22 @@ def api_purchase():
         c.execute("UPDATE settings SET value=? WHERE key='last_pv_number'", (str(n),))
         pv_number = f"PV-{n:04d}"
 
-        total_amount = sum(float(line.get("purchase_price") or 0) for line in lines)
+        total_amount = sum(float(ln.get("purchase_price") or 0) for ln in lines)
 
+        # For cash/cash payment, cash_amount = full total
+        if purchase_type == "cash" and payment_method == "cash":
+            cash_amount = total_amount
+
+        # Insert purchase voucher with all columns
         c.execute("""
             INSERT INTO purchase_vouchers
-            (pv_number, supplier_id, date, total_amount, notes)
-            VALUES (?,?,?,?,?)
-        """, (pv_number, supplier_id, date_str, total_amount, notes))
+            (pv_number, supplier_id, date, total_amount, notes,
+             purchase_type, egadget_ref, payment_method,
+             cash_amount, bank_amount, bank_account_id, bank_ref)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (pv_number, supplier_id, date_str, total_amount, notes,
+              purchase_type, egadget_ref, payment_method,
+              cash_amount, bank_amount, bank_account_id, bank_ref))
         pv_id = c.lastrowid
 
         for line in lines:
@@ -610,6 +668,16 @@ def api_purchase():
                 (model_id, imei, purchase_line_id, purchase_price, status)
                 VALUES (?,?,?,?,'in_stock')
             """, (model_id, imei, pl_id, purchase_price))
+
+        # Cash purchase with bank payment — record bank outflow
+        if purchase_type == "cash" and bank_amount > 0 and bank_account_id:
+            c.execute("""
+                INSERT INTO bank_transactions
+                (voucher_number, type, bank_account_id, source, date, amount, notes)
+                VALUES (?,?,?,?,?,?,?)
+            """, (pv_number, "CR", bank_account_id, "cash_purchase",
+                  date_str, float(bank_amount),
+                  f"Cash Purchase — {pv_number} — {egadget_ref}"))
 
         conn.commit()
         conn.close()
