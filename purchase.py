@@ -79,6 +79,30 @@ def fmt_pkr(val):
     return f"{float(val):,.0f}"
 
 
+def _apply_toggle_style(btn, active: bool, pos: str):
+    """Apply pill-button toggle style. pos: 'left' | 'mid' | 'right'"""
+    if pos == "left":
+        radius = "border-radius:5px 0 0 5px;"
+        border  = ""
+    elif pos == "right":
+        radius = "border-radius:0 5px 5px 0; border-left:none;"
+        border  = ""
+    else:
+        radius = "border-radius:0; border-left:none;"
+        border  = ""
+    if active:
+        btn.setStyleSheet(
+            f"QPushButton {{ background:#2563eb; color:white; border:none;"
+            f" padding:5px 16px; font-size:10pt; font-weight:bold; {radius} }}"
+        )
+    else:
+        btn.setStyleSheet(
+            f"QPushButton {{ background:#f1f5f9; color:#64748b;"
+            f" border:1px solid #cbd5e1; padding:5px 16px; font-size:10pt; {radius} }}"
+            f"QPushButton:hover {{ background:#e2e8f0; color:#334155; }}"
+        )
+
+
 def _make_table(headers):
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
@@ -86,8 +110,7 @@ def _make_table(headers):
     t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     t.setAlternatingRowColors(True)
     t.verticalHeader().setVisible(False)
-    t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    t.horizontalHeader().setStretchLastSection(True)
+    t.horizontalHeader().setStretchLastSection(False)
     t.setStyleSheet(TABLE_STYLE)
     return t
 
@@ -153,8 +176,15 @@ def db_imei_exists_active(imei):
     return row is not None
 
 
-def db_save_purchase(date_str, supplier_id, notes, lines):
-    """lines = [(model_id, imei, price), ...]  Returns pv_number."""
+def db_save_purchase(date_str, supplier_id, notes, lines,
+                      purchase_type="supplier", egadget_ref="",
+                      payment_method="", cash_amount=0.0, bank_amount=0.0,
+                      bank_account_id=None, bank_ref=""):
+    """
+    lines = [(model_id, imei, price), ...]  Returns pv_number.
+    For cash purchases: supplier_id=None, egadget_ref required.
+    Bank outflow (if bank_amount > 0) is recorded in bank_transactions.
+    """
     conn = get_connection()
     try:
         c = conn.cursor()
@@ -167,9 +197,15 @@ def db_save_purchase(date_str, supplier_id, notes, lines):
 
         total = sum(price for _, _, price in lines)
         c.execute(
-            "INSERT INTO purchase_vouchers (pv_number, supplier_id, date, total_amount, notes) "
-            "VALUES (?,?,?,?,?)",
-            (pv_number, supplier_id, date_str, total, notes or ""),
+            "INSERT INTO purchase_vouchers "
+            "(pv_number, supplier_id, date, total_amount, notes, "
+            " purchase_type, egadget_ref, payment_method, "
+            " cash_amount, bank_amount, bank_account_id, bank_ref) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pv_number, supplier_id, date_str, total, notes or "",
+             purchase_type, egadget_ref or "", payment_method or "",
+             float(cash_amount or 0), float(bank_amount or 0),
+             bank_account_id, bank_ref or ""),
         )
         pv_id = c.lastrowid
 
@@ -197,6 +233,17 @@ def db_save_purchase(date_str, supplier_id, notes, lines):
                     (model_id, imei, pl_id, price),
                 )
 
+        # Cash purchase paid (partly) by bank — record the bank outflow
+        if purchase_type == "cash" and bank_amount and bank_amount > 0 and bank_account_id:
+            c.execute(
+                "INSERT INTO bank_transactions "
+                "(voucher_number, type, bank_account_id, source, date, amount, notes) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (pv_number, "CR", bank_account_id, "cash_purchase",
+                 date_str, float(bank_amount),
+                 f"Cash Purchase — {pv_number}"),
+            )
+
         conn.commit()
     except Exception:
         conn.rollback()
@@ -210,7 +257,8 @@ def _date_expr():
     return "substr(pv.date,7,4)||'-'||substr(pv.date,4,2)||'-'||substr(pv.date,1,2)"
 
 
-def db_load_purchases(from_iso=None, to_iso=None, supplier_id=None):
+def db_load_purchases(from_iso=None, to_iso=None, supplier_id=None,
+                       purchase_type_filter=None):
     conds, params = [], []
     de = _date_expr()
     if from_iso:
@@ -222,12 +270,19 @@ def db_load_purchases(from_iso=None, to_iso=None, supplier_id=None):
     if supplier_id:
         conds.append("pv.supplier_id = ?")
         params.append(supplier_id)
+    if purchase_type_filter == "supplier":
+        conds.append("COALESCE(pv.purchase_type,'supplier') = 'supplier'")
+    elif purchase_type_filter == "cash":
+        conds.append("pv.purchase_type = 'cash'")
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     sql = f"""
-        SELECT pv.id, pv.pv_number, pv.date, s.name AS supplier_name,
-               COUNT(pl.id) AS item_count, pv.total_amount, pv.notes
+        SELECT pv.id, pv.pv_number, pv.date,
+               COALESCE(s.name, 'Cash Purchase') AS supplier_name,
+               COUNT(pl.id) AS item_count, pv.total_amount, pv.notes,
+               COALESCE(pv.purchase_type, 'supplier') AS purchase_type,
+               COALESCE(pv.egadget_ref, '') AS egadget_ref
         FROM purchase_vouchers pv
-        JOIN suppliers s ON s.id = pv.supplier_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id
         LEFT JOIN purchase_lines pl ON pl.pv_id = pv.id
         {where}
         GROUP BY pv.id
@@ -556,12 +611,19 @@ class PurchaseReturnForm(QWidget):
         self.lines_table = _make_table(
             ["#", "Brand", "Model", "IMEI", "Purchase Date", "Purchase Price (PKR)", ""]
         )
-        self.lines_table.setColumnWidth(0, 40)
+        _lh = self.lines_table.horizontalHeader()
+        _lh.setStretchLastSection(False)
+        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)       # #
+        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)     # Brand
+        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)     # Model
+        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IMEI
+        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Purchase Date
+        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Purchase Price
+        _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        self.lines_table.setColumnWidth(0, 35)
+        self.lines_table.setColumnWidth(4, 110)
+        self.lines_table.setColumnWidth(5, 160)
         self.lines_table.setColumnWidth(6, 80)
-        for col in (0, 6):
-            self.lines_table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.Fixed
-            )
         layout.addWidget(self.lines_table, stretch=1)
 
         # ── Footer ────────────────────────────────────────────────────────────
@@ -810,6 +872,14 @@ class PurchaseReturnListView(QWidget):
         self.table = _make_table(
             ["PR Number", "Date", "Supplier", "Items", "Return Amount (PKR)", "Notes"]
         )
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)   # Supplier stretches
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)      # Items
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)      # Return Amount (PKR)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)    # Notes stretches
+        self.table.setColumnWidth(3, 55)
+        self.table.setColumnWidth(4, 150)
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit_pr.setEnabled(self.table.currentRow() >= 0)
@@ -880,10 +950,18 @@ class PurchaseDetailDialog(QDialog):
         info.setStyleSheet(CARD_STYLE)
         info_layout = QHBoxLayout(info)
         info_layout.setContentsMargins(16, 12, 16, 12)
+        ptype = pv_row.get("purchase_type", "supplier") or "supplier"
+        if ptype == "cash":
+            egadget = pv_row.get("egadget_ref", "") or ""
+            party_label = "Type"
+            party_value = f"Cash Purchase" + (f" — Ref: {egadget}" if egadget else "")
+        else:
+            party_label = "Supplier"
+            party_value = pv_row["supplier_name"]
         for label, value in [
             ("PV Number", pv_row["pv_number"]),
             ("Date", pv_row["date"]),
-            ("Supplier", pv_row["supplier_name"]),
+            (party_label, party_value),
             ("Total", f"PKR {fmt_pkr(pv_row['total_amount'])}"),
         ]:
             col = QVBoxLayout()
@@ -906,6 +984,8 @@ class PurchaseDetailDialog(QDialog):
         layout.addWidget(info)
 
         table = _make_table(["Brand", "Model", "IMEI", "Purchase Price (PKR)"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
         for r in db_load_purchase_lines(pv_row["id"]):
             row = table.rowCount()
             table.insertRow(row)
@@ -932,6 +1012,8 @@ class PurchaseForm(QWidget):
         self._lines = []          # [(model_id, brand_name, model_name, imei, net_price)]
         self._current_model_id = None
         self._updating_price = False
+        self._purchase_type = "supplier"   # 'supplier' | 'cash'
+        self._pay_method    = "cash"       # 'cash' | 'bank' | 'split'
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -955,6 +1037,22 @@ class PurchaseForm(QWidget):
         title_row.addWidget(self.btn_save)
         layout.addLayout(title_row)
 
+        # ── Purchase type toggle ──────────────────────────────────────────────
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(0)
+        self._btn_supplier_type = QPushButton("Supplier Purchase")
+        self._btn_supplier_type.setFixedHeight(30)
+        self._btn_cash_type = QPushButton("Cash Purchase")
+        self._btn_cash_type.setFixedHeight(30)
+        _apply_toggle_style(self._btn_supplier_type, True,  "left")
+        _apply_toggle_style(self._btn_cash_type,     False, "right")
+        self._btn_supplier_type.clicked.connect(lambda: self._set_purchase_type("supplier"))
+        self._btn_cash_type.clicked.connect(    lambda: self._set_purchase_type("cash"))
+        toggle_row.addWidget(self._btn_supplier_type)
+        toggle_row.addWidget(self._btn_cash_type)
+        toggle_row.addStretch()
+        layout.addLayout(toggle_row)
+
         # ── Header card ──────────────────────────────────────────────────────
         header_card = QFrame()
         header_card.setStyleSheet(CARD_STYLE)
@@ -972,20 +1070,23 @@ class PurchaseForm(QWidget):
         date_col.addWidget(self.date_edit)
         header_layout.addLayout(date_col)
 
-        # Supplier
-        sup_col = QVBoxLayout()
-        sup_col.addWidget(QLabel("Supplier *"))
+        # Supplier (wrapped in a QWidget so it can be hidden for cash purchases)
+        self._sup_widget = QWidget()
+        sup_inner = QVBoxLayout(self._sup_widget)
+        sup_inner.setContentsMargins(0, 0, 0, 0)
+        sup_inner.setSpacing(4)
+        sup_inner.addWidget(QLabel("Supplier *"))
         self.supplier_combo = QComboBox()
         self.supplier_combo.setMinimumWidth(200)
         self.supplier_combo.addItem("— Select Supplier —", None)
         for s in db_suppliers_list():
             self.supplier_combo.addItem(s["name"], s["id"])
-        sup_col.addWidget(self.supplier_combo)
+        sup_inner.addWidget(self.supplier_combo)
         self.supplier_balance_lbl = QLabel("")
         self.supplier_balance_lbl.setStyleSheet(STATUS_INFO)
-        sup_col.addWidget(self.supplier_balance_lbl)
+        sup_inner.addWidget(self.supplier_balance_lbl)
         self.supplier_combo.currentIndexChanged.connect(self._on_supplier_changed)
-        header_layout.addLayout(sup_col)
+        header_layout.addWidget(self._sup_widget)
 
         # Notes
         notes_col = QVBoxLayout()
@@ -999,6 +1100,119 @@ class PurchaseForm(QWidget):
 
         header_layout.addStretch()
         layout.addWidget(header_card)
+
+        # ── Cash Purchase Panel ───────────────────────────────────────────────
+        self._cash_pay_card = QFrame()
+        self._cash_pay_card.setStyleSheet(CARD_STYLE)
+        self._cash_pay_card.setVisible(False)
+        cpay_v = QVBoxLayout(self._cash_pay_card)
+        cpay_v.setContentsMargins(16, 12, 16, 12)
+        cpay_v.setSpacing(10)
+
+        # Row 1 — eGadget reference number
+        ref_row = QHBoxLayout()
+        ref_row.setSpacing(10)
+        ref_lbl = QLabel("eGadget Ref # *")
+        ref_lbl.setMinimumWidth(120)
+        ref_row.addWidget(ref_lbl)
+        self.egadget_ref_edit = QLineEdit()
+        self.egadget_ref_edit.setPlaceholderText("Mandatory — eGadget reference number")
+        self.egadget_ref_edit.setMinimumWidth(240)
+        ref_row.addWidget(self.egadget_ref_edit)
+        ref_row.addStretch()
+        cpay_v.addLayout(ref_row)
+
+        # Row 2 — Payment method toggle
+        pm_row = QHBoxLayout()
+        pm_row.setSpacing(0)
+        pm_lbl = QLabel("Payment *")
+        pm_lbl.setMinimumWidth(80)
+        pm_row.addWidget(pm_lbl)
+        pm_row.addSpacing(10)
+        self._pay_btn_cash  = QPushButton("Cash")
+        self._pay_btn_bank  = QPushButton("Bank Transfer")
+        self._pay_btn_split = QPushButton("Split")
+        for b in (self._pay_btn_cash, self._pay_btn_bank, self._pay_btn_split):
+            b.setFixedHeight(30)
+        _apply_toggle_style(self._pay_btn_cash,  True,  "left")
+        _apply_toggle_style(self._pay_btn_bank,  False, "mid")
+        _apply_toggle_style(self._pay_btn_split, False, "right")
+        self._pay_btn_cash.clicked.connect( lambda: self._set_pay_method("cash"))
+        self._pay_btn_bank.clicked.connect( lambda: self._set_pay_method("bank"))
+        self._pay_btn_split.clicked.connect(lambda: self._set_pay_method("split"))
+        pm_row.addWidget(self._pay_btn_cash)
+        pm_row.addWidget(self._pay_btn_bank)
+        pm_row.addWidget(self._pay_btn_split)
+        pm_row.addStretch()
+        cpay_v.addLayout(pm_row)
+
+        # Row 3 — Payment detail stacked widget
+        self._pay_stack = QStackedWidget()
+
+        # Page 0 — Cash
+        pg_cash = QFrame()
+        pg_cash_h = QHBoxLayout(pg_cash)
+        pg_cash_h.setContentsMargins(0, 2, 0, 2)
+        self._cash_pay_info_lbl = QLabel("Full purchase amount will be paid in cash.")
+        self._cash_pay_info_lbl.setStyleSheet(STATUS_INFO)
+        pg_cash_h.addWidget(self._cash_pay_info_lbl)
+        pg_cash_h.addStretch()
+        self._pay_stack.addWidget(pg_cash)
+
+        # Page 1 — Bank Transfer
+        pg_bank = QFrame()
+        pg_bank_h = QHBoxLayout(pg_bank)
+        pg_bank_h.setContentsMargins(0, 2, 0, 2)
+        pg_bank_h.setSpacing(10)
+        pg_bank_h.addWidget(QLabel("Account:"))
+        self.pay_bank_combo = QComboBox()
+        self.pay_bank_combo.setMinimumWidth(180)
+        self._populate_bank_combo(self.pay_bank_combo)
+        pg_bank_h.addWidget(self.pay_bank_combo)
+        pg_bank_h.addWidget(QLabel("Reference:"))
+        self.pay_bank_ref_edit = QLineEdit()
+        self.pay_bank_ref_edit.setPlaceholderText("Transfer reference number")
+        self.pay_bank_ref_edit.setMinimumWidth(180)
+        pg_bank_h.addWidget(self.pay_bank_ref_edit)
+        pg_bank_h.addStretch()
+        self._pay_stack.addWidget(pg_bank)
+
+        # Page 2 — Split
+        pg_split = QFrame()
+        pg_split_h = QHBoxLayout(pg_split)
+        pg_split_h.setContentsMargins(0, 2, 0, 2)
+        pg_split_h.setSpacing(10)
+        pg_split_h.addWidget(QLabel("Cash:"))
+        self.split_cash_spin = QDoubleSpinBox()
+        self.split_cash_spin.setRange(0, 9_999_999)
+        self.split_cash_spin.setDecimals(0)
+        self.split_cash_spin.setSingleStep(1000)
+        self.split_cash_spin.setGroupSeparatorShown(True)
+        self.split_cash_spin.setMinimumWidth(110)
+        pg_split_h.addWidget(self.split_cash_spin)
+        pg_split_h.addWidget(QLabel("Bank:"))
+        self.split_bank_spin = QDoubleSpinBox()
+        self.split_bank_spin.setRange(0, 9_999_999)
+        self.split_bank_spin.setDecimals(0)
+        self.split_bank_spin.setSingleStep(1000)
+        self.split_bank_spin.setGroupSeparatorShown(True)
+        self.split_bank_spin.setMinimumWidth(110)
+        pg_split_h.addWidget(self.split_bank_spin)
+        pg_split_h.addWidget(QLabel("Account:"))
+        self.split_bank_combo = QComboBox()
+        self.split_bank_combo.setMinimumWidth(160)
+        self._populate_bank_combo(self.split_bank_combo)
+        pg_split_h.addWidget(self.split_bank_combo)
+        pg_split_h.addWidget(QLabel("Ref:"))
+        self.split_ref_edit = QLineEdit()
+        self.split_ref_edit.setPlaceholderText("Bank ref (optional)")
+        self.split_ref_edit.setMinimumWidth(130)
+        pg_split_h.addWidget(self.split_ref_edit)
+        pg_split_h.addStretch()
+        self._pay_stack.addWidget(pg_split)
+
+        cpay_v.addWidget(self._pay_stack)
+        layout.addWidget(self._cash_pay_card)
 
         # ── Add line card ─────────────────────────────────────────────────────
         add_card = QFrame()
@@ -1092,14 +1306,17 @@ class PurchaseForm(QWidget):
 
         # ── Lines table ───────────────────────────────────────────────────────
         self.lines_table = _make_table(["#", "Brand", "Model", "IMEI", "Price (PKR)", ""])
-        self.lines_table.setColumnWidth(0, 40)
-        self.lines_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Fixed
-        )
-        self.lines_table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.Fixed
-        )
-        self.lines_table.setColumnWidth(5, 60)
+        _lh = self.lines_table.horizontalHeader()
+        _lh.setStretchLastSection(False)
+        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)       # #
+        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)     # Brand
+        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)     # Model
+        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IMEI
+        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Price (PKR)
+        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        self.lines_table.setColumnWidth(0, 35)
+        self.lines_table.setColumnWidth(4, 130)
+        self.lines_table.setColumnWidth(5, 80)
         layout.addWidget(self.lines_table, stretch=1)
 
         # ── Footer ────────────────────────────────────────────────────────────
@@ -1110,6 +1327,33 @@ class PurchaseForm(QWidget):
         self.total_label.setStyleSheet("color:#1d4ed8;")
         footer.addWidget(self.total_label)
         layout.addLayout(footer)
+
+    # ── Purchase type / payment method helpers ────────────────────────────────
+
+    def _populate_bank_combo(self, combo: QComboBox):
+        from database import db_bank_accounts
+        combo.clear()
+        accounts = db_bank_accounts()
+        if not accounts:
+            combo.addItem("— No bank accounts (add in Settings) —", None)
+        else:
+            combo.addItem("— Select Account —", None)
+            for a in accounts:
+                combo.addItem(a["name"], a["id"])
+
+    def _set_purchase_type(self, ptype: str):
+        self._purchase_type = ptype
+        _apply_toggle_style(self._btn_supplier_type, ptype == "supplier", "left")
+        _apply_toggle_style(self._btn_cash_type,     ptype == "cash",     "right")
+        self._sup_widget.setVisible(ptype == "supplier")
+        self._cash_pay_card.setVisible(ptype == "cash")
+
+    def _set_pay_method(self, method: str):
+        self._pay_method = method
+        _apply_toggle_style(self._pay_btn_cash,  method == "cash",  "left")
+        _apply_toggle_style(self._pay_btn_bank,  method == "bank",  "mid")
+        _apply_toggle_style(self._pay_btn_split, method == "split", "right")
+        self._pay_stack.setCurrentIndex({"cash": 0, "bank": 1, "split": 2}.get(method, 0))
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
@@ -1242,31 +1486,109 @@ class PurchaseForm(QWidget):
             self.lines_table.setCellWidget(r, 5, del_btn)
             total += price
         self.total_label.setText(f"Total: PKR {fmt_pkr(total)}")
+        # Keep cash info label current
+        if hasattr(self, "_cash_pay_info_lbl"):
+            self._cash_pay_info_lbl.setText(
+                f"Full purchase amount will be paid in cash: PKR {fmt_pkr(total)}"
+            )
 
     def _remove_line(self, idx):
         self._lines.pop(idx)
         self._refresh_lines_table()
 
     def _save(self):
-        if self.supplier_combo.currentData() is None:
-            QMessageBox.warning(self, "Missing", "Please select a supplier.")
-            return
         if not self._lines:
             QMessageBox.warning(self, "Missing", "Add at least one IMEI line.")
             return
 
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        supplier_id = self.supplier_combo.currentData()
-        notes = self.notes_edit.text().strip()
+        notes    = self.notes_edit.text().strip()
         db_lines = [(m, imei, price) for m, _, _, imei, price in self._lines]
+        total    = sum(price for _, _, price in db_lines)
 
-        try:
-            pv_number = db_save_purchase(date_str, supplier_id, notes, db_lines)
-        except sqlite3.IntegrityError as e:
-            QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
-            return
+        if self._purchase_type == "supplier":
+            # ── Supplier purchase (existing flow unchanged) ───────────────
+            if self.supplier_combo.currentData() is None:
+                QMessageBox.warning(self, "Missing", "Please select a supplier.")
+                return
+            supplier_id = self.supplier_combo.currentData()
+            try:
+                pv_number = db_save_purchase(date_str, supplier_id, notes, db_lines)
+            except sqlite3.IntegrityError as e:
+                QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
+                return
+            QMessageBox.information(self, "Saved",
+                                    f"Purchase {pv_number} saved successfully.")
 
-        QMessageBox.information(self, "Saved", f"Purchase {pv_number} saved successfully.")
+        else:
+            # ── Cash purchase ─────────────────────────────────────────────
+            egadget_ref = self.egadget_ref_edit.text().strip()
+            if not egadget_ref:
+                QMessageBox.warning(self, "Missing",
+                    "eGadget Reference Number is required for cash purchases.")
+                self.egadget_ref_edit.setFocus()
+                return
+
+            pm = self._pay_method
+            if pm == "cash":
+                cash_amount    = total
+                bank_amount    = 0.0
+                bank_account_id = None
+                bank_ref       = ""
+            elif pm == "bank":
+                if self.pay_bank_combo.currentData() is None:
+                    QMessageBox.warning(self, "Missing",
+                        "Please select a bank account for bank transfer.")
+                    return
+                cash_amount    = 0.0
+                bank_amount    = total
+                bank_account_id = self.pay_bank_combo.currentData()
+                bank_ref       = self.pay_bank_ref_edit.text().strip()
+            else:  # split
+                if self.split_bank_combo.currentData() is None:
+                    QMessageBox.warning(self, "Missing",
+                        "Please select a bank account for split payment.")
+                    return
+                cash_amount    = self.split_cash_spin.value()
+                bank_amount    = self.split_bank_spin.value()
+                bank_account_id = self.split_bank_combo.currentData()
+                bank_ref       = self.split_ref_edit.text().strip()
+                if abs((cash_amount + bank_amount) - total) > 0.01:
+                    QMessageBox.warning(self, "Split Validation",
+                        f"Cash (PKR {fmt_pkr(cash_amount)}) + "
+                        f"Bank (PKR {fmt_pkr(bank_amount)}) = "
+                        f"PKR {fmt_pkr(cash_amount + bank_amount)}\n"
+                        f"but purchase total is PKR {fmt_pkr(total)}.\n"
+                        "The two amounts must equal the total.")
+                    return
+
+            try:
+                pv_number = db_save_purchase(
+                    date_str, None, notes, db_lines,
+                    purchase_type="cash",
+                    egadget_ref=egadget_ref,
+                    payment_method=pm,
+                    cash_amount=cash_amount,
+                    bank_amount=bank_amount,
+                    bank_account_id=bank_account_id,
+                    bank_ref=bank_ref,
+                )
+            except sqlite3.IntegrityError as e:
+                QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
+                return
+
+            # Print cash purchase receipt
+            try:
+                from receipt import print_cash_purchase_receipt
+                print_cash_purchase_receipt(pv_number, parent=self)
+            except Exception:
+                pass
+
+            QMessageBox.information(self, "Saved",
+                f"Cash Purchase {pv_number} saved.\n"
+                f"eGadget Ref: {egadget_ref}\n"
+                f"Total: PKR {fmt_pkr(total)}")
+
         self._on_save(pv_number)
 
 
@@ -1326,6 +1648,14 @@ class PurchaseListView(QWidget):
             self.sup_filter.addItem(s["name"], s["id"])
         fl.addWidget(self.sup_filter)
 
+        fl.addWidget(QLabel("Type:"))
+        self.type_filter = QComboBox()
+        self.type_filter.setMinimumWidth(130)
+        self.type_filter.addItem("All Types",     None)
+        self.type_filter.addItem("Supplier Only", "supplier")
+        self.type_filter.addItem("Cash Purchase", "cash")
+        fl.addWidget(self.type_filter)
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
@@ -1343,6 +1673,14 @@ class PurchaseListView(QWidget):
         self.table = _make_table(
             ["PV Number", "Date", "Supplier", "Items", "Total Amount (PKR)", "Notes"]
         )
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)   # Supplier stretches
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)      # Items
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)      # Total Amount (PKR)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)    # Notes stretches
+        self.table.setColumnWidth(3, 55)
+        self.table.setColumnWidth(4, 150)
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit.setEnabled(self.table.currentRow() >= 0)
@@ -1353,9 +1691,10 @@ class PurchaseListView(QWidget):
 
     def refresh(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
-        to_iso = self.to_date.date().toString("yyyy-MM-dd")
-        sup_id = self.sup_filter.currentData()
-        rows = db_load_purchases(from_iso, to_iso, sup_id)
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        sup_id   = self.sup_filter.currentData()
+        type_f   = self.type_filter.currentData()
+        rows = db_load_purchases(from_iso, to_iso, sup_id, type_f)
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
@@ -1366,7 +1705,14 @@ class PurchaseListView(QWidget):
             pv_item.setData(Qt.ItemDataRole.UserRole, dict(r))
             self.table.setItem(row, 0, pv_item)
             self.table.setItem(row, 1, QTableWidgetItem(r["date"]))
-            self.table.setItem(row, 2, QTableWidgetItem(r["supplier_name"]))
+            # Supplier column: show "Cash — {egadget_ref}" for cash purchases
+            ptype = r["purchase_type"] if "purchase_type" in r.keys() else "supplier"
+            if ptype == "cash":
+                ref = r["egadget_ref"] if "egadget_ref" in r.keys() else ""
+                sup_display = f"Cash — {ref}" if ref else "Cash Purchase"
+            else:
+                sup_display = r["supplier_name"]
+            self.table.setItem(row, 2, QTableWidgetItem(sup_display))
             cnt = QTableWidgetItem(str(r["item_count"]))
             cnt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 3, cnt)
@@ -1381,6 +1727,7 @@ class PurchaseListView(QWidget):
         self.from_date.setDate(QDate.currentDate().addMonths(-1))
         self.to_date.setDate(QDate.currentDate())
         self.sup_filter.setCurrentIndex(0)
+        self.type_filter.setCurrentIndex(0)
         self.refresh()
 
     def _edit_selected(self):

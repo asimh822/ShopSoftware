@@ -5,7 +5,7 @@ import os
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 # Increment this whenever a new _migrate_vN function is added below.
-CURRENT_DB_VERSION = 1
+CURRENT_DB_VERSION = 2
 
 
 def get_connection():
@@ -209,6 +209,7 @@ def _run_migrations(conn) -> None:
     # Register every migration here — key = target version number
     _MIGRATIONS: dict[int, callable] = {
         1: _migrate_v1,
+        2: _migrate_v2,
     }
 
     current = _get_db_version(conn)
@@ -412,6 +413,30 @@ def _migrate_v1(conn) -> None:
           )
     """)
     # _run_migrations() commits after this function returns.
+
+
+def _migrate_v2(conn) -> None:
+    """
+    Version 2 — Cash Purchase support.
+    Adds columns to purchase_vouchers for buying from walk-in sellers (no supplier).
+    Do NOT add a conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    for col_name, col_def in [
+        ("purchase_type",   "TEXT DEFAULT 'supplier'"),
+        ("egadget_ref",     "TEXT"),
+        ("payment_method",  "TEXT"),
+        ("cash_amount",     "REAL DEFAULT 0"),
+        ("bank_amount",     "REAL DEFAULT 0"),
+        ("bank_account_id", "INTEGER"),
+        ("bank_ref",        "TEXT"),
+    ]:
+        try:
+            c.execute(
+                f"ALTER TABLE purchase_vouchers ADD COLUMN {col_name} {col_def}"
+            )
+        except Exception:
+            pass  # column already exists — safe to ignore
 
 
 def next_voucher_number(prefix: str, counter_key: str) -> str:
@@ -661,6 +686,8 @@ def db_cash_in_hand() -> float:
                         WHERE type='CR' AND source='cash_transfer'), 0)
             + COALESCE((SELECT SUM(amount) FROM cash_journal_lines WHERE direction='in'), 0)
             - COALESCE((SELECT SUM(amount) FROM cash_journal_lines WHERE direction='out'), 0)
+            - COALESCE((SELECT SUM(cash_amount) FROM purchase_vouchers
+                        WHERE purchase_type='cash' AND cash_amount > 0), 0)
     """).fetchone()[0]
     conn.close()
     return cash_ob + float(result or 0.0)

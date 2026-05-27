@@ -425,3 +425,147 @@ def print_sale_return_receipt(sr_id: int, parent=None) -> bool:
     )
     return _print_return_raw(text, get_setting("thermal_printer") or "",
                              data["sr_number"], parent)
+
+
+# ── Cash Purchase receipt ─────────────────────────────────────────────────────
+
+def fetch_cash_purchase_data(pv_number: str) -> dict | None:
+    conn = get_connection()
+    pv = conn.execute("""
+        SELECT pv.id, pv.pv_number, pv.date,
+               COALESCE(pv.total_amount, 0) total_amount,
+               COALESCE(pv.notes, '') notes,
+               COALESCE(pv.egadget_ref, '') egadget_ref,
+               COALESCE(pv.payment_method, 'cash') payment_method,
+               COALESCE(pv.cash_amount, 0) cash_amount,
+               COALESCE(pv.bank_amount, 0) bank_amount,
+               COALESCE(pv.bank_ref, '') bank_ref,
+               COALESCE(ba.name, '') bank_name
+        FROM purchase_vouchers pv
+        LEFT JOIN bank_accounts ba ON ba.id = pv.bank_account_id
+        WHERE pv.pv_number = ? AND pv.purchase_type = 'cash'
+    """, (pv_number,)).fetchone()
+    if not pv:
+        conn.close()
+        return None
+    lines = conn.execute("""
+        SELECT b.name brand, m.name model, pl.imei, pl.purchase_price
+        FROM purchase_lines pl
+        JOIN models m ON m.id = pl.model_id
+        JOIN brands b ON b.id = m.brand_id
+        WHERE pl.pv_id = ?
+        ORDER BY pl.id
+    """, (pv["id"],)).fetchall()
+    conn.close()
+    return {
+        "pv_number":      pv["pv_number"],
+        "date":           pv["date"],
+        "total_amount":   float(pv["total_amount"]),
+        "notes":          pv["notes"],
+        "egadget_ref":    pv["egadget_ref"],
+        "payment_method": pv["payment_method"],
+        "cash_amount":    float(pv["cash_amount"]),
+        "bank_amount":    float(pv["bank_amount"]),
+        "bank_ref":       pv["bank_ref"],
+        "bank_name":      pv["bank_name"],
+        "lines": [(r["brand"], r["model"], r["imei"], r["purchase_price"]) for r in lines],
+    }
+
+
+def build_cash_purchase_receipt_text(data: dict, shop_name: str, shop_address: str,
+                                      shop_contact: str, footer_msg: str) -> str:
+    lines_out = []
+    lines_out.append(_center(shop_name))
+    for addr_line in shop_address.split(","):
+        lines_out.append(_center(addr_line.strip()))
+    lines_out.append(_center(shop_contact))
+    lines_out.append(_sep())
+
+    lines_out.append("CASH PURCHASE VOUCHER")
+    lines_out.append(f"PV No:      {data['pv_number']}")
+    lines_out.append(f"Date:       {data['date']}")
+    lines_out.append(f"eGadget Ref: {data['egadget_ref']}")
+
+    pm = data["payment_method"]
+    if pm == "cash":
+        lines_out.append(f"Payment:    Cash — PKR {fmt_pkr(data['total_amount'])}")
+    elif pm == "bank":
+        lines_out.append(f"Payment:    Bank Transfer — PKR {fmt_pkr(data['bank_amount'])}")
+        if data["bank_name"]:
+            lines_out.append(f"Account:    {data['bank_name']}")
+        if data["bank_ref"]:
+            lines_out.append(f"Bank Ref:   {data['bank_ref']}")
+    else:  # split
+        lines_out.append(f"Payment:    Split")
+        lines_out.append(f"  Cash:     PKR {fmt_pkr(data['cash_amount'])}")
+        lines_out.append(f"  Bank:     PKR {fmt_pkr(data['bank_amount'])}")
+        if data["bank_name"]:
+            lines_out.append(f"  Account:  {data['bank_name']}")
+        if data["bank_ref"]:
+            lines_out.append(f"  Bank Ref: {data['bank_ref']}")
+
+    lines_out.append(_sep())
+    lines_out.append(f"{'Item':<22}{'IMEI':>10}{'Price':>10}")
+    lines_out.append(_sep())
+
+    for brand, model, imei, price in data["lines"]:
+        label = f"{brand} {model}"
+        if len(label) > 22:
+            label = label[:21] + "…"
+        imei_short = imei[-5:] if len(imei) > 5 else imei
+        lines_out.append(f"{label:<22}{imei_short:>10}{fmt_pkr(price):>10}")
+
+    lines_out.append(_sep())
+    lines_out.append(_right_align("TOTAL:", f"PKR {fmt_pkr(data['total_amount'])}"))
+    lines_out.append(_sep())
+
+    if data["notes"]:
+        lines_out.append(data["notes"])
+        lines_out.append(_sep())
+
+    lines_out.append(_center(footer_msg or "Thank you!"))
+    lines_out.append("")
+    lines_out.append("")
+    return "\n".join(lines_out)
+
+
+def print_cash_purchase_receipt(pv_number: str, parent=None) -> bool:
+    """Print a cash purchase voucher receipt. Returns True if printed."""
+    data = fetch_cash_purchase_data(pv_number)
+    if not data:
+        return False
+    text = build_cash_purchase_receipt_text(
+        data,
+        shop_name    = get_setting("shop_name") or "United Mobile",
+        shop_address = get_setting("shop_address") or "",
+        shop_contact = get_setting("shop_contact") or "",
+        footer_msg   = get_setting("receipt_footer") or "Thank you!",
+    )
+    printer_name = get_setting("thermal_printer") or ""
+    if printer_name:
+        try:
+            from escpos.printer import Win32Raw
+            p = Win32Raw(printer_name)
+            p.text(text)
+            p.cut()
+            return True
+        except Exception:
+            pass
+        try:
+            import win32print
+            raw = build_receipt_bytes(text)
+            hPrinter = win32print.OpenPrinter(printer_name)
+            try:
+                win32print.StartDocPrinter(hPrinter, 1,
+                                           ("Cash Purchase Receipt", None, "RAW"))
+                win32print.StartPagePrinter(hPrinter)
+                win32print.WritePrinter(hPrinter, raw)
+                win32print.EndPagePrinter(hPrinter)
+                win32print.EndDocPrinter(hPrinter)
+            finally:
+                win32print.ClosePrinter(hPrinter)
+            return True
+        except Exception:
+            pass
+    _show_preview(text, pv_number, parent)
+    return False

@@ -262,7 +262,8 @@ def db_sales_report(from_iso=None, to_iso=None, sale_type=None, salesman_id=None
     return rows
 
 
-def db_purchase_report(from_iso=None, to_iso=None, supplier_id=None):
+def db_purchase_report(from_iso=None, to_iso=None, supplier_id=None,
+                         purchase_type_filter=None):
     de = _date_expr("pv.date")
     conds, params = [], []
     if from_iso:
@@ -274,13 +275,20 @@ def db_purchase_report(from_iso=None, to_iso=None, supplier_id=None):
     if supplier_id:
         conds.append("pv.supplier_id=?")
         params.append(supplier_id)
+    if purchase_type_filter == "supplier":
+        conds.append("COALESCE(pv.purchase_type,'supplier') = 'supplier'")
+    elif purchase_type_filter == "cash":
+        conds.append("pv.purchase_type = 'cash'")
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     conn = get_connection()
     rows = conn.execute(f"""
-        SELECT pv.date, pv.pv_number, s.name supplier,
-               COUNT(pl.id) items, pv.total_amount
+        SELECT pv.date, pv.pv_number,
+               COALESCE(s.name, 'Cash Purchase') supplier,
+               COUNT(pl.id) items, pv.total_amount,
+               COALESCE(pv.purchase_type, 'supplier') purchase_type,
+               COALESCE(pv.egadget_ref, '') egadget_ref
         FROM purchase_vouchers pv
-        JOIN suppliers s ON s.id = pv.supplier_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id
         LEFT JOIN purchase_lines pl ON pl.pv_id = pv.id
         {where}
         GROUP BY pv.id
@@ -350,6 +358,7 @@ def db_cash_book(date_str: str) -> dict:
     ).fetchone()
     cash_ob = float(ob_row[0]) if ob_row and ob_row[0] else 0.0
 
+    de_pv = _de("pv.date")
     opening_cash = (
         cash_ob
         + _q(f"SELECT COALESCE(SUM(sv.cash_paid),0) FROM sale_vouchers sv"
@@ -366,6 +375,8 @@ def db_cash_book(date_str: str) -> dict:
              f" WHERE cjl.direction='in' AND {de_cjl}<?", (iso,))
         - _q(f"SELECT COALESCE(SUM(cjl.amount),0) FROM cash_journal_lines cjl"
              f" WHERE cjl.direction='out' AND {de_cjl}<?", (iso,))
+        - _q(f"SELECT COALESCE(SUM(pv.cash_amount),0) FROM purchase_vouchers pv"
+             f" WHERE pv.purchase_type='cash' AND pv.cash_amount>0 AND {de_pv}<?", (iso,))
     )
 
     # ── Opening Bank — all bank movements BEFORE iso ──────────────────────
@@ -467,6 +478,48 @@ def db_cash_book(date_str: str) -> dict:
             rows.append({"date": bt["date"], "voucher": bt["voucher_number"],
                          "description": f"Cash Withdrawal ← {bname}",
                          "cash_in": amt, "cash_out": 0.0})
+
+    # 4. Cash purchases — walk-in seller purchases (no supplier)
+    cash_purch = conn.execute(f"""
+        SELECT pv.date, pv.pv_number,
+               COALESCE(pv.payment_method, 'cash') payment_method,
+               COALESCE(pv.egadget_ref, '') egadget_ref,
+               COALESCE(pv.total_amount, 0) total_amount,
+               COALESCE(pv.cash_amount,  0) cash_amount,
+               COALESCE(pv.bank_amount,  0) bank_amount,
+               COALESCE(ba.name, 'Bank') bank_name
+        FROM purchase_vouchers pv
+        LEFT JOIN bank_accounts ba ON ba.id = pv.bank_account_id
+        WHERE pv.purchase_type = 'cash' AND {de_pv}=?
+        ORDER BY pv.pv_number
+    """, (iso,)).fetchall()
+
+    for cp in cash_purch:
+        pm    = cp["payment_method"]
+        total = float(cp["total_amount"] or 0)
+        camnt = float(cp["cash_amount"]  or 0)
+        bamnt = float(cp["bank_amount"]  or 0)
+        ref   = cp["egadget_ref"] or cp["pv_number"]
+        pv_no = cp["pv_number"]
+        date  = cp["date"]
+        bname = cp["bank_name"]
+
+        if pm == "cash":
+            rows.append({"date": date, "voucher": pv_no,
+                         "description": f"Cash Purchase (Cash) — {ref}",
+                         "cash_in": 0.0, "cash_out": total})
+        elif pm == "bank":
+            # Bank paid out — no cash movement; show informational row
+            rows.append({"date": date, "voucher": pv_no,
+                         "description": f"Cash Purchase (Bank/{bname}) — {ref}",
+                         "cash_in": 0.0, "cash_out": 0.0})
+        else:  # split
+            rows.append({"date": date, "voucher": pv_no,
+                         "description": f"Cash Purchase (Split-Cash) — {ref}",
+                         "cash_in": 0.0, "cash_out": camnt})
+            rows.append({"date": date, "voucher": pv_no,
+                         "description": f"Cash Purchase (Split-Bank/{bname}) — {ref}",
+                         "cash_in": 0.0, "cash_out": 0.0})
 
     # Keep rows in voucher-number order
     rows.sort(key=lambda r: r["voucher"])
@@ -896,6 +949,12 @@ class PurchaseReportTab(QWidget):
         for s in db_suppliers_list():
             self.sup_combo.addItem(s["name"], s["id"])
 
+        self.type_combo = QComboBox()
+        self.type_combo.setMinimumWidth(130)
+        self.type_combo.addItem("All Types",     None)
+        self.type_combo.addItem("Supplier Only", "supplier")
+        self.type_combo.addItem("Cash Purchase", "cash")
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
@@ -904,11 +963,12 @@ class PurchaseReportTab(QWidget):
             QLabel("From:"), self.from_date,
             QLabel("To:"), self.to_date,
             QLabel("Supplier:"), self.sup_combo,
+            QLabel("Type:"), self.type_combo,
             btn_search, None,
         ))
 
         self.table = _make_table(
-            ["Date", "PV Number", "Supplier", "Items", "Total Amount (PKR)"]
+            ["Date", "PV Number", "Supplier / Type", "Items", "Total Amount (PKR)"]
         )
         layout.addWidget(self.table, stretch=1)
 
@@ -923,8 +983,12 @@ class PurchaseReportTab(QWidget):
 
     def refresh(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
-        to_iso = self.to_date.date().toString("yyyy-MM-dd")
-        rows = db_purchase_report(from_iso, to_iso, self.sup_combo.currentData())
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        rows = db_purchase_report(
+            from_iso, to_iso,
+            self.sup_combo.currentData(),
+            self.type_combo.currentData(),
+        )
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         grand_total = 0.0
@@ -933,7 +997,14 @@ class PurchaseReportTab(QWidget):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(r["date"]))
             self.table.setItem(row, 1, QTableWidgetItem(r["pv_number"]))
-            self.table.setItem(row, 2, QTableWidgetItem(r["supplier"]))
+            # Supplier / Type column
+            ptype = r["purchase_type"] if "purchase_type" in r.keys() else "supplier"
+            if ptype == "cash":
+                ref = r["egadget_ref"] if "egadget_ref" in r.keys() else ""
+                sup_display = f"Cash — {ref}" if ref else "Cash Purchase"
+            else:
+                sup_display = r["supplier"]
+            self.table.setItem(row, 2, QTableWidgetItem(sup_display))
             cnt = QTableWidgetItem(str(r["items"]))
             cnt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 3, cnt)

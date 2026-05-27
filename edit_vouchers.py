@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QDate
-from PyQt6.QtGui import QFont, QBrush, QColor
+from PyQt6.QtGui import QFont, QBrush, QColor, QDoubleValidator
 
 from database import get_connection, db_bank_accounts
 
@@ -602,7 +602,12 @@ class SaleEditDialog(QDialog):
 
     def __init__(self, sv_id, parent=None):
         super().__init__(parent)
-        self._sv_id = sv_id
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         sv, lines, cust = db_load_sale_for_edit(sv_id)
         self._sv = sv
 
@@ -621,8 +626,8 @@ class SaleEditDialog(QDialog):
         ]
 
         self.setWindowTitle(f"Edit Sale — {sv['sv_number']}")
-        self.setMinimumWidth(860)
-        self.resize(920, 680)
+        self.setMinimumWidth(960)
+        self.resize(960, 720)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         root = QVBoxLayout(self)
@@ -767,14 +772,26 @@ class SaleEditDialog(QDialog):
         self.lines_table.setAlternatingRowColors(True)
         self.lines_table.verticalHeader().setVisible(False)
         hh = self.lines_table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)    # Brand
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Model — fills spare width
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)    # IMEI
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)    # Ref Price
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)    # Final Price
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)    # Remove
+        self.lines_table.setColumnWidth(0, 90)
+        self.lines_table.setColumnWidth(2, 160)
+        self.lines_table.setColumnWidth(3, 150)
+        self.lines_table.setColumnWidth(4, 170)
+        self.lines_table.setColumnWidth(5, 90)
         self.lines_table.setStyleSheet(TABLE_STYLE)
-        self.lines_table.setMinimumHeight(160)
-        root.addWidget(self.lines_table)
-        self._rebuild_lines_table()
-
-        # ── Discount + total ──────────────────────────────────────────────────
+        self.lines_table.verticalHeader().setDefaultSectionSize(38)
+        self.lines_table.setMinimumHeight(200)
+        root.addWidget(self.lines_table, stretch=1)
+        # NOTE: total_lbl must be created BEFORE _rebuild_lines_table() is
+        # called, because _rebuild_lines_table() → _update_total() references
+        # self.total_lbl.  The layout is added to root afterwards so the visual
+        # order (table → footer) is preserved.
         foot_row = QHBoxLayout()
         foot_row.addStretch()
         foot_row.addWidget(QLabel("Overall Discount (PKR):"))
@@ -789,8 +806,10 @@ class SaleEditDialog(QDialog):
         self.total_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_lbl.setStyleSheet("color:#1e293b; padding-left:20px;")
         foot_row.addWidget(self.total_lbl)
+
+        self._rebuild_lines_table()   # safe — total_lbl now exists
+
         root.addLayout(foot_row)
-        self._update_total()
 
         # ── Payment section (cash sales only) ─────────────────────────────────
         self.pay_card = QFrame()
@@ -836,16 +855,18 @@ class SaleEditDialog(QDialog):
         pay_layout.addLayout(pay_toggle_row)
 
         self.pay_stack = QStackedWidget()
-        self.pay_stack.setFixedHeight(44)
+        self.pay_stack.setFixedHeight(52)
 
         # Cash page
         cash_pay_w = QFrame()
         cpl = QHBoxLayout(cash_pay_w)
-        cpl.setContentsMargins(0, 0, 0, 0)
+        cpl.setContentsMargins(0, 4, 0, 4)
+        cpl.setSpacing(10)
         cpl.addWidget(QLabel("Cash Received (PKR):"))
         self.pay_cash_spin = QDoubleSpinBox()
         self.pay_cash_spin.setRange(0, 9_999_999)
         self.pay_cash_spin.setDecimals(0)
+        self.pay_cash_spin.setMinimumWidth(150)
         self.pay_cash_spin.setValue(float(sv.get("cash_paid") or 0))
         cpl.addWidget(self.pay_cash_spin)
         cpl.addStretch()
@@ -854,10 +875,11 @@ class SaleEditDialog(QDialog):
         # Bank page
         bank_pay_w = QFrame()
         bpl = QHBoxLayout(bank_pay_w)
-        bpl.setContentsMargins(0, 0, 0, 0)
+        bpl.setContentsMargins(0, 4, 0, 4)
+        bpl.setSpacing(10)
         bpl.addWidget(QLabel("Bank Account:"))
         self.pay_bank_combo = QComboBox()
-        self.pay_bank_combo.setMinimumWidth(180)
+        self.pay_bank_combo.setMinimumWidth(200)
         for acc in db_bank_accounts():
             self.pay_bank_combo.addItem(acc["name"], acc["id"])
             if sv.get("bank_account_id") == acc["id"]:
@@ -865,7 +887,8 @@ class SaleEditDialog(QDialog):
         bpl.addWidget(self.pay_bank_combo)
         bpl.addWidget(QLabel("Ref:"))
         self.pay_bank_ref = QLineEdit(sv.get("bank_ref") or "")
-        self.pay_bank_ref.setMinimumWidth(120)
+        self.pay_bank_ref.setMinimumWidth(160)
+        self.pay_bank_ref.setPlaceholderText("Transaction / cheque ref")
         bpl.addWidget(self.pay_bank_ref)
         bpl.addStretch()
         self.pay_stack.addWidget(bank_pay_w)
@@ -873,16 +896,18 @@ class SaleEditDialog(QDialog):
         # Split page
         split_pay_w = QFrame()
         spl = QHBoxLayout(split_pay_w)
-        spl.setContentsMargins(0, 0, 0, 0)
+        spl.setContentsMargins(0, 4, 0, 4)
+        spl.setSpacing(10)
         spl.addWidget(QLabel("Cash (PKR):"))
         self.pay_split_cash_spin = QDoubleSpinBox()
         self.pay_split_cash_spin.setRange(0, 9_999_999)
         self.pay_split_cash_spin.setDecimals(0)
+        self.pay_split_cash_spin.setMinimumWidth(140)
         self.pay_split_cash_spin.setValue(float(sv.get("cash_paid") or 0))
         spl.addWidget(self.pay_split_cash_spin)
-        spl.addWidget(QLabel("Bank:"))
+        spl.addWidget(QLabel("Bank Account:"))
         self.pay_split_bank_combo = QComboBox()
-        self.pay_split_bank_combo.setMinimumWidth(160)
+        self.pay_split_bank_combo.setMinimumWidth(180)
         for acc in db_bank_accounts():
             self.pay_split_bank_combo.addItem(acc["name"], acc["id"])
             if sv.get("bank_account_id") == acc["id"]:
@@ -892,7 +917,8 @@ class SaleEditDialog(QDialog):
         spl.addWidget(self.pay_split_bank_combo)
         spl.addWidget(QLabel("Ref:"))
         self.pay_split_bank_ref = QLineEdit(sv.get("bank_ref") or "")
-        self.pay_split_bank_ref.setMinimumWidth(100)
+        self.pay_split_bank_ref.setMinimumWidth(140)
+        self.pay_split_bank_ref.setPlaceholderText("Transaction / cheque ref")
         spl.addWidget(self.pay_split_bank_ref)
         spl.addStretch()
         self.pay_stack.addWidget(split_pay_w)
@@ -958,24 +984,28 @@ class SaleEditDialog(QDialog):
             ref_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.lines_table.setItem(row, 3, ref_item)
 
-            spin = QDoubleSpinBox()
-            spin.setRange(0, 9_999_999)
-            spin.setDecimals(0)
-            spin.setSingleStep(500)
-            spin.setValue(ln["final_price"])
-            spin.valueChanged.connect(lambda v, idx=i: self._on_price_change(idx, v))
-            self.lines_table.setCellWidget(row, 4, spin)
+            price_edit = QLineEdit(str(int(ln["final_price"])))
+            price_edit.setFixedWidth(168)
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
+            price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
+            self.lines_table.setCellWidget(row, 4, price_edit)
 
             btn_rm = QPushButton("Remove")
+            btn_rm.setFixedWidth(88)
             btn_rm.setStyleSheet(BTN_DANGER_SMALL)
             btn_rm.clicked.connect(lambda checked, idx=i: self._remove_line(idx))
             self.lines_table.setCellWidget(row, 5, btn_rm)
 
         self._update_total()
 
-    def _on_price_change(self, idx, value):
+    def _on_price_change(self, idx, text):
         if idx < len(self._lines):
-            self._lines[idx]["final_price"] = value
+            try:
+                self._lines[idx]["final_price"] = float(text) if text.strip() else 0.0
+            except ValueError:
+                self._lines[idx]["final_price"] = 0.0
             self._update_total()
 
     def _remove_line(self, idx):
@@ -1102,6 +1132,12 @@ class PurchaseEditDialog(QDialog):
 
     def __init__(self, pv_id, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self._pv_id = pv_id
         pv, lines = db_load_purchase_for_edit(pv_id)
         self._pv = pv
@@ -1119,8 +1155,8 @@ class PurchaseEditDialog(QDialog):
         ]
 
         self.setWindowTitle(f"Edit Purchase — {pv['pv_number']}")
-        self.setMinimumWidth(820)
-        self.resize(860, 600)
+        self.setMinimumWidth(960)
+        self.resize(960, 640)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         root = QVBoxLayout(self)
@@ -1205,10 +1241,19 @@ class PurchaseEditDialog(QDialog):
         self.lines_table.setAlternatingRowColors(True)
         self.lines_table.verticalHeader().setVisible(False)
         hh = self.lines_table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)    # Brand
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Model — fills spare width
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)    # IMEI
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)    # Purchase Price
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)    # Remove
+        self.lines_table.setColumnWidth(0, 90)
+        self.lines_table.setColumnWidth(2, 160)
+        self.lines_table.setColumnWidth(3, 180)   # Purchase Price — QLineEdit
+        self.lines_table.setColumnWidth(4, 90)    # Remove button
         self.lines_table.setStyleSheet(TABLE_STYLE)
-        self.lines_table.setMinimumHeight(180)
+        self.lines_table.verticalHeader().setDefaultSectionSize(38)
+        self.lines_table.setMinimumHeight(200)
         root.addWidget(self.lines_table)
 
         # Total
@@ -1233,16 +1278,17 @@ class PurchaseEditDialog(QDialog):
             self.lines_table.setItem(row, 1, QTableWidgetItem(ln["model_name"]))
             self.lines_table.setItem(row, 2, QTableWidgetItem(ln["imei"]))
 
-            spin = QDoubleSpinBox()
-            spin.setRange(0, 9_999_999)
-            spin.setDecimals(0)
-            spin.setSingleStep(500)
-            spin.setValue(ln["purchase_price"])
-            spin.valueChanged.connect(lambda v, idx=i: self._on_price_change(idx, v))
-            self.lines_table.setCellWidget(row, 3, spin)
+            price_edit = QLineEdit(str(int(ln["purchase_price"])))
+            price_edit.setFixedWidth(178)
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
+            price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
+            self.lines_table.setCellWidget(row, 3, price_edit)
 
             is_sold = ln.get("stock_status") == "sold"
             btn_rm = QPushButton("Remove")
+            btn_rm.setFixedWidth(88)
             btn_rm.setStyleSheet(BTN_DANGER_SMALL)
             btn_rm.setEnabled(not is_sold)
             if is_sold:
@@ -1254,9 +1300,12 @@ class PurchaseEditDialog(QDialog):
 
         self.total_lbl.setText(f"TOTAL: PKR {fmt_pkr(total)}")
 
-    def _on_price_change(self, idx, value):
+    def _on_price_change(self, idx, text):
         if idx < len(self._lines):
-            self._lines[idx]["purchase_price"] = value
+            try:
+                self._lines[idx]["purchase_price"] = float(text) if text.strip() else 0.0
+            except ValueError:
+                self._lines[idx]["purchase_price"] = 0.0
             total = sum(ln["purchase_price"] for ln in self._lines)
             self.total_lbl.setText(f"TOTAL: PKR {fmt_pkr(total)}")
 
@@ -1338,10 +1387,12 @@ class PaymentEditDialog(QDialog):
         vtype = payment_dict["type"]
         vnum  = payment_dict["voucher_number"]
         self.setWindowTitle(f"Edit Payment — {vnum}")
-        self.setFixedWidth(420)
+        self.setMinimumWidth(500)
+        self.resize(520, 240)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
         lbl = QLabel(f"Edit {vtype} — {vnum}")
@@ -1350,27 +1401,40 @@ class PaymentEditDialog(QDialog):
         layout.addWidget(lbl)
 
         g = QHBoxLayout()
-        g.addWidget(QLabel("Date:"))
+        g.setSpacing(10)
+        lbl_d = QLabel("Date:")
+        lbl_d.setFixedWidth(110)
+        g.addWidget(lbl_d)
         self.date_edit = QDateEdit()
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setMinimumWidth(140)
         d = payment_dict["date"].split("/")
         self.date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
         g.addWidget(self.date_edit)
+        g.addStretch()
         layout.addLayout(g)
 
         g2 = QHBoxLayout()
-        g2.addWidget(QLabel("Amount (PKR):"))
+        g2.setSpacing(10)
+        lbl_a = QLabel("Amount (PKR):")
+        lbl_a.setFixedWidth(110)
+        g2.addWidget(lbl_a)
         self.amount_spin = QDoubleSpinBox()
         self.amount_spin.setRange(0.01, 9_999_999)
         self.amount_spin.setDecimals(0)
         self.amount_spin.setSingleStep(1000)
+        self.amount_spin.setMinimumWidth(160)
         self.amount_spin.setValue(float(payment_dict["amount"]))
         g2.addWidget(self.amount_spin)
+        g2.addStretch()
         layout.addLayout(g2)
 
         g3 = QHBoxLayout()
-        g3.addWidget(QLabel("Notes:"))
+        g3.setSpacing(10)
+        lbl_n = QLabel("Notes:")
+        lbl_n.setFixedWidth(110)
+        g3.addWidget(lbl_n)
         self.notes_edit = QLineEdit(payment_dict.get("notes") or "")
         g3.addWidget(self.notes_edit)
         layout.addLayout(g3)
@@ -1442,10 +1506,12 @@ class JVEditDialog(QDialog):
         self._je = je_dict
         vnum = je_dict["jv_number"]
         self.setWindowTitle(f"Edit Journal Entry — {vnum}")
-        self.setFixedWidth(420)
+        self.setMinimumWidth(500)
+        self.resize(520, 280)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
         lbl = QLabel(f"Edit JV — {vnum}")
@@ -1454,37 +1520,55 @@ class JVEditDialog(QDialog):
         layout.addWidget(lbl)
 
         g = QHBoxLayout()
-        g.addWidget(QLabel("Date:"))
+        g.setSpacing(10)
+        lbl_d = QLabel("Date:")
+        lbl_d.setFixedWidth(110)
+        g.addWidget(lbl_d)
         self.date_edit = QDateEdit()
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setMinimumWidth(140)
         d = je_dict["date"].split("/")
         self.date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
         g.addWidget(self.date_edit)
+        g.addStretch()
         layout.addLayout(g)
 
         g2 = QHBoxLayout()
-        g2.addWidget(QLabel("Amount (PKR):"))
+        g2.setSpacing(10)
+        lbl_a = QLabel("Amount (PKR):")
+        lbl_a.setFixedWidth(110)
+        g2.addWidget(lbl_a)
         self.amount_spin = QDoubleSpinBox()
         self.amount_spin.setRange(0.01, 9_999_999)
         self.amount_spin.setDecimals(0)
         self.amount_spin.setSingleStep(1000)
+        self.amount_spin.setMinimumWidth(160)
         self.amount_spin.setValue(float(je_dict["amount"]))
         g2.addWidget(self.amount_spin)
+        g2.addStretch()
         layout.addLayout(g2)
 
         g3 = QHBoxLayout()
-        g3.addWidget(QLabel("Type:"))
+        g3.setSpacing(10)
+        lbl_t = QLabel("Type:")
+        lbl_t.setFixedWidth(110)
+        g3.addWidget(lbl_t)
         self.type_combo = QComboBox()
+        self.type_combo.setMinimumWidth(140)
         self.type_combo.addItem("Debit", "debit")
         self.type_combo.addItem("Credit", "credit")
         if je_dict["type"] == "credit":
             self.type_combo.setCurrentIndex(1)
         g3.addWidget(self.type_combo)
+        g3.addStretch()
         layout.addLayout(g3)
 
         g4 = QHBoxLayout()
-        g4.addWidget(QLabel("Notes:"))
+        g4.setSpacing(10)
+        lbl_n = QLabel("Notes:")
+        lbl_n.setFixedWidth(110)
+        g4.addWidget(lbl_n)
         self.notes_edit = QLineEdit(je_dict.get("notes") or "")
         g4.addWidget(self.notes_edit)
         layout.addLayout(g4)
@@ -1527,10 +1611,12 @@ class SimpleReturnEditDialog(QDialog):
         self._type = record_type
         self._id = record_id
         self.setWindowTitle(f"Edit {number}")
-        self.setFixedWidth(380)
+        self.setMinimumWidth(480)
+        self.resize(500, 240)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
         lbl = QLabel(f"Edit — {number}")
@@ -1545,17 +1631,25 @@ class SimpleReturnEditDialog(QDialog):
         layout.addWidget(note)
 
         g = QHBoxLayout()
-        g.addWidget(QLabel("Date:"))
+        g.setSpacing(10)
+        lbl_d = QLabel("Date:")
+        lbl_d.setFixedWidth(80)
+        g.addWidget(lbl_d)
         self.date_edit = QDateEdit()
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setMinimumWidth(140)
         d = date_str.split("/")
         self.date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
         g.addWidget(self.date_edit)
+        g.addStretch()
         layout.addLayout(g)
 
         g2 = QHBoxLayout()
-        g2.addWidget(QLabel("Notes:"))
+        g2.setSpacing(10)
+        lbl_n = QLabel("Notes:")
+        lbl_n.setFixedWidth(80)
+        g2.addWidget(lbl_n)
         self.notes_edit = QLineEdit(notes or "")
         g2.addWidget(self.notes_edit)
         layout.addLayout(g2)

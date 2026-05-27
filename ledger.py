@@ -1,4 +1,5 @@
 import sqlite3
+from collections import Counter
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QComboBox, QDateEdit,
@@ -131,12 +132,22 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
 
     if party_type == "supplier":
         for r in conn.execute(
-            "SELECT date, pv_number, total_amount "
+            "SELECT id, date, pv_number, total_amount "
             "FROM purchase_vouchers WHERE supplier_id=?",
             (party_id,),
         ):
-            raw.append({"date": r[0], "voucher": r[1], "desc": "Purchase",
-                        "dr": float(r[2] or 0), "cr": 0.0})
+            lines = conn.execute("""
+                SELECT m.name AS model, pl.purchase_price
+                FROM purchase_lines pl
+                JOIN models m ON m.id = pl.model_id
+                WHERE pl.pv_id=?
+                ORDER BY pl.id
+            """, (r[0],)).fetchall()
+            counts = Counter((ln["model"], int(ln["purchase_price"])) for ln in lines)
+            parts = [f"{qty}x{model}@{price}" for (model, price), qty in counts.items()]
+            desc = ", ".join(parts) if parts else "Purchase"
+            raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                        "dr": float(r[3] or 0), "cr": 0.0})
 
         # Supplier payment directions — DO NOT CHANGE:
         #   CP (you pay supplier)          → CREDIT  (reduces what you owe them)
@@ -157,12 +168,22 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
 
     else:  # customer
         for r in conn.execute(
-            "SELECT sv.date, sv.sv_number, sv.total_amount "
+            "SELECT sv.id, sv.date, sv.sv_number, sv.total_amount "
             "FROM sale_vouchers sv WHERE sv.customer_id=? AND sv.type='credit'",
             (party_id,),
         ):
-            raw.append({"date": r[0], "voucher": r[1], "desc": "Sale on Credit",
-                        "dr": float(r[2] or 0), "cr": 0.0})
+            lines = conn.execute("""
+                SELECT m.name AS model, sl.final_price
+                FROM sale_lines sl
+                JOIN models m ON m.id = sl.model_id
+                WHERE sl.sv_id=?
+                ORDER BY sl.id
+            """, (r[0],)).fetchall()
+            counts = Counter((ln["model"], int(ln["final_price"])) for ln in lines)
+            parts = [f"{qty}x{model}@{price}" for (model, price), qty in counts.items()]
+            desc = ", ".join(parts) if parts else "Sale on Credit"
+            raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                        "dr": float(r[3] or 0), "cr": 0.0})
 
         # Customer payment directions — DO NOT CHANGE:
         #   CR (cash received FROM customer)  → CREDIT  (reduces what they owe you)
@@ -1516,6 +1537,7 @@ class LedgerPage(QWidget):
     def _populate_table(self, entries):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        self.table.setWordWrap(True)
         HEADER_BG = QBrush(QColor("#f0f9ff"))
         DR_COLOR  = QColor("#dc2626")
         CR_COLOR  = QColor("#16a34a")
@@ -1554,6 +1576,7 @@ class LedgerPage(QWidget):
                     ))
                 self.table.setItem(row, col, item)
             closing_balance = e["balance"]
+        self.table.resizeRowsToContents()
         self._lbl_balance.setText(f"PKR {fmt_pkr(closing_balance)}")
         bal_color = "#dc2626" if closing_balance > 0 else "#16a34a"
         self._lbl_balance.setStyleSheet(f"color:{bal_color};")
