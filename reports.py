@@ -1412,6 +1412,334 @@ class CashBookTab(QWidget):
         _export_table_csv(self.table, f"cash_book_{date_str}.csv", self)
 
 
+# ── Tab 8: Customer Insights ──────────────────────────────────────────────────
+
+# Price-range buckets — (label, min_price_or_None, max_price_or_None)
+_PRICE_RANGES = [
+    ("All Prices",           None,   None),
+    ("Under Rs. 20,000",     None,  20000),
+    ("Rs. 20,000 – 30,000", 20000,  30000),
+    ("Rs. 30,000 – 40,000", 30000,  40000),
+    ("Rs. 40,000 – 50,000", 40000,  50000),
+    ("Rs. 50,000 – 75,000", 50000,  75000),
+    ("Rs. 75,000 – 100,000",75000, 100000),
+    ("Above Rs. 100,000",  100000,   None),
+]
+
+
+def db_customer_insights(from_iso=None, to_iso=None, brand_name=None,
+                          price_min=None, price_max=None, search=None):
+    """
+    Returns one row per unique cash_customer_contact:
+      - Most recent cash sale for that contact number
+      - If that sale has multiple items, the highest-priced item is used
+    All filter parameters apply to this 'representative' purchase.
+
+    Columns returned: cash_customer_name, cash_customer_contact,
+                      model_name, brand_name, final_price, date, iso_date
+    """
+    de_sv = _date_expr("sv.date")
+
+    # Build the outer WHERE clauses and params
+    conds, params = [], []
+    if from_iso:
+        conds.append("ri.iso_date >= ?")
+        params.append(from_iso)
+    if to_iso:
+        conds.append("ri.iso_date <= ?")
+        params.append(to_iso)
+    if brand_name:
+        conds.append("ri.brand_name = ?")
+        params.append(brand_name)
+    if price_min is not None:
+        conds.append("ri.final_price >= ?")
+        params.append(price_min)
+    if price_max is not None:
+        conds.append("ri.final_price < ?")
+        params.append(price_max)
+    if search:
+        like = f"%{search}%"
+        conds.append("(ri.cash_customer_name LIKE ? OR ri.cash_customer_contact LIKE ?)")
+        params += [like, like]
+
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+    sql = f"""
+    WITH ranked_sales AS (
+        -- For each unique contact, rank sales newest-first (ISO date DESC, then id DESC)
+        SELECT
+            sv.id          AS sv_id,
+            sv.date,
+            {de_sv}        AS iso_date,
+            sv.cash_customer_name,
+            sv.cash_customer_contact,
+            ROW_NUMBER() OVER (
+                PARTITION BY sv.cash_customer_contact
+                ORDER BY {de_sv} DESC, sv.id DESC
+            ) AS rn
+        FROM sale_vouchers sv
+        WHERE sv.type = 'cash'
+          AND sv.cash_customer_contact IS NOT NULL
+          AND TRIM(sv.cash_customer_contact) != ''
+    ),
+    latest_sale AS (
+        -- Keep only the most recent sale per contact
+        SELECT sv_id, date, iso_date, cash_customer_name, cash_customer_contact
+        FROM ranked_sales
+        WHERE rn = 1
+    ),
+    ranked_items AS (
+        -- For each latest sale, rank its items highest-price-first
+        SELECT
+            ls.cash_customer_contact,
+            ls.cash_customer_name,
+            ls.date,
+            ls.iso_date,
+            m.name    AS model_name,
+            b.name    AS brand_name,
+            sl.final_price,
+            ROW_NUMBER() OVER (
+                PARTITION BY ls.sv_id
+                ORDER BY sl.final_price DESC, sl.id DESC
+            ) AS item_rn
+        FROM latest_sale ls
+        JOIN sale_lines sl ON sl.sv_id  = ls.sv_id
+        JOIN models     m  ON m.id      = sl.model_id
+        JOIN brands     b  ON b.id      = m.brand_id
+    ),
+    ri AS (
+        SELECT cash_customer_contact, cash_customer_name,
+               date, iso_date, model_name, brand_name, final_price
+        FROM ranked_items
+        WHERE item_rn = 1
+    )
+    SELECT
+        ri.cash_customer_name,
+        ri.cash_customer_contact,
+        ri.model_name,
+        ri.brand_name,
+        ri.final_price,
+        ri.date,
+        ri.iso_date
+    FROM ri
+    {where}
+    ORDER BY ri.iso_date DESC, ri.cash_customer_contact
+    """
+
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return rows
+
+
+class CustomerInsightsTab(QWidget):
+    """
+    Tab 8 — Customer Insights.
+
+    Shows cash customers (one row per unique phone number) with their most
+    recent purchase.  Filters: brand, price range, date range, free-text search.
+    Exports to CSV with date-stamped filename.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # ── Filter card ───────────────────────────────────────────────────────
+        filter_card = QFrame()
+        filter_card.setStyleSheet(CARD_STYLE)
+        fc_layout = QVBoxLayout(filter_card)
+        fc_layout.setContentsMargins(12, 10, 12, 10)
+        fc_layout.setSpacing(8)
+
+        # Row 1: date range + search
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+
+        row1.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addYears(-1))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        row1.addWidget(self.from_date)
+
+        row1.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        row1.addWidget(self.to_date)
+
+        row1.addSpacing(10)
+        row1.addWidget(QLabel("Search:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Name or phone number…")
+        self.search_edit.setMinimumWidth(200)
+        self.search_edit.returnPressed.connect(self.refresh)
+        row1.addWidget(self.search_edit)
+
+        row1.addStretch()
+
+        # Export CSV — top right of filter card
+        self.btn_export = QPushButton("⬇ Export CSV")
+        self.btn_export.setStyleSheet(BTN_PRIMARY)
+        self.btn_export.clicked.connect(self._export)
+        row1.addWidget(self.btn_export)
+
+        fc_layout.addLayout(row1)
+
+        # Row 2: brand + price range + Apply + Reset
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+
+        row2.addWidget(QLabel("Brand:"))
+        self.brand_combo = QComboBox()
+        self.brand_combo.setMinimumWidth(150)
+        self.brand_combo.addItem("All Brands", None)
+        for b in db_brands_list():
+            self.brand_combo.addItem(b["name"], b["name"])
+        row2.addWidget(self.brand_combo)
+
+        row2.addWidget(QLabel("Price Range:"))
+        self.price_combo = QComboBox()
+        self.price_combo.setMinimumWidth(200)
+        for label, pmin, pmax in _PRICE_RANGES:
+            self.price_combo.addItem(label, (pmin, pmax))
+        row2.addWidget(self.price_combo)
+
+        row2.addStretch()
+
+        btn_apply = QPushButton("Apply Filters")
+        btn_apply.setStyleSheet(BTN_SECONDARY)
+        btn_apply.clicked.connect(self.refresh)
+        row2.addWidget(btn_apply)
+
+        btn_reset = QPushButton("Reset")
+        btn_reset.setStyleSheet(BTN_SECONDARY)
+        btn_reset.clicked.connect(self._reset)
+        row2.addWidget(btn_reset)
+
+        fc_layout.addLayout(row2)
+        layout.addWidget(filter_card)
+
+        # ── Results table ─────────────────────────────────────────────────────
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "#", "Customer Name", "Contact Number",
+            "Last Model Bought", "Brand", "Sale Price (Rs.)", "Date of Purchase",
+        ])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)            # #
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          # Name
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Contact
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)          # Model
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents) # Brand
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents) # Price
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents) # Date
+        hdr.setStretchLastSection(False)
+        self.table.setColumnWidth(0, 42)
+        self.table.setStyleSheet(TABLE_STYLE)
+        layout.addWidget(self.table, stretch=1)
+
+        # ── Footer: count ─────────────────────────────────────────────────────
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    # ── Lazy load ─────────────────────────────────────────────────────────────
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    # ── Reset filters ─────────────────────────────────────────────────────────
+    def _reset(self):
+        self.from_date.setDate(QDate.currentDate().addYears(-1))
+        self.to_date.setDate(QDate.currentDate())
+        self.brand_combo.setCurrentIndex(0)
+        self.price_combo.setCurrentIndex(0)
+        self.search_edit.clear()
+        self.refresh()
+
+    # ── Query and populate ────────────────────────────────────────────────────
+    def refresh(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        brand    = self.brand_combo.currentData()      # None or brand name str
+        price_rng = self.price_combo.currentData()     # (min, max) tuple
+        price_min, price_max = price_rng if price_rng else (None, None)
+        search   = self.search_edit.text().strip() or None
+
+        rows = db_customer_insights(
+            from_iso=from_iso,
+            to_iso=to_iso,
+            brand_name=brand,
+            price_min=price_min,
+            price_max=price_max,
+            search=search,
+        )
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+
+        for idx, r in enumerate(rows, start=1):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            # # (sequence number)
+            num = QTableWidgetItem(str(idx))
+            num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, num)
+
+            self.table.setItem(row, 1,
+                QTableWidgetItem(r["cash_customer_name"] or "—"))
+            self.table.setItem(row, 2,
+                QTableWidgetItem(r["cash_customer_contact"] or "—"))
+            self.table.setItem(row, 3,
+                QTableWidgetItem(r["model_name"] or "—"))
+            self.table.setItem(row, 4,
+                QTableWidgetItem(r["brand_name"] or "—"))
+
+            price_item = QTableWidgetItem(fmt_pkr(r["final_price"]))
+            price_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 5, price_item)
+
+            self.table.setItem(row, 6,
+                QTableWidgetItem(r["date"] or "—"))
+
+        self.table.setSortingEnabled(True)
+
+        n = len(rows)
+        if n == 0:
+            # Check whether there are ANY cash sales at all
+            conn = get_connection()
+            any_cash = conn.execute(
+                "SELECT 1 FROM sale_vouchers WHERE type='cash' LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if any_cash:
+                self.footer.setText("No customers found matching the selected filters.")
+            else:
+                self.footer.setText("No cash sales recorded yet.")
+        else:
+            self.footer.setText(
+                f"{n} customer{'s' if n != 1 else ''} found"
+            )
+
+    # ── CSV export ────────────────────────────────────────────────────────────
+    def _export(self):
+        from datetime import date as _dt_date
+        today = _dt_date.today().strftime("%d%m%Y")
+        _export_table_csv(self.table, f"CustomerInsights_{today}.csv", self)
+
+
 # ── Reports Page ──────────────────────────────────────────────────────────────
 
 class ReportsPage(QWidget):
@@ -1452,6 +1780,7 @@ class ReportsPage(QWidget):
         self._tab_purchases  = PurchaseReportTab()
         self._tab_profit     = ProfitReportTab()
         self._tab_cashbook   = CashBookTab()
+        self._tab_customers  = CustomerInsightsTab()
 
         self.tabs.addTab(self._tab_stock,      "Stock Summary")
         self.tabs.addTab(self._tab_imei_stock, "IMEI Stock")
@@ -1460,6 +1789,7 @@ class ReportsPage(QWidget):
         self.tabs.addTab(self._tab_purchases,  "Purchases")
         self.tabs.addTab(self._tab_profit,     "Profit")
         self.tabs.addTab(self._tab_cashbook,   "Cash Book")
+        self.tabs.addTab(self._tab_customers,  "Customer Insights")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
         layout.addWidget(self.tabs)
