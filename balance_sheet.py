@@ -225,7 +225,7 @@ class BalanceSheetPage(QWidget):
         refresh_btn = QPushButton("Refresh")
         refresh_btn.setFixedHeight(32)
         refresh_btn.setStyleSheet(
-            "background:#0891b2;color:white;border-radius:4px;padding:0 14px;font-weight:bold;"
+            "background:#2c6e85;color:white;border-radius:4px;padding:0 14px;font-weight:bold;"
         )
         refresh_btn.clicked.connect(self._refresh)
 
@@ -370,7 +370,7 @@ class BalanceSheetPage(QWidget):
         d = self._data
         lyt = self._content_lyt
 
-        self._add_section(lyt, "ASSETS", "#0891b2")
+        self._add_section(lyt, "ASSETS", "#2c6e85")
         self._add_gap(lyt, 6)
 
         if d["fixed_assets"]:
@@ -384,7 +384,7 @@ class BalanceSheetPage(QWidget):
             for fa in d["fixed_assets"]:
                 self._add_item(lyt, fa["name"], fa["value"], indent=True)
             self._add_item(lyt, "Total Fixed Assets", d["total_fixed"],
-                           bold=True, bg="#e0f2fe")
+                           bold=True, bg="#e5f0f5")
             self._add_gap(lyt, 10)
 
         ca_lbl = QLabel("Current Assets")
@@ -400,16 +400,16 @@ class BalanceSheetPage(QWidget):
         self._add_item(lyt, "Cash in Hand", d["cash"], indent=True)
         self._add_item(lyt, "Bank Balance", d["bank"], indent=True)
         self._add_item(lyt, "Total Current Assets", d["total_current"],
-                       bold=True, bg="#e0f2fe")
+                       bold=True, bg="#e5f0f5")
 
         self._add_gap(lyt, 10)
-        self._add_grand_total(lyt, "TOTAL ASSETS", d["total_assets"], "#0891b2")
+        self._add_grand_total(lyt, "TOTAL ASSETS", d["total_assets"], "#2c6e85")
 
         self._add_gap(lyt, 16)
         self._add_sep(lyt, thick=True)
         self._add_gap(lyt, 16)
 
-        self._add_section(lyt, "LIABILITIES", "#dc2626")
+        self._add_section(lyt, "LIABILITIES", "#8b3535")
         self._add_gap(lyt, 6)
 
         tp_lbl = QLabel("Trade Payables")
@@ -422,7 +422,7 @@ class BalanceSheetPage(QWidget):
         for p in d["payables"]:
             self._add_item(lyt, p["name"], p["balance"], indent=True)
         self._add_item(lyt, "Total Trade Payables", d["total_payables"],
-                       bold=True, bg="#fee2e2")
+                       bold=True, bg="#f0e5e5")
 
         if d["committee_items"]:
             self._add_gap(lyt, 10)
@@ -436,20 +436,20 @@ class BalanceSheetPage(QWidget):
             for ci in d["committee_items"]:
                 self._add_item(lyt, ci["name"], ci["remaining"], indent=True)
             self._add_item(lyt, "Total Committees", d["total_committees"],
-                           bold=True, bg="#fee2e2")
+                           bold=True, bg="#f0e5e5")
 
         self._add_gap(lyt, 10)
-        self._add_grand_total(lyt, "TOTAL LIABILITIES", d["total_liabilities"], "#dc2626")
+        self._add_grand_total(lyt, "TOTAL LIABILITIES", d["total_liabilities"], "#8b3535")
 
         self._add_gap(lyt, 16)
         self._add_sep(lyt, thick=True)
         self._add_gap(lyt, 16)
 
-        self._add_section(lyt, "CAPITAL", "#8e44ad")
+        self._add_section(lyt, "CAPITAL", "#5e3878")
         self._add_gap(lyt, 6)
         for ci in d["capital_items"]:
             self._add_item(lyt, ci["name"], ci["balance"], indent=True)
-        self._add_grand_total(lyt, "TOTAL CAPITAL", d["total_capital"], "#8e44ad")
+        self._add_grand_total(lyt, "TOTAL CAPITAL", d["total_capital"], "#5e3878")
 
         self._add_gap(lyt, 16)
         self._add_sep(lyt, thick=True)
@@ -458,10 +458,10 @@ class BalanceSheetPage(QWidget):
         retained = d["retained"]
         if retained >= 0:
             self._add_item(lyt, "Retained Profit", retained,
-                           bold=True, label_color="#16a34a", amount_color="#16a34a")
+                           bold=True, label_color="#2d7a4f", amount_color="#2d7a4f")
         else:
             self._add_item(lyt, "Retained Loss", retained,
-                           bold=True, label_color="#dc2626", amount_color="#dc2626")
+                           bold=True, label_color="#8b3535", amount_color="#8b3535")
 
         self._add_gap(lyt, 16)
         self._add_sep(lyt, thick=True)
@@ -642,14 +642,14 @@ class BalanceSheetPage(QWidget):
         story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1e293b")))
         story.append(Spacer(1, 8))
 
-        story.append(_section_row("ASSETS", "#0891b2"))
+        story.append(_section_row("ASSETS", "#2c6e85"))
         story.append(Spacer(1, 4))
 
         if d["fixed_assets"]:
             story.append(_cat_row("Fixed Assets"))
             for fa in d["fixed_assets"]:
                 story.append(_indent_row(fa["name"], fa["value"]))
-            story.append(_bold_bg_row("Total Fixed Assets", d["total_fixed"], "#e0f2fe"))
+            story.append(_bold_bg_row("Total Fixed Assets", d["total_fixed"], "#e5f0f5"))
             story.append(Spacer(1, 6))
 
         story.append(_cat_row("Current Assets"))
@@ -657,40 +657,40 @@ class BalanceSheetPage(QWidget):
         story.append(_indent_row("Trade Receivables", d["total_recv"]))
         story.append(_indent_row("Cash in Hand", d["cash"]))
         story.append(_indent_row("Bank Balance", d["bank"]))
-        story.append(_bold_bg_row("Total Current Assets", d["total_current"], "#e0f2fe"))
+        story.append(_bold_bg_row("Total Current Assets", d["total_current"], "#e5f0f5"))
         story.append(Spacer(1, 6))
-        story.append(_grand_row("TOTAL ASSETS", d["total_assets"], "#0891b2"))
+        story.append(_grand_row("TOTAL ASSETS", d["total_assets"], "#2c6e85"))
 
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#64748b")))
         story.append(Spacer(1, 10))
 
-        story.append(_section_row("LIABILITIES", "#dc2626"))
+        story.append(_section_row("LIABILITIES", "#8b3535"))
         story.append(Spacer(1, 4))
         story.append(_cat_row("Trade Payables"))
         for p in d["payables"]:
             story.append(_indent_row(p["name"], p["balance"]))
-        story.append(_bold_bg_row("Total Trade Payables", d["total_payables"], "#fee2e2"))
+        story.append(_bold_bg_row("Total Trade Payables", d["total_payables"], "#f0e5e5"))
 
         if d["committee_items"]:
             story.append(Spacer(1, 6))
             story.append(_cat_row("Committees"))
             for ci in d["committee_items"]:
                 story.append(_indent_row(ci["name"], ci["remaining"]))
-            story.append(_bold_bg_row("Total Committees", d["total_committees"], "#fee2e2"))
+            story.append(_bold_bg_row("Total Committees", d["total_committees"], "#f0e5e5"))
 
         story.append(Spacer(1, 6))
-        story.append(_grand_row("TOTAL LIABILITIES", d["total_liabilities"], "#dc2626"))
+        story.append(_grand_row("TOTAL LIABILITIES", d["total_liabilities"], "#8b3535"))
 
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#64748b")))
         story.append(Spacer(1, 10))
 
-        story.append(_section_row("CAPITAL", "#8e44ad"))
+        story.append(_section_row("CAPITAL", "#5e3878"))
         story.append(Spacer(1, 4))
         for ci in d["capital_items"]:
             story.append(_indent_row(ci["name"], ci["balance"]))
-        story.append(_grand_row("TOTAL CAPITAL", d["total_capital"], "#8e44ad"))
+        story.append(_grand_row("TOTAL CAPITAL", d["total_capital"], "#5e3878"))
 
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#64748b")))
@@ -698,10 +698,10 @@ class BalanceSheetPage(QWidget):
 
         retained = d["retained"]
         if retained >= 0:
-            ret_color = colors.HexColor("#16a34a")
+            ret_color = colors.HexColor("#2d7a4f")
             ret_label = "Retained Profit"
         else:
-            ret_color = colors.HexColor("#dc2626")
+            ret_color = colors.HexColor("#8b3535")
             ret_label = "Retained Loss"
 
         ret_ps_l = _ps("ret_l", bold=True, color=ret_color)
