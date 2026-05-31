@@ -1,0 +1,57 @@
+UNITED MOBILE EPOS — SHOP PC SETUP
+====================================
+
+REQUIREMENTS
+------------
+- Windows 10 or 11
+- Python 3.11 or 3.12  (download from python.org — tick "Add to PATH" during install)
+
+STEP 1 — Install Python packages (run once)
+--------------------------------------------
+Open Command Prompt in this folder and run:
+
+    pip install -r requirements.txt
+
+STEP 2 — Run the app
+---------------------
+Double-click:  start_epos.bat
+
+Or from Command Prompt:
+    python main.py
+
+STEP 3 — First run
+-------------------
+- App PIN is set in Settings (default: no PIN / blank)
+- Shop name, address, contact set in Settings > Shop Info
+- Add your thermal printer name in Settings > Printer
+
+THERMAL PRINTER
+---------------
+- Printer must be installed on Windows as a shared/local printer
+- Enter the exact Windows printer name in Settings > Printer Name
+- If no printer configured, receipts show as a preview dialog
+
+WHATSAPP
+--------
+- WhatsApp must be installed on this PC or linked via WhatsApp Web
+- Scan the QR code once from Settings > WhatsApp
+
+MOBILE APP (salesmen)
+----------------------
+- The API server runs automatically on port 5000 when the app starts
+- Allow TCP port 5000 in Windows Firewall (inbound rule)
+- Salesmen connect via: http://<this-PC-IP>:5000
+- Find this PC's IP: run  ipconfig  in Command Prompt
+
+BACKUPS
+-------
+- Automatic monthly backup saves to the  backups\  folder
+- Manual backup: Settings > Backup Now
+
+FILES IN THIS FOLDER
+---------------------
+united_mobile.db  — All shop data (keep this safe, back it up regularly)
+backups\          — Automatic backup folder
+*.py              — App source files (do not delete or rename)
+icon.ico / .png   — App icon
+CLAUDE.md         — Complete system specification (for reference)
