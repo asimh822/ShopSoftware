@@ -8,7 +8,7 @@ Default port: 5000
 import os
 import sqlite3
 import uuid
-from datetime import date as _date
+from datetime import date as _date, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify
@@ -125,6 +125,15 @@ def api_login():
 
     token = str(uuid.uuid4())
     today = _date.today().strftime("%d/%m/%Y")
+
+    # Prune sessions older than 30 days so the table can't grow unbounded.
+    cutoff_iso = (_date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+    conn.execute(
+        "DELETE FROM sessions WHERE "
+        "substr(created_date,7,4)||'-'||substr(created_date,4,2)||'-'||substr(created_date,1,2) < ?",
+        (cutoff_iso,),
+    )
+
     conn.execute(
         "INSERT INTO sessions (token, salesman_id, created_date) VALUES (?,?,?)",
         (token, salesman["id"], today),
@@ -207,7 +216,8 @@ def api_imei_search():
     conn = get_conn()
     rows = conn.execute("""
         SELECT TRIM(si.imei) imei, b.name brand, m.name model,
-               m.reference_price, si.id stock_item_id, m.id model_id
+               m.reference_price, si.id stock_item_id, m.id model_id,
+               si.purchase_price
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -225,6 +235,7 @@ def api_imei_search():
                 "brand": r["brand"],
                 "model": r["model"],
                 "reference_price": _fmt_pkr(r["reference_price"]),
+                "purchase_price": _fmt_pkr(r["purchase_price"]),
                 "stock_item_id": r["stock_item_id"],
                 "model_id": r["model_id"],
             }
@@ -421,7 +432,7 @@ def api_brands():
             "name": b["name"],
             "models": [
                 {"id": m["id"], "name": m["name"],
-                 "reference_price": _fmt_pkr(m["reference_price"])}
+                 "reference_price": None if m["reference_price"] is None else _fmt_pkr(m["reference_price"])}
                 for m in models
             ],
         })
@@ -451,7 +462,8 @@ def api_sale():
     note                  = (data.get("note") or "").strip()
     overall_discount      = float(data.get("discount") or 0)
     lines                 = data.get("lines") or []
-    payment_method        = (data.get("payment_method") or "cash").strip()
+    _pm = data.get("payment_method")
+    payment_method        = _pm.strip() if _pm and _pm.strip() else None
     cash_paid             = float(data.get("cash_amount") or 0)
     bank_amount           = float(data.get("bank_amount") or 0)
     bank_ref              = (data.get("bank_ref") or "").strip()
@@ -526,7 +538,22 @@ def api_sale():
 
         conn.commit()
         conn.close()
-        return jsonify({"success": True, "sv_number": sv_number})
+
+        # Print thermal receipt on the shop PC. Never fails the API response —
+        # the sale is already committed; we just surface print issues to the client.
+        print_warning = None
+        try:
+            from receipt import print_receipt_headless
+            ok, err = print_receipt_headless(sv_id)
+            if not ok:
+                print_warning = err
+            print(f"[api_sale] receipt sv_id={sv_id} ok={ok} err={err!r}")
+        except Exception as e:
+            print_warning = str(e)
+            print(f"[api_sale] receipt crash: {e}")
+
+        return jsonify({"success": True, "sv_number": sv_number,
+                        "print_warning": print_warning})
 
     except Exception as e:
         conn.rollback()
@@ -585,9 +612,6 @@ def api_purchase():
         bank_account_id = data.get("bank_account_id")
         bank_ref       = (data.get("bank_ref") or "").strip()
 
-        if not egadget_ref:
-            return jsonify({"success": False,
-                            "error": "egadget_ref is required for cash purchases"}), 400
         if payment_method not in ("cash", "bank", "split"):
             return jsonify({"success": False,
                             "error": "payment_method must be cash, bank, or split"}), 400
@@ -642,11 +666,11 @@ def api_purchase():
         # Insert purchase voucher with all columns
         c.execute("""
             INSERT INTO purchase_vouchers
-            (pv_number, supplier_id, date, total_amount, notes,
+            (pv_number, supplier_id, date, total_amount, notes, salesman_id,
              purchase_type, egadget_ref, payment_method,
              cash_amount, bank_amount, bank_account_id, bank_ref)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (pv_number, supplier_id, date_str, total_amount, notes,
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (pv_number, supplier_id, date_str, total_amount, notes, salesman_id,
               purchase_type, egadget_ref, payment_method,
               cash_amount, bank_amount, bank_account_id, bank_ref))
         pv_id = c.lastrowid
@@ -739,6 +763,68 @@ def api_salesman_today():
             }
             for r in sales_rows
         ],
+    })
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GET /api/cash_in_hand
+# Returns: { success, cash_in_hand: <amount> }
+# Formula mirrors db_cash_book() in reports.py — all-time version (no date filter).
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/cash_in_hand", methods=["GET"])
+@require_auth
+def api_cash_in_hand():
+    print("[api] GET /api/cash_in_hand — hit")
+    try:
+        conn = get_conn()
+
+        def _q(sql):
+            return float(conn.execute(sql).fetchone()[0] or 0)
+
+        ob_row = conn.execute(
+            "SELECT value FROM settings WHERE key='cash_opening_balance'"
+        ).fetchone()
+        cash_ob = float(ob_row[0]) if ob_row and ob_row[0] else 0.0
+
+        cash_in_hand = (
+            cash_ob
+            + _q("SELECT COALESCE(SUM(cash_paid),0) FROM sale_vouchers WHERE cash_paid>0")
+            + _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CR'")
+            - _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CP'")
+            - _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CP' AND source='cash_transfer'")
+            + _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CR' AND source='cash_transfer'")
+            + _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='in'")
+            - _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='out'")
+            - _q("SELECT COALESCE(SUM(cash_amount),0) FROM purchase_vouchers WHERE purchase_type='cash' AND cash_amount>0")
+            - _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE payment_method='cash'")
+        )
+
+        conn.close()
+        result = round(cash_in_hand, 2)
+        print(f"[api] /api/cash_in_hand -> {result}")
+        return jsonify({"success": True, "cash_in_hand": result})
+    except Exception as exc:
+        print(f"[api] /api/cash_in_hand ERROR: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GET /api/salesmen
+# Returns: { success, salesmen: [{ id, name }] }  — active salesmen only
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/salesmen", methods=["GET"])
+@require_auth
+def api_salesmen():
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, name FROM salesmen WHERE active=1 ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "success": True,
+        "salesmen": [{"id": r["id"], "name": r["name"]} for r in rows],
     })
 
 

@@ -1,19 +1,18 @@
 /**
  * NewPurchaseScreen — record a purchase on mobile.
  *
- * Flow A — Supplier Purchase (unchanged):
+ * Flow A — Supplier Purchase (credit — goes to supplier ledger):
  *   1. Pick supplier
  *   2. Pick brand → model (pre-fills reference price)
  *   3. Enter IMEI + purchase price, add to list
  *   4. Save → POST /api/purchase  { purchase_type:"supplier", ... }
+ *   No cash changes hands — recorded as a payable to the supplier.
  *
  * Flow B — Cash Purchase (walk-in seller, no supplier):
  *   1. Pick brand → model, enter IMEIs
- *   2. Enter eGadget reference number (mandatory)
- *   3. Select payment method: Cash / Bank Transfer / Split
- *   4. Save → POST /api/purchase  { purchase_type:"cash", ... }
- *      salesman_id is read silently from AsyncStorage (set at login)
- *   5. Show success screen with PV#, eGadget ref, total, payment details
+ *   2. Enter eGadget reference number (optional)
+ *   3. Save → POST /api/purchase  { purchase_type:"cash", payment_method:"cash", ... }
+ *   Always paid in full by cash — no bank or split options.
  */
 
 import React, {useState, useEffect} from 'react';
@@ -33,6 +32,7 @@ import {
 } from 'react-native';
 import {apiGet, apiPost, getSalesmanId} from '../config/api';
 import {fmtPKR, todayDDMMYYYY} from '../utils/formatting';
+import BarcodeScanner, {requestCameraPermission} from '../components/BarcodeScanner';
 
 const C = {
   primary:   '#2E7D32',
@@ -70,10 +70,9 @@ const sr = StyleSheet.create({
 // ── Main component ────────────────────────────────────────────────────────────
 export default function NewPurchaseScreen({navigation}) {
   // ── Master data ────────────────────────────────────────────────────────────
-  const [brands,       setBrands]       = useState([]);
-  const [suppliers,    setSuppliers]    = useState([]);
-  const [bankAccounts, setBankAccounts] = useState([]);
-  const [loading,      setLoading]      = useState(true);
+  const [brands,    setBrands]    = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [loading,   setLoading]   = useState(true);
 
   // ── Purchase type ──────────────────────────────────────────────────────────
   const [purchaseType, setPurchaseType] = useState('supplier'); // 'supplier' | 'cash'
@@ -82,12 +81,27 @@ export default function NewPurchaseScreen({navigation}) {
   const [selectedSupplier, setSelectedSupplier] = useState(null);
 
   // ── Cash purchase mode ─────────────────────────────────────────────────────
-  const [egadgetRef,       setEgadgetRef]       = useState('');
-  const [paymentMethod,    setPaymentMethod]    = useState('cash'); // 'cash'|'bank'|'split'
-  const [selectedBankAcct, setSelectedBankAcct] = useState(null);
-  const [bankRefInput,     setBankRefInput]     = useState('');
-  const [cashAmountStr,    setCashAmountStr]    = useState('');
-  const [bankAmountStr,    setBankAmountStr]    = useState('');
+  const [egadgetRef, setEgadgetRef] = useState('');
+
+  // ── Barcode scanner ───────────────────────────────────────────────────────
+  const [scannerVisible, setScannerVisible] = useState(false);
+
+  const openScanner = async () => {
+    const granted = await requestCameraPermission();
+    if (granted) {
+      setScannerVisible(true);
+    } else {
+      Alert.alert(
+        'Permission Required',
+        'Camera permission is required to scan barcodes. Please enable it in Settings.',
+      );
+    }
+  };
+
+  const handleScanned = (digits) => {
+    setScannerVisible(false);
+    setImeiInput(digits);   // fills the IMEI field; user reviews then taps Add
+  };
 
   // ── Shared (both modes) ────────────────────────────────────────────────────
   const [selectedBrand, setSelectedBrand] = useState(null);
@@ -97,7 +111,7 @@ export default function NewPurchaseScreen({navigation}) {
   const [lines,         setLines]         = useState([]);
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  // pickerModal: null | 'supplier' | 'brand' | 'model' | 'bank'
+  // pickerModal: null | 'supplier' | 'brand' | 'model'
   const [pickerModal,  setPickerModal]  = useState(null);
   const [pickerSearch, setPickerSearch] = useState('');
   const [saving,       setSaving]       = useState(false);
@@ -111,14 +125,12 @@ export default function NewPurchaseScreen({navigation}) {
   const loadMasterData = async () => {
     setLoading(true);
     try {
-      const [bData, sData, baData] = await Promise.all([
+      const [bData, sData] = await Promise.all([
         apiGet('/api/brands'),
         apiGet('/api/suppliers'),
-        apiGet('/api/bank-account'),
       ]);
       setBrands(bData.brands || []);
       setSuppliers(sData.suppliers || []);
-      setBankAccounts(baData.accounts || []);
     } catch (err) {
       if (err.message === 'SESSION_EXPIRED') navigation.replace('Login');
       else Alert.alert('Error', 'Failed to load data. Check connection.');
@@ -137,7 +149,7 @@ export default function NewPurchaseScreen({navigation}) {
 
   const handleSelectModel = model => {
     setSelectedModel(model);
-    setPurchasePrice(String(Math.round(model.reference_price || 0)));
+    setPurchasePrice(model.reference_price != null ? String(Math.round(model.reference_price)) : '');
     setPickerModal(null);
   };
 
@@ -175,25 +187,7 @@ export default function NewPurchaseScreen({navigation}) {
 
   const total = lines.reduce((s, l) => s + l.purchase_price, 0);
 
-  // ── Split auto-calculate ───────────────────────────────────────────────────
-  // Typing cash → auto-fill bank; typing bank → auto-fill cash
-  const handleCashAmountChange = val => {
-    setCashAmountStr(val);
-    const cashVal = parseFloat(val) || 0;
-    if (total > 0) {
-      setBankAmountStr(String(Math.round(Math.max(0, total - cashVal))));
-    }
-  };
-
-  const handleBankAmountChange = val => {
-    setBankAmountStr(val);
-    const bankVal = parseFloat(val) || 0;
-    if (total > 0) {
-      setCashAmountStr(String(Math.round(Math.max(0, total - bankVal))));
-    }
-  };
-
-  // ── Save: Supplier purchase (existing flow — unchanged) ────────────────────
+  // ── Save: Supplier purchase (credit — no cash changes hands) ──────────────
   const handleSaveSupplier = async () => {
     if (!selectedSupplier) {
       Alert.alert('Required', 'Select a supplier.');
@@ -235,45 +229,11 @@ export default function NewPurchaseScreen({navigation}) {
     }
   };
 
-  // ── Save: Cash purchase ────────────────────────────────────────────────────
+  // ── Save: Cash purchase (always paid in full by cash) ─────────────────────
   const handleSaveCash = async () => {
     if (lines.length === 0) {
       Alert.alert('Empty', 'Add at least one phone.');
       return;
-    }
-    if (!egadgetRef.trim()) {
-      Alert.alert('Required', 'eGadget Reference Number is required.');
-      return;
-    }
-    if (paymentMethod === 'bank' && !selectedBankAcct) {
-      Alert.alert('Required', 'Select a bank account for bank transfer.');
-      return;
-    }
-    if (paymentMethod === 'split' && !selectedBankAcct) {
-      Alert.alert('Required', 'Select a bank account for split payment.');
-      return;
-    }
-
-    let cash_amount     = 0;
-    let bank_amount     = 0;
-    let bank_account_id = null;
-
-    if (paymentMethod === 'cash') {
-      cash_amount = total;
-    } else if (paymentMethod === 'bank') {
-      bank_amount     = total;
-      bank_account_id = selectedBankAcct.id;
-    } else {
-      // split
-      cash_amount     = parseFloat(cashAmountStr) || 0;
-      bank_amount     = parseFloat(bankAmountStr) || 0;
-      bank_account_id = selectedBankAcct.id;
-      if (Math.abs((cash_amount + bank_amount) - total) > 1) {
-        Alert.alert('Split Error',
-          `Cash (PKR ${fmtPKR(cash_amount)}) + Bank (PKR ${fmtPKR(bank_amount)})\n` +
-          `must equal total PKR ${fmtPKR(total)}.`);
-        return;
-      }
     }
 
     const salesman_id = await getSalesmanId();
@@ -282,11 +242,11 @@ export default function NewPurchaseScreen({navigation}) {
       egadget_ref:    egadgetRef.trim(),
       date:           today,
       salesman_id:    parseInt(salesman_id),
-      payment_method: paymentMethod,
-      cash_amount,
-      bank_amount,
-      bank_account_id,
-      bank_ref:       bankRefInput.trim(),
+      payment_method: 'cash',
+      cash_amount:    total,
+      bank_amount:    0,
+      bank_account_id: null,
+      bank_ref:       '',
       lines:          lines.map(l => ({
         imei:           l.imei,
         model_id:       l.model_id,
@@ -299,14 +259,10 @@ export default function NewPurchaseScreen({navigation}) {
       const data = await apiPost('/api/purchase', payload);
       if (data.success) {
         setSuccessData({
-          pv_number:      data.pv_number,
-          egadget_ref:    egadgetRef.trim(),
+          pv_number:   data.pv_number,
+          egadget_ref: egadgetRef.trim(),
           total,
-          payment_method: paymentMethod,
-          cash_amount,
-          bank_amount,
-          bank_name:      selectedBankAcct ? selectedBankAcct.name : '',
-          items:          lines.length,
+          items:       lines.length,
         });
       } else {
         Alert.alert('Error', data.error || 'Purchase failed.');
@@ -330,7 +286,6 @@ export default function NewPurchaseScreen({navigation}) {
       pickerModal === 'supplier' ? suppliers
       : pickerModal === 'brand'  ? brands
       : pickerModal === 'model'  ? currentModels
-      : pickerModal === 'bank'   ? bankAccounts
       : [];
     if (!pickerSearch.trim()) return raw;
     const q = pickerSearch.toLowerCase();
@@ -339,11 +294,6 @@ export default function NewPurchaseScreen({navigation}) {
 
   // ── Success screen ─────────────────────────────────────────────────────────
   if (successData) {
-    const pmLabel =
-      successData.payment_method === 'cash'  ? 'Cash' :
-      successData.payment_method === 'bank'  ? `Bank Transfer — ${successData.bank_name}` :
-      `Split  (Cash PKR ${fmtPKR(successData.cash_amount)} / Bank PKR ${fmtPKR(successData.bank_amount)})`;
-
     return (
       <View style={s.successWrap}>
         <View style={s.successIcon}>
@@ -352,10 +302,12 @@ export default function NewPurchaseScreen({navigation}) {
         <Text style={s.successTitle}>Cash Purchase Saved</Text>
         <View style={s.successCard}>
           <SuccessRow label="PV Number"       value={successData.pv_number} />
-          <SuccessRow label="eGadget Ref"     value={successData.egadget_ref} />
+          {!!successData.egadget_ref && (
+            <SuccessRow label="eGadget Ref" value={successData.egadget_ref} />
+          )}
           <SuccessRow label="Items Purchased" value={`${successData.items} phone(s)`} />
           <SuccessRow label="Total Amount"    value={`PKR ${fmtPKR(successData.total)}`} bold />
-          <SuccessRow label="Payment"         value={pmLabel} />
+          <SuccessRow label="Payment"         value="Cash" />
         </View>
         <TouchableOpacity style={s.successDoneBtn} onPress={() => navigation.goBack()}>
           <Text style={s.successDoneTxt}>Done</Text>
@@ -375,10 +327,6 @@ export default function NewPurchaseScreen({navigation}) {
   }
 
   // ── Form ───────────────────────────────────────────────────────────────────
-  const splitCash = parseFloat(cashAmountStr) || 0;
-  const splitBank = parseFloat(bankAmountStr) || 0;
-  const splitOk   = total > 0 && Math.abs((splitCash + splitBank) - total) <= 1;
-
   return (
     <>
       <KeyboardAvoidingView
@@ -455,15 +403,20 @@ export default function NewPurchaseScreen({navigation}) {
           {selectedModel && (
             <View style={s.card}>
               <Text style={s.sectionTitle}>Add IMEI</Text>
-              <TextInput
-                style={s.input}
-                placeholder="IMEI (exactly 15 digits)"
-                placeholderTextColor={C.subtext}
-                value={imeiInput}
-                onChangeText={setImeiInput}
-                keyboardType="number-pad"
-                maxLength={15}
-              />
+              <View style={s.imeiRow}>
+                <TextInput
+                  style={[s.input, s.imeiInput]}
+                  placeholder="IMEI (exactly 15 digits)"
+                  placeholderTextColor={C.subtext}
+                  value={imeiInput}
+                  onChangeText={setImeiInput}
+                  keyboardType="number-pad"
+                  maxLength={15}
+                />
+                <TouchableOpacity style={s.scanBtn} onPress={openScanner}>
+                  <Text style={s.scanBtnIcon}>📷</Text>
+                </TouchableOpacity>
+              </View>
               <View style={s.priceRow}>
                 <Text style={s.priceLbl}>Purchase Price (PKR):</Text>
                 <TextInput
@@ -512,138 +465,20 @@ export default function NewPurchaseScreen({navigation}) {
             </View>
           )}
 
-          {/* ── Cash Purchase Details (cash mode — AFTER phone/IMEI) ─────── */}
+          {/* ── Cash Purchase Details (cash mode — eGadget ref only) ─────── */}
           {purchaseType === 'cash' && (
             <View style={s.card}>
               <Text style={s.sectionTitle}>Cash Purchase Details</Text>
-
-              {/* eGadget Reference */}
-              <Text style={s.fieldLbl}>eGadget Reference # *</Text>
+              <Text style={s.fieldLbl}>eGadget Reference #</Text>
               <TextInput
-                style={[s.input, {marginBottom: 16}]}
-                placeholder="Mandatory — eGadget reference number"
+                style={[s.input, {marginBottom: 4}]}
+                placeholder="Optional — eGadget reference number"
                 placeholderTextColor={C.subtext}
                 value={egadgetRef}
                 onChangeText={setEgadgetRef}
                 autoCapitalize="characters"
                 autoCorrect={false}
               />
-
-              {/* Payment Method Toggle */}
-              <Text style={s.fieldLbl}>Payment Method *</Text>
-              <View style={s.payRow}>
-                <TouchableOpacity
-                  style={[s.payBtn, s.payBtnLeft,
-                          paymentMethod === 'cash' && s.payBtnActive]}
-                  onPress={() => setPaymentMethod('cash')}>
-                  <Text style={[s.payBtnTxt,
-                                paymentMethod === 'cash' && s.payBtnTxtActive]}>
-                    Cash
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[s.payBtn, s.payBtnMid,
-                          paymentMethod === 'bank' && s.payBtnActive]}
-                  onPress={() => setPaymentMethod('bank')}>
-                  <Text style={[s.payBtnTxt,
-                                paymentMethod === 'bank' && s.payBtnTxtActive]}>
-                    Bank
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[s.payBtn, s.payBtnRight,
-                          paymentMethod === 'split' && s.payBtnActive]}
-                  onPress={() => setPaymentMethod('split')}>
-                  <Text style={[s.payBtnTxt,
-                                paymentMethod === 'split' && s.payBtnTxtActive]}>
-                    Split
-                  </Text>
-                </TouchableOpacity>
-              </View>
-
-              {/* Bank Transfer details */}
-              {paymentMethod === 'bank' && (
-                <View style={s.payDetail}>
-                  <Text style={s.fieldLbl}>Bank Account *</Text>
-                  <TouchableOpacity
-                    style={s.pickerBtn}
-                    onPress={() => { setPickerSearch(''); setPickerModal('bank'); }}>
-                    <Text style={[s.pickerTxt,
-                                  !selectedBankAcct && s.pickerPlaceholder]}>
-                      {selectedBankAcct ? selectedBankAcct.name : 'Select Bank Account...'}
-                    </Text>
-                    <Text style={s.pickerArrow}>▼</Text>
-                  </TouchableOpacity>
-                  <Text style={[s.fieldLbl, {marginTop: 12}]}>Bank Reference</Text>
-                  <TextInput
-                    style={s.input}
-                    placeholder="Transfer reference number (optional)"
-                    placeholderTextColor={C.subtext}
-                    value={bankRefInput}
-                    onChangeText={setBankRefInput}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                </View>
-              )}
-
-              {/* Split details — cash amount auto-calculates bank and vice versa */}
-              {paymentMethod === 'split' && (
-                <View style={s.payDetail}>
-                  <View style={s.splitAmtRow}>
-                    <View style={s.splitField}>
-                      <Text style={s.fieldLbl}>Cash Amount (PKR) *</Text>
-                      <TextInput
-                        style={s.input}
-                        placeholder="0"
-                        placeholderTextColor={C.subtext}
-                        value={cashAmountStr}
-                        onChangeText={handleCashAmountChange}
-                        keyboardType="number-pad"
-                      />
-                    </View>
-                    <View style={[s.splitField, {marginLeft: 10}]}>
-                      <Text style={s.fieldLbl}>Bank Amount (PKR) *</Text>
-                      <TextInput
-                        style={s.input}
-                        placeholder="0"
-                        placeholderTextColor={C.subtext}
-                        value={bankAmountStr}
-                        onChangeText={handleBankAmountChange}
-                        keyboardType="number-pad"
-                      />
-                    </View>
-                  </View>
-                  {total > 0 && (
-                    <Text style={[s.splitHint,
-                                  splitOk ? s.splitHintOk : s.splitHintErr]}>
-                      {splitOk
-                        ? `✓ Total matches: PKR ${fmtPKR(total)}`
-                        : `Must equal PKR ${fmtPKR(total)}  (currently PKR ${fmtPKR(splitCash + splitBank)})`}
-                    </Text>
-                  )}
-                  <Text style={[s.fieldLbl, {marginTop: 8}]}>Bank Account *</Text>
-                  <TouchableOpacity
-                    style={s.pickerBtn}
-                    onPress={() => { setPickerSearch(''); setPickerModal('bank'); }}>
-                    <Text style={[s.pickerTxt,
-                                  !selectedBankAcct && s.pickerPlaceholder]}>
-                      {selectedBankAcct ? selectedBankAcct.name : 'Select Bank Account...'}
-                    </Text>
-                    <Text style={s.pickerArrow}>▼</Text>
-                  </TouchableOpacity>
-                  <Text style={[s.fieldLbl, {marginTop: 12}]}>Bank Reference</Text>
-                  <TextInput
-                    style={s.input}
-                    placeholder="Bank transfer reference (optional)"
-                    placeholderTextColor={C.subtext}
-                    value={bankRefInput}
-                    onChangeText={setBankRefInput}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                </View>
-              )}
             </View>
           )}
 
@@ -677,30 +512,27 @@ export default function NewPurchaseScreen({navigation}) {
               <Text style={s.modalTitle}>
                 {pickerModal === 'supplier' ? 'Select Supplier'
                 : pickerModal === 'brand'   ? 'Select Brand'
-                : pickerModal === 'model'   ? 'Select Model'
-                :                            'Select Bank Account'}
+                :                            'Select Model'}
               </Text>
               <TouchableOpacity onPress={() => setPickerModal(null)}>
                 <Text style={s.modalClose}>✕</Text>
               </TouchableOpacity>
             </View>
 
-            {/* Search bar — shown for all except bank */}
-            {pickerModal !== 'bank' && (
-              <View style={s.modalSearch}>
-                <TextInput
-                  style={s.modalSearchInput}
-                  placeholder={
-                    pickerModal === 'supplier' ? 'Search supplier...'
-                    : pickerModal === 'brand'  ? 'Search brand...'
-                    :                           'Search model...'}
-                  placeholderTextColor={C.subtext}
-                  value={pickerSearch}
-                  onChangeText={setPickerSearch}
-                  autoCapitalize="none"
-                />
-              </View>
-            )}
+            {/* Search bar */}
+            <View style={s.modalSearch}>
+              <TextInput
+                style={s.modalSearchInput}
+                placeholder={
+                  pickerModal === 'supplier' ? 'Search supplier...'
+                  : pickerModal === 'brand'  ? 'Search brand...'
+                  :                           'Search model...'}
+                placeholderTextColor={C.subtext}
+                value={pickerSearch}
+                onChangeText={setPickerSearch}
+                autoCapitalize="none"
+              />
+            </View>
 
             <FlatList
               data={getFilteredPickerData()}
@@ -714,16 +546,12 @@ export default function NewPurchaseScreen({navigation}) {
                       setPickerModal(null);
                     } else if (pickerModal === 'brand') {
                       handleSelectBrand(item);
-                    } else if (pickerModal === 'model') {
-                      handleSelectModel(item);
                     } else {
-                      // bank
-                      setSelectedBankAcct(item);
-                      setPickerModal(null);
+                      handleSelectModel(item);
                     }
                   }}>
                   <Text style={s.modalItemTxt}>{item.name}</Text>
-                  {pickerModal === 'model' && (
+                  {pickerModal === 'model' && item.reference_price != null && (
                     <Text style={s.modalItemSub}>
                       Ref: PKR {fmtPKR(item.reference_price)}
                     </Text>
@@ -733,16 +561,19 @@ export default function NewPurchaseScreen({navigation}) {
               ItemSeparatorComponent={() => <View style={s.sep} />}
               keyboardShouldPersistTaps="handled"
               ListEmptyComponent={
-                <Text style={s.emptyTxt}>
-                  {pickerModal === 'bank'
-                    ? 'No bank accounts found. Add accounts in desktop Settings.'
-                    : 'No results found.'}
-                </Text>
+                <Text style={s.emptyTxt}>No results found.</Text>
               }
             />
           </View>
         </View>
       </Modal>
+
+      {/* Barcode / IMEI scanner */}
+      <BarcodeScanner
+        visible={scannerVisible}
+        onScanned={handleScanned}
+        onClose={() => setScannerVisible(false)}
+      />
     </>
   );
 }
@@ -822,6 +653,19 @@ const s = StyleSheet.create({
     color: C.text,
     marginBottom: 10,
   },
+  imeiRow:    {flexDirection: 'row', alignItems: 'center', marginBottom: 0},
+  imeiInput:  {flex: 1, marginBottom: 10},
+  scanBtn:    {
+    marginLeft: 8,
+    marginBottom: 10,
+    backgroundColor: C.primary,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scanBtnIcon: {fontSize: 18},
   priceRow:   {flexDirection: 'row', alignItems: 'center', marginBottom: 12},
   priceLbl:   {fontSize: 14, color: C.text, flex: 1},
   priceInput: {
@@ -835,32 +679,6 @@ const s = StyleSheet.create({
     width: 120,
     textAlign: 'right',
   },
-
-  // ── Payment method toggle ─────────────────────────────────────────────────
-  payRow: {flexDirection: 'row', marginBottom: 14},
-  payBtn: {
-    flex: 1,
-    paddingVertical: 9,
-    alignItems: 'center',
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: C.toggleBdr,
-    backgroundColor: C.toggle,
-  },
-  payBtnLeft:      {borderLeftWidth: 1, borderRightWidth: 0, borderTopLeftRadius: 7, borderBottomLeftRadius: 7},
-  payBtnMid:       {borderLeftWidth: 1, borderRightWidth: 0},
-  payBtnRight:     {borderLeftWidth: 1, borderRightWidth: 1, borderTopRightRadius: 7, borderBottomRightRadius: 7},
-  payBtnActive:    {backgroundColor: C.blue, borderColor: C.blue},
-  payBtnTxt:       {fontSize: 14, fontWeight: '600', color: C.toggleTxt},
-  payBtnTxtActive: {color: '#FFFFFF'},
-
-  // ── Payment detail area ───────────────────────────────────────────────────
-  payDetail:    {marginTop: 4},
-  splitAmtRow:  {flexDirection: 'row'},
-  splitField:   {flex: 1},
-  splitHint:    {fontSize: 13, marginBottom: 10, textAlign: 'center', fontWeight: '500'},
-  splitHintOk:  {color: C.primary},
-  splitHintErr: {color: C.danger},
 
   // ── Add line button ───────────────────────────────────────────────────────
   addBtn:    {backgroundColor: C.primary, borderRadius: 8, padding: 12, alignItems: 'center'},

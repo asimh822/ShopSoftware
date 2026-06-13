@@ -7,14 +7,15 @@ from datetime import date as _date
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QMainWindow,
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
-    QStackedWidget, QFrame,
+    QStackedWidget, QFrame, QGridLayout,
     QDoubleSpinBox, QSpinBox, QComboBox, QDateEdit, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QTextEdit,
 )
-from PyQt6.QtCore import Qt, QObject, QEvent, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QRegularExpression
+from PyQt6.QtGui import QFont, QColor, QRegularExpressionValidator
 
-from database import init_db
-from login import LoginDialog
+from database import init_db, check_pin, check_owner_pin
+from login import LoginDialog, _DIGIT_STYLE, _OK_STYLE, _BACK_STYLE
 from masters import MastersPage
 from purchase import PurchasePage
 from sales import SalePage
@@ -101,25 +102,28 @@ def _stop_api_server() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 NAV_ITEMS = [
-    ("Dashboard",   "dashboard"),
-    ("Masters",     "masters"),
-    ("Purchase",    "purchase"),
-    ("Sales",       "sales"),
-    ("Ledger",      "ledger"),
-    ("Capital",     "capital"),
-    ("Expenses",    "expenses"),
-    ("Reports",     "reports"),
-    ("Bal. Sheet",  "balance_sheet"),
-    ("WhatsApp",    "whatsapp"),
-    ("Settings",    "settings"),
+    ("Dashboard",        "dashboard"),
+    ("Masters",          "masters"),
+    ("Purchase",         "purchase"),
+    ("Sales",            "sales"),
+    ("Cash Payment",     "cp"),
+    ("Cash Receipt",     "cr"),
+    ("Journal Voucher",  "jv"),
+    ("Ledger",           "ledger"),
+    ("Capital",          "capital"),
+    ("Expenses",         "expenses"),
+    ("Reports",          "reports"),
+    ("Bal. Sheet",       "balance_sheet"),
+    ("WhatsApp",         "whatsapp"),
+    ("Settings",         "settings"),
 ]
 
 SIDEBAR_W = 180
-SIDEBAR_BG = "#000000"
-SIDEBAR_HOVER = "#1a1a1a"
+SIDEBAR_BG = "#1a3c40"
+SIDEBAR_HOVER = "#22505a"
 SIDEBAR_ACTIVE = "#2563eb"
-HEADER_BG = "#000000"
-HEADER_BORDER = "#1a1a1a"
+HEADER_BG = "#1a3c40"
+HEADER_BORDER = "#22505a"
 CONTENT_BG = "#f1f5f9"
 
 
@@ -157,7 +161,7 @@ class NavButton(QPushButton):
         self.setCheckable(True)
         self.setFixedHeight(46)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._apply_style(False)
 
     def _apply_style(self, active: bool):
@@ -177,8 +181,6 @@ class NavButton(QPushButton):
                 border-radius: 0px;
                 text-align: left;
                 padding-left: 20px;
-                font-weight: bold;
-                font-size: 12pt;
             }}
             QPushButton:hover {{
                 background: {SIDEBAR_HOVER};
@@ -204,16 +206,16 @@ class Sidebar(QWidget):
         # Logo / shop name
         logo = QLabel("United Mobile")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        logo.setStyleSheet("color: #ffffff; padding: 20px 0 8px 0;")
-        logo.setFixedHeight(60)
+        logo.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        logo.setStyleSheet("color: #ffffff; padding: 8px 0 2px 0;")
+        logo.setFixedHeight(36)
         layout.addWidget(logo)
 
         sub = QLabel("EPOS System")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setFont(QFont("Segoe UI", 9))
-        sub.setStyleSheet("color: #64748b; padding-bottom: 14px;")
-        sub.setFixedHeight(28)
+        sub.setFont(QFont("Segoe UI", 8))
+        sub.setStyleSheet("color: #64748b; padding-bottom: 4px;")
+        sub.setFixedHeight(18)
         layout.addWidget(sub)
 
         sep = QFrame()
@@ -226,8 +228,25 @@ class Sidebar(QWidget):
         self.buttons: dict[str, NavButton] = {}
         for label, key in NAV_ITEMS:
             btn = NavButton(label)
+            if key in ("cp", "cr", "jv"):
+                btn.setCheckable(False)   # dialog launchers — no persistent active state
             self.buttons[key] = btn
             layout.addWidget(btn)
+
+        layout.addSpacing(4)
+
+        # Action buttons — open dialogs (not nav pages)
+        self.duplicate_print_btn = NavButton("Duplicate Print")
+        self.duplicate_print_btn.setCheckable(False)
+        layout.addWidget(self.duplicate_print_btn)
+
+        self.imei_lookup_btn = NavButton("IMEI Lookup")
+        self.imei_lookup_btn.setCheckable(False)
+        layout.addWidget(self.imei_lookup_btn)
+
+        self.lock_btn = NavButton("Lock")
+        self.lock_btn.setCheckable(False)
+        layout.addWidget(self.lock_btn)
 
         layout.addStretch()
 
@@ -287,7 +306,6 @@ class DashboardPage(QWidget):
             ("sales",        "Today's Sales",          "PKR", "#16a34a"),
             ("purchases",    "Today's Purchases",      "PKR", "#7c3aed"),
             ("customers",    "Customers Outstanding",  "PKR", "#d97706"),
-            ("suppliers",    "Suppliers Outstanding",  "PKR", "#dc2626"),
         ]
         for key, label, unit, color in card_defs:
             card, val_lbl = self._make_card(label, unit, color)
@@ -296,9 +314,6 @@ class DashboardPage(QWidget):
 
         bank_card = self._make_bank_card()
         cards_row.addWidget(bank_card)
-
-        cap_card, self._capital_val_lbl = self._make_card("Total Capital", "PKR", "#8e44ad")
-        cards_row.addWidget(cap_card)
 
         layout.addLayout(cards_row)
 
@@ -404,6 +419,20 @@ class DashboardPage(QWidget):
 
         return card
 
+    def _set_card_value(self, label, value, base_size: int = 22):
+        """Set a card's value text and shrink the font once the integer
+        portion reaches 7 digits (>= 1,000,000) so it stays inside the card."""
+        text = _fmt_pkr(value)
+        digit_count = sum(c.isdigit() for c in text)
+        if digit_count >= 9:        # 100,000,000+
+            size = max(12, base_size - 8)
+        elif digit_count >= 7:      # 1,000,000+
+            size = max(14, base_size - 4)
+        else:
+            size = base_size
+        label.setFont(QFont("Segoe UI", size, QFont.Weight.Bold))
+        label.setText(text)
+
     def showEvent(self, event):
         super().showEvent(event)
         self._refresh()
@@ -427,15 +456,6 @@ class DashboardPage(QWidget):
                 (today,),
             ).fetchone()[0]
 
-            sup_outstanding = conn.execute("""
-                SELECT
-                    COALESCE((SELECT SUM(opening_balance) FROM suppliers WHERE id != 0), 0) +
-                    COALESCE((SELECT SUM(total_amount) FROM purchase_vouchers WHERE supplier_id != 0), 0) -
-                    COALESCE((SELECT SUM(amount) FROM payments WHERE party_type='supplier' AND type='CP'), 0) +
-                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='supplier' AND type='debit'), 0) -
-                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='supplier' AND type='credit'), 0)
-            """).fetchone()[0]
-
             cust_outstanding = conn.execute("""
                 SELECT
                     COALESCE((SELECT SUM(opening_balance) FROM customers WHERE type='credit'), 0) +
@@ -447,11 +467,10 @@ class DashboardPage(QWidget):
 
             conn.close()
 
-            self._val_labels["cash_in_hand"].setText(_fmt_pkr(cash_in_hand))
-            self._val_labels["sales"].setText(_fmt_pkr(today_sales))
-            self._val_labels["purchases"].setText(_fmt_pkr(today_purchases))
-            self._val_labels["customers"].setText(_fmt_pkr(cust_outstanding))
-            self._val_labels["suppliers"].setText(_fmt_pkr(sup_outstanding))
+            self._set_card_value(self._val_labels["cash_in_hand"], cash_in_hand, base_size=22)
+            self._set_card_value(self._val_labels["sales"], today_sales, base_size=22)
+            self._set_card_value(self._val_labels["purchases"], today_purchases, base_size=22)
+            self._set_card_value(self._val_labels["customers"], cust_outstanding, base_size=22)
 
             # ── Salesman table ────────────────────────────────────────────────
             from database import db_today_sales_by_salesman
@@ -481,14 +500,568 @@ class DashboardPage(QWidget):
                 self._bank_acct_lbl.setText(names)
             else:
                 self._bank_acct_lbl.setText("Add accounts in Settings")
-            self._bank_val_lbl.setText(_fmt_pkr(db_bank_total_balance()))
+            self._set_card_value(self._bank_val_lbl, db_bank_total_balance(), base_size=20)
 
-            from capital import get_total_capital, get_db
-            _cconn = get_db()
-            self._capital_val_lbl.setText(_fmt_pkr(get_total_capital(_cconn)))
-            _cconn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Dashboard refresh error: {e}")
+
+
+def db_search_sales_for_reprint(query: str) -> list[dict]:
+    """Find sale vouchers for the Duplicate Print dialog.
+
+    The query is matched two ways and the results combined:
+      • As a voucher number — a bare number (e.g. "45") is auto-prefixed and
+        zero-padded to "SV-0045"; the full form "SV-0045" works too.
+      • As the last digits of an IMEI (when the query is all digits).
+
+    Returns one row per matching sale voucher, newest first.
+    """
+    import re
+    from database import get_connection
+    q = query.strip()
+    if not q:
+        return []
+    base = """
+        SELECT sv.id, sv.sv_number, sv.date,
+               COALESCE(c.name, sv.cash_customer_name, 'Walk-in') AS customer_name,
+               sv.total_amount,
+               (SELECT COUNT(*) FROM sale_lines sl2 WHERE sl2.sv_id = sv.id) AS item_count
+        FROM sale_vouchers sv
+        LEFT JOIN customers c ON c.id = sv.customer_id
+    """
+    # Normalize a voucher-number candidate: "45", "SV45", "sv-0045" → "SV-0045"
+    voucher_number = None
+    m = re.fullmatch(r"(?:sv-?)?(\d+)", q, re.IGNORECASE)
+    if m:
+        voucher_number = f"SV-{int(m.group(1)):04d}"
+
+    conn = get_connection()
+    found: dict[int, dict] = {}   # keyed by sv.id to dedupe across both searches
+
+    if voucher_number is not None:
+        for r in conn.execute(
+            base + " WHERE UPPER(TRIM(sv.sv_number)) = UPPER(TRIM(?))",
+            (voucher_number,),
+        ).fetchall():
+            found[r["id"]] = dict(r)
+
+    if q.isdigit():
+        for r in conn.execute(
+            base + """ WHERE sv.id IN (
+                SELECT sl.sv_id FROM sale_lines sl WHERE TRIM(sl.imei) LIKE ?
+            )""",
+            ("%" + q,),
+        ).fetchall():
+            found[r["id"]] = dict(r)
+
+    conn.close()
+    return sorted(found.values(), key=lambda r: r["id"], reverse=True)
+
+
+class DuplicatePrintDialog(QDialog):
+    """Compact dialog to reprint a sale receipt by voucher number or IMEI digits."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Duplicate Print")
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        lbl = QLabel(
+            "Enter a voucher number (e.g. 45 or SV-0045) or the last few digits "
+            "of an IMEI:"
+        )
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        row = QHBoxLayout()
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("45,  SV-0045,  or IMEI digits")
+        # Let Enter trigger the search instead of tab-navigating away
+        self._input.setProperty("enterKeepDefault", True)
+        self._input.returnPressed.connect(self._search)
+        row.addWidget(self._input, stretch=1)
+        find_btn = QPushButton("Find")
+        find_btn.clicked.connect(self._search)
+        row.addWidget(find_btn)
+        layout.addLayout(row)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color:#64748b; font-size:9pt;")
+        layout.addWidget(self._status)
+
+        self._list = QListWidget()
+        self._list.setMinimumHeight(150)
+        self._list.itemDoubleClicked.connect(lambda _it: self._print_selected())
+        self._list.hide()
+        layout.addWidget(self._list)
+
+        self._print_btn = QPushButton("Print Selected")
+        self._print_btn.clicked.connect(self._print_selected)
+        self._print_btn.hide()
+        layout.addWidget(self._print_btn)
+
+    def _search(self):
+        q = self._input.text().strip()
+        if not q:
+            self._status.setText("Type a voucher number or IMEI digits.")
+            return
+        matches = db_search_sales_for_reprint(q)
+        if not matches:
+            self._list.hide()
+            self._print_btn.hide()
+            self._status.setText("")
+            QMessageBox.information(self, "Not Found", f"No sale found for '{q}'.")
+            return
+        if len(matches) == 1:
+            self._do_print(matches[0])
+            return
+        # Multiple matches — let the user pick one
+        self._status.setText(f"{len(matches)} matches found — pick one to print:")
+        self._list.clear()
+        for m in matches:
+            item = QListWidgetItem(
+                f"{m['sv_number']}   ·   {m['date']}   ·   {m['customer_name']}"
+                f"   ·   PKR {_fmt_pkr(m['total_amount'])}   ({m['item_count']} item(s))"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, m)
+            self._list.addItem(item)
+        self._list.setCurrentRow(0)
+        self._list.show()
+        self._print_btn.show()
+
+    def _print_selected(self):
+        item = self._list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Select", "Select a voucher from the list first.")
+            return
+        self._do_print(item.data(Qt.ItemDataRole.UserRole))
+
+    def _do_print(self, match: dict):
+        from receipt import print_receipt
+        print_receipt(match["id"], parent=self)
+        self.accept()
+
+
+def db_imei_lookup_candidates(digits: str) -> list[str]:
+    """Distinct full IMEIs containing the given digits (any position).
+
+    Searches every table that stores an IMEI so the lookup works even for
+    purchase-returned items (no stock_items row) or older data.
+    """
+    from database import get_connection
+    d = digits.strip()
+    if len(d) < 5 or not d.isdigit():
+        return []
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT DISTINCT imei FROM (
+            SELECT TRIM(imei) AS imei FROM purchase_lines
+            UNION
+            SELECT TRIM(imei) AS imei FROM sale_lines
+            UNION
+            SELECT TRIM(imei) AS imei FROM stock_items
+        )
+        WHERE imei LIKE ?
+        ORDER BY imei
+    """, ("%" + d + "%",)).fetchall()
+    conn.close()
+    return [r["imei"] for r in rows]
+
+
+def db_imei_full_history(imei: str) -> dict | None:
+    """Full purchase + sale history for one exact IMEI, or None if not found.
+
+    Purchase and sale are the most recent of each (an IMEI can be repurchased
+    after being sold). stock_status reflects the current stock_items state.
+    """
+    from database import get_connection
+    conn = get_connection()
+    purchase = conn.execute("""
+        SELECT pv.date AS date,
+               COALESCE(s.name, 'Cash Purchase') AS supplier_name,
+               pl.purchase_price AS purchase_price,
+               pv.pv_number AS pv_number,
+               b.name AS brand_name, m.name AS model_name
+        FROM purchase_lines pl
+        JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id
+        LEFT JOIN models m ON m.id = pl.model_id
+        LEFT JOIN brands b ON b.id = m.brand_id
+        WHERE TRIM(pl.imei) = ?
+        ORDER BY pv.id DESC
+        LIMIT 1
+    """, (imei,)).fetchone()
+
+    sale = conn.execute("""
+        SELECT sv.date AS date, sv.type AS sale_type,
+               c.name AS customer_name,
+               sv.cash_customer_name AS cash_name,
+               sv.cash_customer_contact AS cash_contact,
+               sl.final_price AS final_price,
+               sv.sv_number AS sv_number,
+               sm.name AS salesman_name
+        FROM sale_lines sl
+        JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        LEFT JOIN customers c ON c.id = sv.customer_id
+        LEFT JOIN salesmen sm ON sm.id = sv.salesman_id
+        WHERE TRIM(sl.imei) = ?
+        ORDER BY sv.id DESC
+        LIMIT 1
+    """, (imei,)).fetchone()
+
+    stock = conn.execute(
+        "SELECT status FROM stock_items WHERE TRIM(imei) = ?", (imei,)
+    ).fetchone()
+    conn.close()
+
+    if not purchase and not sale and not stock:
+        return None
+    return {
+        "imei": imei,
+        "purchase": dict(purchase) if purchase else None,
+        "sale": dict(sale) if sale else None,
+        "stock_status": stock["status"] if stock else None,
+    }
+
+
+class ImeiLookupDialog(QDialog):
+    """Look up the full purchase + sale history of an IMEI by any 5+ digits."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("IMEI Lookup")
+        self.setMinimumWidth(480)
+        self.resize(520, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        lbl = QLabel("Enter at least 5 digits of the IMEI (any part):")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        row = QHBoxLayout()
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("e.g. 12345")
+        self._input.setMaxLength(15)
+        self._input.setProperty("enterKeepDefault", True)
+        self._input.returnPressed.connect(self._search)
+        row.addWidget(self._input, stretch=1)
+        find_btn = QPushButton("Search")
+        find_btn.clicked.connect(self._search)
+        row.addWidget(find_btn)
+        layout.addLayout(row)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color:#64748b; font-size:9pt;")
+        layout.addWidget(self._status)
+
+        # Candidate picker — shown only when multiple IMEIs match
+        self._list = QListWidget()
+        self._list.setMaximumHeight(120)
+        self._list.itemClicked.connect(
+            lambda it: self._show_history(it.data(Qt.ItemDataRole.UserRole))
+        )
+        self._list.hide()
+        layout.addWidget(self._list)
+
+        self._result = QTextEdit()
+        self._result.setReadOnly(True)
+        self._result.setStyleSheet(
+            "QTextEdit { background:#ffffff; color:#1e293b; border:1px solid #e2e8f0; "
+            "border-radius:6px; font-size:11pt; }"
+        )
+        layout.addWidget(self._result, stretch=1)
+
+    def _search(self):
+        digits = self._input.text().strip()
+        self._list.hide()
+        self._result.clear()
+        if len(digits) < 5 or not digits.isdigit():
+            self._status.setText("Enter at least 5 digits (numbers only).")
+            return
+        candidates = db_imei_lookup_candidates(digits)
+        if not candidates:
+            self._status.setText("")
+            self._result.setPlainText("IMEI not found.")
+            return
+        if len(candidates) == 1:
+            self._status.setText("")
+            self._show_history(candidates[0])
+            return
+        # Multiple matches — let the user pick
+        self._status.setText(f"{len(candidates)} IMEIs match — select one:")
+        self._list.clear()
+        for imei in candidates:
+            item = QListWidgetItem(imei)
+            item.setData(Qt.ItemDataRole.UserRole, imei)
+            self._list.addItem(item)
+        self._list.show()
+
+    def _show_history(self, imei: str):
+        hist = db_imei_full_history(imei)
+        if not hist:
+            self._result.setPlainText("IMEI not found.")
+            return
+
+        out = [f"IMEI: {imei}", ""]
+
+        p = hist["purchase"]
+        out.append("── Purchase Info ──")
+        if p:
+            out.append(f"Date of Purchase : {p['date']}")
+            out.append(f"Brand            : {p['brand_name'] or '—'}")
+            out.append(f"Model            : {p['model_name'] or '—'}")
+            out.append(f"Supplier         : {p['supplier_name']}")
+            out.append(f"Purchase Price   : Rs. {_fmt_pkr(p['purchase_price'])}")
+            out.append(f"PV Number        : {p['pv_number']}")
+        else:
+            out.append("(no purchase record found)")
+        out.append("")
+
+        s = hist["sale"]
+        if s:
+            if s["sale_type"] == "cash":
+                cust = s["cash_name"] or "Walk-in"
+                if s["cash_contact"]:
+                    cust += f" ({s['cash_contact']})"
+            else:
+                cust = s["customer_name"] or "—"
+            out.append("── Sale Info ──")
+            out.append(f"Date of Sale     : {s['date']}")
+            out.append(f"Customer         : {cust}")
+            out.append(f"Final Sale Price : Rs. {_fmt_pkr(s['final_price'])}")
+            out.append(f"SV Number        : {s['sv_number']}")
+            out.append(f"Salesman         : {s['salesman_name'] or '—'}")
+        else:
+            out.append("── Sale Info ──")
+            out.append("Not Yet Sold — Currently In Stock")
+
+        self._result.setPlainText("\n".join(out))
+
+
+class LockOverlay(QWidget):
+    """Opaque full-window lock screen.
+
+    Covers the entire app (sidebar + all content) with a centred PIN entry so
+    nothing behind it is visible. Calls on_unlock() when the correct PIN is
+    entered. This is a LOCK, not a logout — the app keeps running behind it.
+    """
+
+    def __init__(self, parent, on_unlock):
+        super().__init__(parent)
+        self._on_unlock = on_unlock
+        self._pin = ""
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # Fully opaque background matching the app, so no content shows through.
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), QColor("#f8fafc"))
+        self.setPalette(pal)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(40, 40, 40, 40)
+        root.addStretch()
+
+        brand = QLabel("United Mobile — Locked")
+        brand.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        brand.setStyleSheet("color:#1e293b; background:transparent;")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(brand)
+
+        root.addSpacing(4)
+        sub = QLabel("Enter PIN to unlock")
+        sub.setFont(QFont("Segoe UI", 11))
+        sub.setStyleSheet("color:#64748b; background:transparent;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(sub)
+
+        root.addSpacing(24)
+
+        # PIN dot indicators (supports 4–6 digit PINs)
+        dots_row = QHBoxLayout()
+        dots_row.setSpacing(14)
+        dots_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dots: list[QLabel] = []
+        for _ in range(6):
+            dot = QLabel("○")
+            dot.setFont(QFont("Segoe UI", 22))
+            dot.setStyleSheet("color:#cbd5e1; background:transparent;")
+            dot.setFixedWidth(32)
+            dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dots_row.addWidget(dot)
+            self._dots.append(dot)
+        root.addLayout(dots_row)
+
+        self._err = QLabel("")
+        self._err.setStyleSheet("color:#dc2626; font-size:9pt; background:transparent;")
+        self._err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._err.setFixedHeight(20)
+        root.addWidget(self._err)
+
+        root.addSpacing(16)
+
+        # Keypad — phone layout: 1 2 3 / 4 5 6 / 7 8 9 / ⌫ 0 ✓
+        grid = QGridLayout()
+        grid.setSpacing(14)
+        grid.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rows = [("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9"), ("⌫", "0", "✓")]
+        for r, keys in enumerate(rows):
+            for c, key in enumerate(keys):
+                btn = QPushButton(key)
+                btn.setFixedSize(72, 72)
+                btn.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+                btn.setAutoDefault(False)
+                btn.setDefault(False)
+                if key == "✓":
+                    btn.setStyleSheet(_OK_STYLE)
+                    btn.clicked.connect(self._submit)
+                elif key == "⌫":
+                    btn.setStyleSheet(_BACK_STYLE)
+                    btn.clicked.connect(self._backspace)
+                else:
+                    btn.setStyleSheet(_DIGIT_STYLE)
+                    btn.clicked.connect(lambda _, k=key: self._digit(k))
+                grid.addWidget(btn, r, c)
+
+        grid_wrap = QHBoxLayout()
+        grid_wrap.addStretch()
+        grid_wrap.addLayout(grid)
+        grid_wrap.addStretch()
+        root.addLayout(grid_wrap)
+
+        root.addStretch()
+
+    def reset(self):
+        self._pin = ""
+        self._err.setText("")
+        self._refresh_dots()
+
+    def _digit(self, d: str):
+        if len(self._pin) < 6:
+            self._pin += d
+            self._refresh_dots()
+            self._err.setText("")
+            # Auto-unlock the moment the entered digits match the stored PIN
+            if check_pin(self._pin):
+                self._unlock()
+
+    def _backspace(self):
+        if self._pin:
+            self._pin = self._pin[:-1]
+            self._refresh_dots()
+            self._err.setText("")
+
+    def _submit(self):
+        if not self._pin:
+            return
+        if check_pin(self._pin):
+            self._unlock()
+        else:
+            self._pin = ""
+            self._refresh_dots()
+            self._err.setText("Incorrect PIN. Please try again.")
+
+    def _unlock(self):
+        self.reset()
+        self._on_unlock()
+
+    def _refresh_dots(self):
+        for i, dot in enumerate(self._dots):
+            filled = i < len(self._pin)
+            dot.setText("●" if filled else "○")
+            dot.setStyleSheet(
+                ("color:#2563eb;" if filled else "color:#cbd5e1;")
+                + " font-size:22pt; background:transparent;"
+            )
+
+    def keyPressEvent(self, event):
+        key = event.text()
+        if key.isdigit():
+            self._digit(key)
+        elif event.key() == Qt.Key.Key_Backspace:
+            self._backspace()
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._submit()
+        # All other keys (e.g. Escape) are swallowed so the lock can't be bypassed
+
+
+class OwnerPinDialog(QDialog):
+    """Modal owner-PIN gate for the Capital and Settings screens.
+
+    A 4-digit input box with a Confirm button. Auto-submits on the 4th digit,
+    shows 'Incorrect PIN' and clears on a wrong entry, allows unlimited retries.
+    accept() fires only on the correct owner PIN (see database.check_owner_pin).
+    This is separate from the app lock/logoff PIN (check_pin).
+    """
+
+    def __init__(self, parent=None, target_name="this section"):
+        super().__init__(parent)
+        self.setWindowTitle("Owner PIN Required")
+        self.setModal(True)
+        self.setFixedWidth(320)
+
+        lyt = QVBoxLayout(self)
+        lyt.setContentsMargins(24, 20, 24, 20)
+        lyt.setSpacing(12)
+
+        title = QLabel("Owner PIN")
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lyt.addWidget(title)
+
+        sub = QLabel(f"Enter the owner PIN to open {target_name}.")
+        sub.setStyleSheet("color:#64748b; font-size:9pt;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
+        lyt.addWidget(sub)
+
+        self._input = QLineEdit()
+        self._input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._input.setMaxLength(4)
+        self._input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._input.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        # Digits only (0–4 of them); allows leading zeros, unlike QIntValidator.
+        self._input.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"[0-9]{0,4}"), self)
+        )
+        self._input.setPlaceholderText("• • • •")
+        self._input.textChanged.connect(self._on_text)
+        lyt.addWidget(self._input)
+
+        self._err = QLabel("")
+        self._err.setStyleSheet("color:#dc2626; font-size:9pt;")
+        self._err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._err.setFixedHeight(16)
+        lyt.addWidget(self._err)
+
+        confirm = QPushButton("Confirm")
+        confirm.setStyleSheet(_OK_STYLE)
+        confirm.setFixedHeight(40)
+        confirm.setAutoDefault(False)
+        confirm.setDefault(False)
+        confirm.clicked.connect(self._submit)
+        lyt.addWidget(confirm)
+
+        self._input.setFocus()
+
+    def _on_text(self, text: str):
+        self._err.setText("")
+        if len(text) == 4:          # auto-submit once 4 digits are entered
+            self._submit()
+
+    def _submit(self):
+        if check_owner_pin(self._input.text()):
+            self.accept()
+        else:
+            self._input.clear()
+            self._err.setText("Incorrect PIN")
 
 
 class MainWindow(QMainWindow):
@@ -500,6 +1073,7 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
+        self._central = central
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -520,6 +1094,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.setStyleSheet(f"background: {CONTENT_BG};")
         right_layout.addWidget(self.stack, stretch=1)
+        self._current_key = "dashboard"   # tracks the open page for the owner-PIN gate
 
         # Notification bar — hidden by default, shown briefly after auto-backup
         self._notif_bar = self._make_notif_bar()
@@ -542,6 +1117,15 @@ class MainWindow(QMainWindow):
 
         for key, btn in self.sidebar.buttons.items():
             btn.clicked.connect(lambda checked, k=key: self._navigate(k))
+
+        self.sidebar.duplicate_print_btn.clicked.connect(self._open_duplicate_print)
+        self.sidebar.imei_lookup_btn.clicked.connect(self._open_imei_lookup)
+        self.sidebar.lock_btn.clicked.connect(self._lock)
+
+        # Lock overlay — child of central so it can cover sidebar + content.
+        # Created last so it sits on top of all siblings; hidden until locked.
+        self._lock_overlay = LockOverlay(central, on_unlock=self._unlock)
+        self._lock_overlay.hide()
 
         # Wire "Use in Sale" from IMEI Stock report → Sales form
         reports_page = self._pages.get("reports")
@@ -621,11 +1205,58 @@ class MainWindow(QMainWindow):
         self._pages[key] = page
         self.stack.addWidget(page)
 
+    # Sidebar pages that require the owner PIN before opening.
+    _OWNER_PROTECTED = {"capital", "settings"}
+
     def _navigate(self, key: str):
+        # Dialog-only items — open the form without switching pages or updating active state
+        if key in ("cp", "cr", "jv"):
+            ledger = self._pages.get("ledger")
+            if ledger:
+                if key == "cp":
+                    ledger._standalone_cp()
+                elif key == "cr":
+                    ledger._standalone_cr()
+                elif key == "jv":
+                    ledger._standalone_jv()
+            return
+
+        label = dict(NAV_ITEMS).get(key, key.capitalize())
+        if key in self._OWNER_PROTECTED:
+            dlg = OwnerPinDialog(self, target_name=label)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                # Wrong PIN or cancelled — stay put; restore the sidebar highlight.
+                self.sidebar.set_active(self._current_key)
+                return
         self.sidebar.set_active(key)
         self.stack.setCurrentWidget(self._pages[key])
-        label = dict(NAV_ITEMS).get(key, key.capitalize())
         self._header_page_label.setText(label)
+        self._current_key = key
+
+    def _open_duplicate_print(self):
+        DuplicatePrintDialog(self).exec()
+
+    def _open_imei_lookup(self):
+        ImeiLookupDialog(self).exec()
+
+    def _lock(self):
+        """Cover the whole window with the PIN overlay. The app keeps running."""
+        self._lock_overlay.setGeometry(self._central.rect())
+        self._lock_overlay.reset()
+        self._lock_overlay.show()
+        self._lock_overlay.raise_()
+        self._lock_overlay.setFocus()
+
+    def _unlock(self):
+        """Correct PIN entered — hide the overlay and return to the dashboard."""
+        self._lock_overlay.hide()
+        self._navigate("dashboard")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the lock overlay covering the entire window while it's visible.
+        if getattr(self, "_lock_overlay", None) and self._lock_overlay.isVisible():
+            self._lock_overlay.setGeometry(self._central.rect())
 
     def _use_imei_in_sale(self, imei: str):
         sales_page = self._pages.get("sales")
@@ -685,6 +1316,18 @@ def main():
         }
         QLineEdit:focus { border: 2px solid #2563eb; }
         QLineEdit:disabled { background: #f1f5f9; color: #94a3b8; border-color: #e2e8f0; }
+
+        /* Inline table-cell editors (double-click to edit a cell): slightly
+           larger than the 10pt display font and bold, so they are easy to read
+           and type. Reverts to normal cell styling once the edit is committed.
+           Applies to every editable cell in every table app-wide. */
+        QAbstractItemView QLineEdit,
+        QAbstractItemView QDoubleSpinBox,
+        QAbstractItemView QSpinBox {
+            font-size: 12pt; font-weight: bold;
+            color: #1e293b; background: #ffffff;
+            border: 2px solid #2563eb; border-radius: 3px; padding: 1px 4px;
+        }
 
         QTextEdit {
             background: #ffffff; color: #1e293b;

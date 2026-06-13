@@ -6,13 +6,15 @@
  *     If found → auto-fills Name + shows Welcome Back popup
  *  2. Enter Customer Name (mandatory)
  *  3. IMEI search → add lines → save
+ *  Payment is always cash — full amount, no selector.
  *
  * Credit flow:
  *  1. Select credit customer from searchable dropdown (loads /api/customers/list)
  *  2. IMEI search → add lines → save
+ *  No payment collected — goes to customer ledger as receivable.
  */
 
-import React, {useState, useEffect, useRef, useCallback} from 'react';
+import React, {useState, useEffect, useRef} from 'react';
 import {
   View,
   Text,
@@ -29,6 +31,7 @@ import {
 } from 'react-native';
 import {apiGet, apiPost, getSalesmanId} from '../config/api';
 import {fmtPKR, todayDDMMYYYY, isValidPakistaniPhone, titleCase} from '../utils/formatting';
+import BarcodeScanner, {requestCameraPermission} from '../components/BarcodeScanner';
 
 const COLORS = {
   primary: '#1565C0',
@@ -54,7 +57,7 @@ export default function NewSaleScreen({navigation}) {
   // ── Credit customer dropdown ──────────────────────────────────────────────
   const [creditCustomers, setCreditCustomers] = useState([]);
   const [loadingCreditCustomers, setLoadingCreditCustomers] = useState(false);
-  const [creditCustomer, setCreditCustomer] = useState(null); // selected {id, name, contact, balance}
+  const [creditCustomer, setCreditCustomer] = useState(null);
   const [creditPickerVisible, setCreditPickerVisible] = useState(false);
   const [creditSearch, setCreditSearch] = useState('');
 
@@ -65,15 +68,28 @@ export default function NewSaleScreen({navigation}) {
   const imeiDebounce = useRef(null);
 
   // ── Sale lines ────────────────────────────────────────────────────────────
-  const [lines, setLines] = useState([]); // [{imei, model, brandModel, referencePrice, finalPrice, stock_item_id, model_id}]
+  const [lines, setLines] = useState([]);
   const [discount, setDiscount] = useState('0');
 
-  // ── Payment method ────────────────────────────────────────────────────────
-  const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'bank' | 'split'
-  const [bankAccounts, setBankAccounts] = useState([]);
-  const [selectedBankId, setSelectedBankId] = useState(null);
-  const [bankRef, setBankRef] = useState('');
-  const [splitCash, setSplitCash] = useState('');
+  // ── Barcode scanner ───────────────────────────────────────────────────────
+  const [scannerVisible, setScannerVisible] = useState(false);
+
+  const openScanner = async () => {
+    const granted = await requestCameraPermission();
+    if (granted) {
+      setScannerVisible(true);
+    } else {
+      Alert.alert(
+        'Permission Required',
+        'Camera permission is required to scan barcodes. Please enable it in Settings.',
+      );
+    }
+  };
+
+  const handleScanned = (digits) => {
+    setScannerVisible(false);
+    onImeiChange(digits);
+  };
 
   // ── Submission ────────────────────────────────────────────────────────────
   const [saving, setSaving] = useState(false);
@@ -86,17 +102,6 @@ export default function NewSaleScreen({navigation}) {
       loadCreditCustomers();
     }
   }, [saleType]);
-
-  // Load bank accounts on mount
-  useEffect(() => {
-    apiGet('/api/bank-account')
-      .then(data => {
-        const accs = data.accounts || [];
-        setBankAccounts(accs);
-        if (accs.length > 0) setSelectedBankId(accs[0].id);
-      })
-      .catch(() => {}); // non-critical — if no bank accounts, bank options stay empty
-  }, []);
 
   // ── Credit customers ──────────────────────────────────────────────────────
 
@@ -187,7 +192,8 @@ export default function NewSaleScreen({navigation}) {
         model: item.model,
         brandModel: `${item.brand} ${item.model}`,
         referencePrice: item.reference_price,
-        finalPrice: String(Math.round(item.reference_price)),
+        purchasePrice: item.purchase_price || 0,
+        finalPrice: String(Math.round(item.reference_price || 0)),
         stock_item_id: item.stock_item_id,
         model_id: item.model_id,
       },
@@ -211,10 +217,6 @@ export default function NewSaleScreen({navigation}) {
   const subtotal = lines.reduce((s, l) => s + (parseFloat(l.finalPrice) || 0), 0);
   const discountAmt = parseFloat(discount) || 0;
   const total = Math.max(0, subtotal - discountAmt);
-
-  // Split payment: bank amount is auto-calculated
-  const splitCashAmt = parseFloat(splitCash) || 0;
-  const splitBankAmt = Math.max(0, total - splitCashAmt);
 
   // ── Save ──────────────────────────────────────────────────────────────────
 
@@ -248,50 +250,39 @@ export default function NewSaleScreen({navigation}) {
       }
     }
 
-    // Validate payment method
-    if (paymentMethod === 'bank' || paymentMethod === 'split') {
-      if (!selectedBankId) {
-        Alert.alert('Payment', 'Select a bank account.');
-        return;
-      }
-    }
-    if (paymentMethod === 'split') {
-      if (splitCashAmt <= 0) {
-        Alert.alert('Payment', 'Enter the cash portion for split payment.');
-        return;
-      }
-      if (splitCashAmt >= total) {
-        Alert.alert('Payment', 'Cash portion must be less than total. Use "Cash" method instead.');
-        return;
-      }
+    // ── Below-cost confirmation ───────────────────────────────────────────
+    const belowCostLines = lines.filter(
+      l => l.purchasePrice > 0 && parseFloat(l.finalPrice) < l.purchasePrice,
+    );
+    if (belowCostLines.length > 0) {
+      const proceed = await new Promise(resolve => {
+        Alert.alert(
+          'Below Cost Warning',
+          'One or more items are being sold below purchase price. Do you want to continue?',
+          [
+            {text: 'Go Back', style: 'cancel', onPress: () => resolve(false)},
+            {text: 'Continue', onPress: () => resolve(true)},
+          ],
+          {cancelable: false},
+        );
+      });
+      if (!proceed) return;
     }
 
     const salesman_id = await getSalesmanId();
 
-    // Build payment amounts
-    let cashAmount = 0;
-    let bankAmount = 0;
-    if (paymentMethod === 'cash') {
-      cashAmount = total;
-      bankAmount = 0;
-    } else if (paymentMethod === 'bank') {
-      cashAmount = 0;
-      bankAmount = total;
-    } else {
-      cashAmount = splitCashAmt;
-      bankAmount = splitBankAmt;
-    }
+    // Cash sales: always full cash payment. Credit sales: no upfront payment.
+    const payment_method = saleType === 'cash' ? 'cash' : null;
+    const cash_amount = saleType === 'cash' ? total : 0;
 
     const payload = {
       type: saleType,
       date: today,
       salesman_id: parseInt(salesman_id),
       discount: discountAmt,
-      payment_method: paymentMethod,
-      cash_amount: cashAmount,
-      bank_amount: bankAmount,
-      bank_ref: bankRef.trim(),
-      bank_account_id: (paymentMethod === 'cash') ? null : selectedBankId,
+      payment_method,
+      cash_amount,
+      bank_amount: 0,
       lines: lines.map(l => ({
         imei: l.imei,
         stock_item_id: l.stock_item_id,
@@ -473,6 +464,9 @@ export default function NewSaleScreen({navigation}) {
               {searchingImei && (
                 <ActivityIndicator style={styles.spinner} color={COLORS.primary} />
               )}
+              <TouchableOpacity style={styles.scanBtn} onPress={openScanner}>
+                <Text style={styles.scanBtnIcon}>📷</Text>
+              </TouchableOpacity>
             </View>
 
             {imeiResults.length > 0 && (
@@ -523,6 +517,13 @@ export default function NewSaleScreen({navigation}) {
                       keyboardType="number-pad"
                     />
                   </View>
+                  {line.purchasePrice > 0 &&
+                   parseFloat(line.finalPrice) > 0 &&
+                   parseFloat(line.finalPrice) < line.purchasePrice && (
+                    <Text style={styles.belowCostWarn}>
+                      {'⚠ Selling below cost — Purchase price: Rs. ' + fmtPKR(line.purchasePrice)}
+                    </Text>
+                  )}
                 </View>
               ))}
 
@@ -543,142 +544,6 @@ export default function NewSaleScreen({navigation}) {
             </View>
           )}
 
-          {/* Payment method */}
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Payment Method</Text>
-
-            {/* Method selector buttons */}
-            <View style={styles.payToggleRow}>
-              {['cash', 'bank', 'split'].map(m => (
-                <TouchableOpacity
-                  key={m}
-                  style={[
-                    styles.payToggleBtn,
-                    paymentMethod === m && styles.payToggleBtnActive,
-                  ]}
-                  onPress={() => setPaymentMethod(m)}>
-                  <Text
-                    style={[
-                      styles.payToggleBtnText,
-                      paymentMethod === m && styles.payToggleBtnTextActive,
-                    ]}>
-                    {m === 'cash' ? '💵 Cash' : m === 'bank' ? '🏦 Bank' : '✂️ Split'}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            {/* Cash: just info */}
-            {paymentMethod === 'cash' && (
-              <Text style={styles.payInfo}>
-                Full amount PKR {fmtPKR(total)} paid in cash.
-              </Text>
-            )}
-
-            {/* Bank: account + reference */}
-            {paymentMethod === 'bank' && (
-              <>
-                {bankAccounts.length === 0 ? (
-                  <Text style={styles.payInfo}>No bank accounts configured.</Text>
-                ) : (
-                  <>
-                    <Text style={styles.payLabel}>Bank Account</Text>
-                    <View style={styles.bankAccountRow}>
-                      {bankAccounts.map(acc => (
-                        <TouchableOpacity
-                          key={acc.id}
-                          style={[
-                            styles.bankOption,
-                            selectedBankId === acc.id && styles.bankOptionActive,
-                          ]}
-                          onPress={() => setSelectedBankId(acc.id)}>
-                          <Text
-                            style={[
-                              styles.bankOptionText,
-                              selectedBankId === acc.id && styles.bankOptionTextActive,
-                            ]}>
-                            {acc.name}
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  </>
-                )}
-                <Text style={styles.payLabel}>Reference No. (optional)</Text>
-                <TextInput
-                  style={styles.payInput}
-                  placeholder="Transaction / reference number"
-                  placeholderTextColor={COLORS.subtext}
-                  value={bankRef}
-                  onChangeText={setBankRef}
-                  autoCapitalize="none"
-                />
-              </>
-            )}
-
-            {/* Split: cash entry + bank auto */}
-            {paymentMethod === 'split' && (
-              <>
-                {bankAccounts.length === 0 ? (
-                  <Text style={styles.payInfo}>No bank accounts configured.</Text>
-                ) : (
-                  <>
-                    <Text style={styles.payLabel}>Bank Account</Text>
-                    <View style={styles.bankAccountRow}>
-                      {bankAccounts.map(acc => (
-                        <TouchableOpacity
-                          key={acc.id}
-                          style={[
-                            styles.bankOption,
-                            selectedBankId === acc.id && styles.bankOptionActive,
-                          ]}
-                          onPress={() => setSelectedBankId(acc.id)}>
-                          <Text
-                            style={[
-                              styles.bankOptionText,
-                              selectedBankId === acc.id && styles.bankOptionTextActive,
-                            ]}>
-                            {acc.name}
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  </>
-                )}
-                <View style={styles.splitRow}>
-                  <View style={styles.splitField}>
-                    <Text style={styles.payLabel}>Cash Amount (PKR)</Text>
-                    <TextInput
-                      style={styles.payInput}
-                      placeholder="0"
-                      placeholderTextColor={COLORS.subtext}
-                      value={splitCash}
-                      onChangeText={setSplitCash}
-                      keyboardType="number-pad"
-                    />
-                  </View>
-                  <View style={styles.splitField}>
-                    <Text style={styles.payLabel}>Bank Amount (auto)</Text>
-                    <View style={styles.payInputReadonly}>
-                      <Text style={styles.payInputReadonlyText}>
-                        PKR {fmtPKR(splitBankAmt)}
-                      </Text>
-                    </View>
-                  </View>
-                </View>
-                <Text style={styles.payLabel}>Reference No. (optional)</Text>
-                <TextInput
-                  style={styles.payInput}
-                  placeholder="Transaction / reference number"
-                  placeholderTextColor={COLORS.subtext}
-                  value={bankRef}
-                  onChangeText={setBankRef}
-                  autoCapitalize="none"
-                />
-              </>
-            )}
-          </View>
-
           {/* Save button */}
           <TouchableOpacity
             style={[styles.saveBtn, saving && styles.saveBtnDisabled]}
@@ -694,6 +559,13 @@ export default function NewSaleScreen({navigation}) {
           <View style={styles.bottomPad} />
         </ScrollView>
       </KeyboardAvoidingView>
+
+      {/* Barcode / IMEI scanner */}
+      <BarcodeScanner
+        visible={scannerVisible}
+        onScanned={handleScanned}
+        onClose={() => setScannerVisible(false)}
+      />
 
       {/* Credit Customer Picker Modal */}
       <Modal
@@ -866,6 +738,19 @@ const styles = StyleSheet.create({
     marginTop: 2,
     fontWeight: '600',
   },
+  scanBtn: {
+    marginLeft: 8,
+    marginBottom: 10,
+    backgroundColor: COLORS.primary,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scanBtnIcon: {
+    fontSize: 18,
+  },
   noResults: {
     fontSize: 13,
     color: COLORS.subtext,
@@ -901,6 +786,12 @@ const styles = StyleSheet.create({
     width: 120,
     textAlign: 'right',
   },
+  belowCostWarn: {
+    fontSize: 12,
+    color: '#D97706',
+    fontWeight: '600',
+    marginTop: 5,
+  },
   discountRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -930,80 +821,6 @@ const styles = StyleSheet.create({
   saveBtnDisabled: {opacity: 0.5},
   saveBtnText: {color: '#fff', fontSize: 17, fontWeight: 'bold'},
   bottomPad: {height: 30},
-
-  // Payment method section
-  payToggleRow: {
-    flexDirection: 'row',
-    marginBottom: 14,
-    borderRadius: 8,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  payToggleBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    alignItems: 'center',
-    backgroundColor: '#F5F5F5',
-  },
-  payToggleBtnActive: {backgroundColor: COLORS.primary},
-  payToggleBtnText: {fontSize: 13, fontWeight: '600', color: COLORS.subtext},
-  payToggleBtnTextActive: {color: '#fff'},
-  payInfo: {
-    fontSize: 14,
-    color: COLORS.success,
-    fontWeight: '500',
-    textAlign: 'center',
-    paddingVertical: 8,
-  },
-  payLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: COLORS.text,
-    marginBottom: 6,
-    marginTop: 8,
-  },
-  payInput: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 8,
-    padding: 11,
-    fontSize: 15,
-    color: COLORS.text,
-    marginBottom: 4,
-  },
-  payInputReadonly: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 8,
-    padding: 11,
-    backgroundColor: '#F5F5F5',
-    marginBottom: 4,
-  },
-  payInputReadonlyText: {fontSize: 15, color: COLORS.subtext},
-  bankAccountRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginBottom: 4,
-  },
-  bankOption: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 6,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    marginRight: 8,
-    marginBottom: 6,
-    backgroundColor: '#F5F5F5',
-  },
-  bankOptionActive: {backgroundColor: COLORS.primary, borderColor: COLORS.primary},
-  bankOptionText: {fontSize: 14, color: COLORS.text},
-  bankOptionTextActive: {color: '#fff', fontWeight: '600'},
-  splitRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  splitField: {flex: 1},
 
   // Modal
   modalOverlay: {

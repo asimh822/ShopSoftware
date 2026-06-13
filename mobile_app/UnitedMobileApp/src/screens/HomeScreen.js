@@ -11,9 +11,10 @@ import {
   Alert,
   StatusBar,
   SafeAreaView,
+  ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {clearSession, getSalesmanName} from '../config/api';
+import {clearSession, getSalesmanName, apiGet} from '../config/api';
 
 const TILES = [
   {
@@ -46,12 +47,37 @@ const TILES = [
   },
 ];
 
+function formatPkr(amount) {
+  return amount.toLocaleString('en-PK', {maximumFractionDigits: 0});
+}
+
 export default function HomeScreen({navigation}) {
   const [salesmanName, setSalesmanName] = useState('');
+  const [cashInHand, setCashInHand] = useState(null);   // null=loading, false=error, number=ok
+  const [cashLoading, setCashLoading] = useState(true);
 
   useEffect(() => {
     getSalesmanName().then(n => setSalesmanName(n || ''));
+    fetchCashInHand();
   }, []);
+
+  const fetchCashInHand = () => {
+    setCashLoading(true);
+    apiGet('/api/cash_in_hand')
+      .then(data => {
+        console.log('[HomeScreen] cash_in_hand response:', JSON.stringify(data));
+        if (data && data.success) {
+          setCashInHand(data.cash_in_hand);
+        } else {
+          setCashInHand(false);
+        }
+      })
+      .catch(err => {
+        console.log('[HomeScreen] cash_in_hand error:', String(err));
+        setCashInHand(false);
+      })
+      .finally(() => setCashLoading(false));
+  };
 
   const handleLogout = () => {
     Alert.alert('Logout', 'Are you sure you want to logout?', [
@@ -85,17 +111,30 @@ export default function HomeScreen({navigation}) {
         </TouchableOpacity>
       </View>
 
-      <View style={styles.grid}>
-        {TILES.map(tile => (
-          <TouchableOpacity
-            key={tile.key}
-            style={[styles.tile, {backgroundColor: tile.color}]}
-            onPress={() => handleTile(tile.key)}
-            activeOpacity={0.8}>
-            <Text style={styles.tileIcon}>{tile.icon}</Text>
-            <Text style={styles.tileLabel}>{tile.label}</Text>
-          </TouchableOpacity>
-        ))}
+      <View style={styles.body}>
+        <View style={styles.grid}>
+          {TILES.map(tile => (
+            <TouchableOpacity
+              key={tile.key}
+              style={[styles.tile, {backgroundColor: tile.color}]}
+              onPress={() => handleTile(tile.key)}
+              activeOpacity={0.8}>
+              <Text style={styles.tileIcon}>{tile.icon}</Text>
+              <Text style={styles.tileLabel}>{tile.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <View style={styles.cashCard}>
+          <Text style={styles.cashLabel}>Cash in Hand</Text>
+          {cashLoading ? (
+            <ActivityIndicator size="small" color="#1565C0" />
+          ) : (
+            <Text style={styles.cashAmount}>
+              {cashInHand === false ? '—' : `Rs. ${formatPkr(cashInHand)}`}
+            </Text>
+          )}
+        </View>
       </View>
 
       <Text style={styles.footer}>United Mobile • Multan</Text>
@@ -137,8 +176,10 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
   },
-  grid: {
+  body: {
     flex: 1,
+  },
+  grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     padding: 16,
@@ -168,10 +209,36 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     textAlign: 'center',
   },
+  cashCard: {
+    marginHorizontal: 20,
+    marginTop: 4,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: {width: 0, height: 2},
+  },
+  cashLabel: {
+    fontSize: 14,
+    color: '#616161',
+    fontWeight: '500',
+  },
+  cashAmount: {
+    fontSize: 18,
+    color: '#1565C0',
+    fontWeight: 'bold',
+  },
   footer: {
     textAlign: 'center',
     color: '#9E9E9E',
     fontSize: 12,
-    paddingBottom: 16,
+    paddingVertical: 16,
   },
 });
