@@ -27,14 +27,11 @@ copy "%SRC%\installer.iss"        "%DST%\"
 copy "%SRC%\create_update.bat"    "%DST%\"
 copy "%SRC%\CLAUDE.md"            "%DST%\"
 
-echo Copying database...
-copy "%SRC%\united_mobile.db"     "%DST%\"
-
 echo Copying mobile APK...
-set APK_SRC=%SRC%\mobile_app\UnitedMobileApp\android\app\build\outputs\apk\release\UnitedMobile.apk
+set APK_SRC=%SRC%\mobile_app\UnitedMobileApp\android\app\build\outputs\apk\release\unitedmobile.apk
 if exist "%APK_SRC%" (
     copy "%APK_SRC%" "%DST%\"
-    echo   UnitedMobile.apk copied.
+    echo   unitedmobile.apk copied.
 ) else (
     echo   WARNING: APK not found - build it first with gradlew assembleRelease
 )
@@ -44,7 +41,7 @@ echo ============================================================
 echo  Done! Copied to: %DST%
 echo  Files to deploy on shop PC:
 echo    - All .py files  ^>  replace in shop software folder
-echo    - united_mobile.db  ^>  replace existing database
-echo    - UnitedMobile.apk  ^>  install on Android phone
+echo    - unitedmobile.apk  ^>  install on Android phone
+echo    - NOTE: database NOT copied ^(shop PC keeps its own data^)
 echo ============================================================
 pause
