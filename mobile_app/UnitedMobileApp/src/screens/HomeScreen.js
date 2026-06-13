@@ -1,50 +1,27 @@
 /**
- * HomeScreen — 2×2 tile menu + logout button.
+ * HomeScreen — 2×2 tile menu + refresh button + logout.
  */
 
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
-  View,
+  Animated,
+  ActivityIndicator,
+  Alert,
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
   Text,
   TouchableOpacity,
-  StyleSheet,
-  Alert,
-  StatusBar,
-  SafeAreaView,
-  ActivityIndicator,
+  View,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import MaterialIcons from 'react-native-vector-icons/MaterialIcons';
 import {clearSession, getSalesmanName, apiGet} from '../config/api';
 
 const TILES = [
-  {
-    key: 'NewSale',
-    label: 'New Sale',
-    icon: '🛒',
-    color: '#1565C0',
-    darkColor: '#0D47A1',
-  },
-  {
-    key: 'NewPurchase',
-    label: 'New Purchase',
-    icon: '📦',
-    color: '#2E7D32',
-    darkColor: '#1B5E20',
-  },
-  {
-    key: 'StockCheck',
-    label: 'Stock Check',
-    icon: '🔍',
-    color: '#E65100',
-    darkColor: '#BF360C',
-  },
-  {
-    key: 'MyToday',
-    label: "Today's Summary",
-    icon: '📊',
-    color: '#6A1B9A',
-    darkColor: '#4A148C',
-  },
+  {key: 'NewSale',     label: 'New Sale',         icon: '🛒', color: '#1565C0', darkColor: '#0D47A1'},
+  {key: 'NewPurchase', label: 'New Purchase',      icon: '📦', color: '#2E7D32', darkColor: '#1B5E20'},
+  {key: 'StockCheck',  label: 'Stock Check',       icon: '🔍', color: '#E65100', darkColor: '#BF360C'},
+  {key: 'MyToday',     label: "Today's Summary",   icon: '📊', color: '#6A1B9A', darkColor: '#4A148C'},
 ];
 
 function formatPkr(amount) {
@@ -53,30 +30,86 @@ function formatPkr(amount) {
 
 export default function HomeScreen({navigation}) {
   const [salesmanName, setSalesmanName] = useState('');
-  const [cashInHand, setCashInHand] = useState(null);   // null=loading, false=error, number=ok
-  const [cashLoading, setCashLoading] = useState(true);
+  const [cashInHand, setCashInHand]     = useState(null);  // null=loading, false=error, number=ok
+  const [cashLoading, setCashLoading]   = useState(true);
+  const [refreshing, setRefreshing]     = useState(false);
+
+  const spinAnim = useRef(new Animated.Value(0)).current;
+  const spinRef  = useRef(null);
+
+  const startSpin = () => {
+    spinAnim.setValue(0);
+    spinRef.current = Animated.loop(
+      Animated.timing(spinAnim, {
+        toValue: 1,
+        duration: 600,
+        useNativeDriver: true,
+      }),
+    );
+    spinRef.current.start();
+  };
+
+  const stopSpin = () => {
+    if (spinRef.current) {
+      spinRef.current.stop();
+      spinRef.current = null;
+    }
+    spinAnim.setValue(0);
+  };
+
+  const spin = spinAnim.interpolate({
+    inputRange:  [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
+
+  // ── Shared refresh function ────────────────────────────────────────────────
+  // Fetches all data shown on or pre-loaded for the Home screen.
+  // Call on mount and when the refresh button is tapped.
+  const refreshData = async () => {
+    setCashLoading(true);
+    try {
+      // Fetch in parallel — cash_in_hand is displayed; others are background
+      // prefetches so child screens benefit from warmed server-side caches.
+      const [cashResult] = await Promise.allSettled([
+        apiGet('/api/cash_in_hand'),
+        apiGet('/api/stock'),
+        apiGet('/api/brands'),
+        apiGet('/api/customers/list'),
+        apiGet('/api/suppliers'),
+      ]);
+
+      if (cashResult.status === 'fulfilled' && cashResult.value?.success) {
+        setCashInHand(cashResult.value.cash_in_hand);
+      } else {
+        setCashInHand(false);
+      }
+    } catch (err) {
+      if (err.message === 'SESSION_EXPIRED') {
+        navigation.replace('Login');
+        return;
+      }
+      setCashInHand(false);
+    } finally {
+      setCashLoading(false);
+    }
+  };
 
   useEffect(() => {
     getSalesmanName().then(n => setSalesmanName(n || ''));
-    fetchCashInHand();
+    refreshData();
   }, []);
 
-  const fetchCashInHand = () => {
-    setCashLoading(true);
-    apiGet('/api/cash_in_hand')
-      .then(data => {
-        console.log('[HomeScreen] cash_in_hand response:', JSON.stringify(data));
-        if (data && data.success) {
-          setCashInHand(data.cash_in_hand);
-        } else {
-          setCashInHand(false);
-        }
-      })
-      .catch(err => {
-        console.log('[HomeScreen] cash_in_hand error:', String(err));
-        setCashInHand(false);
-      })
-      .finally(() => setCashLoading(false));
+  // ── Refresh button handler ─────────────────────────────────────────────────
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    startSpin();
+    try {
+      await refreshData();
+    } finally {
+      stopSpin();
+      setRefreshing(false);
+    }
   };
 
   const handleLogout = () => {
@@ -93,31 +126,44 @@ export default function HomeScreen({navigation}) {
     ]);
   };
 
-  const handleTile = (key) => {
-    navigation.navigate(key);
-  };
-
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#1565C0" />
 
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
       <View style={styles.header}>
         <View>
           <Text style={styles.welcome}>Welcome back,</Text>
           <Text style={styles.name}>{salesmanName}</Text>
         </View>
-        <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
-          <Text style={styles.logoutText}>Logout</Text>
-        </TouchableOpacity>
+
+        <View style={styles.headerRight}>
+          {/* Refresh button */}
+          <TouchableOpacity
+            style={styles.refreshBtn}
+            onPress={handleRefresh}
+            disabled={refreshing}
+            activeOpacity={0.75}>
+            <Animated.View style={{transform: [{rotate: spin}]}}>
+              <MaterialIcons name="refresh" size={22} color="#fff" />
+            </Animated.View>
+          </TouchableOpacity>
+
+          {/* Logout button */}
+          <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
+            <Text style={styles.logoutText}>Logout</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
+      {/* ── Body ───────────────────────────────────────────────────────────── */}
       <View style={styles.body}>
         <View style={styles.grid}>
           {TILES.map(tile => (
             <TouchableOpacity
               key={tile.key}
               style={[styles.tile, {backgroundColor: tile.color}]}
-              onPress={() => handleTile(tile.key)}
+              onPress={() => navigation.navigate(tile.key)}
               activeOpacity={0.8}>
               <Text style={styles.tileIcon}>{tile.icon}</Text>
               <Text style={styles.tileLabel}>{tile.label}</Text>
@@ -163,6 +209,19 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 20,
     fontWeight: 'bold',
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  refreshBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   logoutBtn: {
     borderWidth: 1.5,

@@ -1107,7 +1107,7 @@ class SalesReportTab(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
 
@@ -1126,6 +1126,14 @@ class SalesReportTab(QWidget):
         for sm in db_salesmen_for_filter():
             self.salesman_combo.addItem(sm["name"], sm["id"])
 
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
@@ -1136,7 +1144,7 @@ class SalesReportTab(QWidget):
             QLabel("To:"), self.to_date,
             QLabel("Type:"), self.type_combo,
             QLabel("Salesman:"), self.salesman_combo,
-            btn_search, None, btn_pdf, btn_csv,
+            btn_today, btn_yesterday, btn_search, None, btn_pdf, btn_csv,
         ))
 
         self.table = _make_table(
@@ -1148,6 +1156,18 @@ class SalesReportTab(QWidget):
         self.footer = QLabel("")
         self.footer.setStyleSheet(TOTAL_STYLE)
         layout.addWidget(self.footer)
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
 
     def ensure_loaded(self):
         if not self._loaded:
@@ -1204,7 +1224,7 @@ class PurchaseReportTab(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
 
@@ -1224,6 +1244,14 @@ class PurchaseReportTab(QWidget):
         self.type_combo.addItem("Supplier Only", "supplier")
         self.type_combo.addItem("Cash Purchase", "cash")
 
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
@@ -1234,7 +1262,7 @@ class PurchaseReportTab(QWidget):
             QLabel("To:"), self.to_date,
             QLabel("Supplier:"), self.sup_combo,
             QLabel("Type:"), self.type_combo,
-            btn_search, None, btn_pdf, btn_csv,
+            btn_today, btn_yesterday, btn_search, None, btn_pdf, btn_csv,
         ))
 
         self.table = _make_table(
@@ -1245,6 +1273,18 @@ class PurchaseReportTab(QWidget):
         self.footer = QLabel("")
         self.footer.setStyleSheet(TOTAL_STYLE)
         layout.addWidget(self.footer)
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
 
     def ensure_loaded(self):
         if not self._loaded:
@@ -1384,7 +1424,25 @@ class ProfitReportTab(QWidget):
 
         layout.addLayout(cards_row)
 
+        # ── Daily breakdown table ─────────────────────────────────────────
+        daily_lbl = QLabel("Daily Breakdown")
+        daily_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        daily_lbl.setStyleSheet("color:#475569;")
+        layout.addWidget(daily_lbl)
+
+        self.daily_table = _make_table(
+            ["Date", "Units Sold", "Purchase Cost (PKR)",
+             "Sale Value (PKR)", "Gross Profit (PKR)", "Margin %"]
+        )
+        self.daily_table.setMaximumHeight(200)
+        layout.addWidget(self.daily_table)
+
         # ── Detail table ──────────────────────────────────────────────────
+        detail_lbl = QLabel("Per-IMEI Detail")
+        detail_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        detail_lbl.setStyleSheet("color:#475569;")
+        layout.addWidget(detail_lbl)
+
         self.table = _make_table(
             ["Date Sold", "Brand", "Model", "IMEI",
              "Purchase Price (PKR)", "Sale Price (PKR)", "Profit (PKR)"]
@@ -1435,6 +1493,39 @@ class ProfitReportTab(QWidget):
             total_profit  += float(r["profit"]         or 0)
 
         self.table.setSortingEnabled(True)
+
+        # ── Daily breakdown table ─────────────────────────────────────────
+        from collections import defaultdict
+        daily: dict = defaultdict(lambda: {"units": 0, "cost": 0.0, "revenue": 0.0, "profit": 0.0})
+        for r in rows:
+            d = r["date_sold"] or "Unknown"
+            daily[d]["units"]   += 1
+            daily[d]["cost"]    += float(r["purchase_price"] or 0)
+            daily[d]["revenue"] += float(r["final_price"] or 0)
+            daily[d]["profit"]  += float(r["profit"] or 0)
+
+        self.daily_table.setSortingEnabled(False)
+        self.daily_table.setRowCount(0)
+        for date_key in sorted(daily.keys(), reverse=True):
+            d = daily[date_key]
+            margin = (d["profit"] / d["revenue"] * 100) if d["revenue"] else 0.0
+            drow = self.daily_table.rowCount()
+            self.daily_table.insertRow(drow)
+            self.daily_table.setItem(drow, 0, QTableWidgetItem(date_key))
+            units_item = QTableWidgetItem(str(d["units"]))
+            units_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.daily_table.setItem(drow, 1, units_item)
+            for col, val in [(2, d["cost"]), (3, d["revenue"]), (4, d["profit"])]:
+                item = QTableWidgetItem(fmt_pkr(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if col == 4:
+                    item.setForeground(QBrush(QColor("#16a34a") if d["profit"] >= 0 else QColor("#dc2626")))
+                    item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+                self.daily_table.setItem(drow, col, item)
+            margin_item = QTableWidgetItem(f"{margin:.1f}%")
+            margin_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.daily_table.setItem(drow, 5, margin_item)
+        self.daily_table.setSortingEnabled(True)
 
         # ── Expenses for the same date range ──────────────────────────────
         conn = get_connection()

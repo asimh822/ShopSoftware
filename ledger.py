@@ -13,7 +13,11 @@ from PyQt6.QtGui import QFont, QColor, QBrush
 from database import (
     get_connection, db_bank_accounts,
     db_save_bank_cp_cr, db_save_double_entry_jv,
+    db_income_account,
 )
+# Reuse the unified report export engine (reportlab PDF + csv, folder picker,
+# <ReportName>_DDMMYYYY.<ext>) so ledger exports match every other report.
+from reports import _do_export_pdf, _do_export_csv, _table_to_rows
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +93,10 @@ def db_parties_list(party_type: str):
         rows = conn.execute(
             "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
         ).fetchall()
+    elif party_type == "other":
+        rows = conn.execute(
+            "SELECT id, name FROM other_parties ORDER BY name"
+        ).fetchall()
     else:
         rows = conn.execute(
             "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
@@ -99,7 +107,8 @@ def db_parties_list(party_type: str):
 
 def db_party_info(party_type: str, party_id: int):
     conn = get_connection()
-    table = "suppliers" if party_type == "supplier" else "customers"
+    table = {"supplier": "suppliers", "customer": "customers",
+             "other": "other_parties"}.get(party_type, "customers")
     row = conn.execute(
         f"SELECT name, contact, opening_balance FROM {table} WHERE id=?", (party_id,)
     ).fetchone()
@@ -109,6 +118,8 @@ def db_party_info(party_type: str, party_id: int):
 
 def _payment_default_desc(ptype: str, party_type: str) -> str:
     """Return a sensible ledger description for a payment when no notes were entered."""
+    if party_type == "other":
+        return "Payment to Party" if ptype == "CP" else "Receipt from Party"
     if ptype == "CP":
         return "Payment to Supplier" if party_type == "supplier" else "Refund to Customer"
     else:  # CR
@@ -123,7 +134,8 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
     conn = get_connection()
 
     # Opening balance
-    table = "suppliers" if party_type == "supplier" else "customers"
+    table = {"supplier": "suppliers", "customer": "customers",
+             "other": "other_parties"}.get(party_type, "customers")
     ob_row = conn.execute(
         f"SELECT opening_balance FROM {table} WHERE id=?", (party_id,)
     ).fetchone()
@@ -131,7 +143,26 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
 
     raw = []
 
-    if party_type == "supplier":
+    if party_type == "other":
+        # Other parties have no purchases/sales — only cash CP/CR vouchers.
+        # Direction mirrors the supplier side:
+        #   CR (cash received from them)  → DEBIT  (you owe them more)
+        #   CP (cash paid to them)        → CREDIT (you owe them less)
+        for r in conn.execute(
+            "SELECT date, voucher_number, notes, amount, type "
+            "FROM payments WHERE party_type='other' AND party_id=?",
+            (party_id,),
+        ):
+            desc = r[2] if r[2] else _payment_default_desc(r[4], "other")
+            amt  = float(r[3] or 0)
+            if r[4] == "CR":
+                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
+                            "dr": amt, "cr": 0.0})
+            else:
+                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
+                            "dr": 0.0, "cr": amt})
+
+    elif party_type == "supplier":
         for r in conn.execute(
             "SELECT id, date, pv_number, total_amount "
             "FROM purchase_vouchers WHERE supplier_id=?",
@@ -272,6 +303,56 @@ def db_save_payment(party_type, party_id, date_str, amount, ptype, notes):
     return voucher_number
 
 
+def db_save_multi_cp_cr(ptype: str, date_str: str, lines: list) -> str:
+    """
+    Save a multi-line CP or CR voucher.
+
+    ptype  = 'CP' | 'CR'
+    lines  = [(party_type, party_id, amount, reference), ...]
+             party_type ∈ {'supplier', 'customer', 'other', 'bank'}
+             For 'bank' lines party_id is the bank_account_id — the row goes
+             into bank_transactions (cash_transfer), not payments.
+             reference is a free-text string stored per line (can be empty).
+
+    A single voucher number is generated and shared by every line.
+    Rolls back the entire transaction on any error.
+    """
+    counter_key = "last_cp_number" if ptype == "CP" else "last_cr_number"
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        row = c.execute("SELECT value FROM settings WHERE key=?", (counter_key,)).fetchone()
+        n = int(row["value"]) + 1 if row else 1
+        c.execute("UPDATE settings SET value=? WHERE key=?", (str(n), counter_key))
+        voucher = f"{ptype}-{n:04d}"
+
+        for party_type, party_id, amount, reference in lines:
+            if party_type == "bank":
+                c.execute(
+                    "INSERT INTO bank_transactions "
+                    "(voucher_number, type, bank_account_id, source, date, amount, notes) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (voucher, ptype, party_id, "cash_transfer",
+                     date_str, float(amount), reference or ""),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO payments "
+                    "(voucher_number, party_type, party_id, date, amount, type, notes, reference) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (voucher, party_type, party_id,
+                     date_str, float(amount), ptype, "", reference or ""),
+                )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return voucher
+
+
 def db_save_journal(party_type, party_id, date_str, amount, entry_type, notes):
     """entry_type = 'debit' or 'credit'."""
     conn = get_connection()
@@ -382,9 +463,14 @@ def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
 class PaymentDialog(QDialog):
     def __init__(self, party_type, party_name, parent=None):
         super().__init__(parent)
+        self._party_type = party_type
+        # Supplier → always CP (you pay).  Customer → always CR (they pay).
+        # Other party (personal loan) → direction is chosen below.
         ptype = "CP" if party_type == "supplier" else "CR"
         if party_type == "supplier":
             verb = f"Payment to {party_name}"
+        elif party_type == "other":
+            verb = f"Cash Voucher — {party_name}"
         else:
             verb = f"Payment from {party_name}"
         self.setWindowTitle(verb)
@@ -400,6 +486,18 @@ class PaymentDialog(QDialog):
         self.date_edit.setCalendarPopup(True)
         form.addRow("Date:", self.date_edit)
 
+        # Direction selector — only for Other Parties (both directions valid).
+        self._dir_group = None
+        if party_type == "other":
+            self.radio_cp = QRadioButton("Payment to them (cash out)")
+            self.radio_cr = QRadioButton("Receipt from them (cash in)")
+            self.radio_cp.setChecked(True)
+            self._dir_group = QButtonGroup(self)
+            self._dir_group.addButton(self.radio_cp)
+            self._dir_group.addButton(self.radio_cr)
+            form.addRow("Direction:", self.radio_cp)
+            form.addRow("", self.radio_cr)
+
         self.amount_spin = QDoubleSpinBox()
         self.amount_spin.setRange(0.01, 99_999_999)
         self.amount_spin.setDecimals(0)
@@ -412,9 +510,10 @@ class PaymentDialog(QDialog):
         self.notes_edit.setPlaceholderText("Optional notes")
         form.addRow("Notes:", self.notes_edit)
 
-        note = QLabel(
-            f"Voucher type: {ptype}  •  Will be numbered automatically"
-        )
+        if party_type == "other":
+            note = QLabel("Cash only  •  Voucher numbered automatically (CP / CR)")
+        else:
+            note = QLabel(f"Voucher type: {ptype}  •  Will be numbered automatically")
         note.setStyleSheet("color:#64748b; font-size:9pt;")
         form.addRow("", note)
 
@@ -432,10 +531,14 @@ class PaymentDialog(QDialog):
         self.accept()
 
     def get_data(self):
+        if self._party_type == "other":
+            ptype = "CP" if self.radio_cp.isChecked() else "CR"
+        else:
+            ptype = self._ptype
         return (
             self.date_edit.date().toString("dd/MM/yyyy"),
             self.amount_spin.value(),
-            self._ptype,
+            ptype,
             self.notes_edit.text().strip(),
         )
 
@@ -461,6 +564,9 @@ class JournalDialog(QDialog):
         if party_type == "supplier":
             dr_label = "Debit (increases what you owe)"
             cr_label = "Credit (e.g. rebate — reduces what you owe)"
+        elif party_type == "other":
+            dr_label = "Debit (increases what you owe them)"
+            cr_label = "Credit (reduces what you owe them)"
         else:
             dr_label = "Debit (increases what they owe)"
             cr_label = "Credit (reduces what they owe)"
@@ -543,275 +649,277 @@ def _make_three_way_toggle(label_a, label_b, label_c):
     return row, btn_a, btn_b, btn_c
 
 
-class CashReceiptDialog(QDialog):
+class MultiLineCpCrDialog(QDialog):
     """
-    CR voucher — cash / bank coming IN.
-    Supplier:  refund received from supplier  (reduces what they owe you)
-    Customer:  payment received from customer (reduces what they owe you)
-    Bank:      cash withdrawal from bank      (Bank ↓, Cash in Hand ↑)
+    Multi-line Cash Payment (CP) or Cash Receipt (CR) voucher.
+
+    Multiple parties can be included in one voucher; all lines share a single
+    CP-XXXX / CR-XXXX number.  Party types per line:
+      Supplier / Customer / Other → saved to payments table
+      Bank                        → saved to bank_transactions (cash transfer)
     """
 
-    def __init__(self, parent=None):
+    _PARTY_LABELS = [
+        ("Supplier", "supplier"),
+        ("Customer", "customer"),
+        ("Other",    "other"),
+        ("Bank",     "bank"),
+    ]
+
+    def __init__(self, ptype: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cash Receipt Voucher (CR)")
-        self.setMinimumWidth(460)
-        self._party_type = "supplier"
+        self._ptype   = ptype    # 'CP' | 'CR'
+        self._voucher = None     # set after successful save
 
-        form = QFormLayout(self)
-        form.setSpacing(12)
-        form.setContentsMargins(20, 20, 20, 20)
+        self.setWindowTitle(
+            "Cash Payment Voucher (CP)" if ptype == "CP"
+            else "Cash Receipt Voucher (CR)"
+        )
+        self.setMinimumWidth(740)
+        self.resize(780, 520)
 
+        # Pre-load all party lists once to avoid DB hits on every row
+        self._cache: dict[str, list] = {
+            "supplier": db_parties_list("supplier"),
+            "customer": db_parties_list("customer"),
+            "other":    db_parties_list("other"),
+            "bank":     [(a["id"], a["name"]) for a in db_bank_accounts()],
+        }
+
+        # Voucher number preview (peek without incrementing)
+        counter_key = "last_cp_number" if ptype == "CP" else "last_cr_number"
+        conn = get_connection()
+        peek = conn.execute(
+            "SELECT value FROM settings WHERE key=?", (counter_key,)
+        ).fetchone()
+        conn.close()
+        n = int(peek["value"]) + 1 if peek else 1
+        voucher_preview = f"{ptype}-{n:04d}"
+
+        # ── Layout ───────────────────────────────────────────────────────────
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # ── Header card ──────────────────────────────────────────────────────
+        hdr = QFrame()
+        hdr.setStyleSheet(CARD_STYLE)
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(14, 10, 14, 10)
+        hl.setSpacing(12)
+
+        hl.addWidget(QLabel("Voucher:"))
+        vno = QLabel(f"<b>{voucher_preview}</b>")
+        vno.setStyleSheet("color:#2563eb; font-size:11pt;")
+        hl.addWidget(vno)
+
+        hl.addSpacing(12)
+        hl.addWidget(QLabel("Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
-        form.addRow("Date:", self.date_edit)
+        self.date_edit.setMinimumWidth(120)
+        hl.addWidget(self.date_edit)
 
-        type_row, self._btn_sup, self._btn_cust, self._btn_bank = _make_three_way_toggle(
-            "Supplier", "Customer", "Bank"
+        hl.addStretch()
+
+        layout.addWidget(hdr)
+
+        # ── Lines table ──────────────────────────────────────────────────────
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "Party Type", "Party Name", "Reference No.", "Amount (PKR)", ""]
         )
-        self._btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
-        self._btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
-        self._btn_bank.clicked.connect(lambda: self._set_party_type("bank"))
-        form.addRow("Party Type:", type_row)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(TABLE_STYLE)
+        lh = self.table.horizontalHeader()
+        lh.setStretchLastSection(False)
+        lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        lh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 40)
+        self.table.setColumnWidth(1, 128)
+        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(4, 160)
+        self.table.setColumnWidth(5, 56)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        layout.addWidget(self.table, stretch=1)
 
-        self._hint_lbl = QLabel("")
-        self._hint_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
-        form.addRow("", self._hint_lbl)
+        # ── Add line button ───────────────────────────────────────────────────
+        add_row = QHBoxLayout()
+        btn_add = QPushButton("+ Add Line")
+        btn_add.setStyleSheet(BTN_SECONDARY)
+        btn_add.clicked.connect(self._add_row)
+        add_row.addWidget(btn_add)
+        add_row.addStretch()
+        layout.addLayout(add_row)
 
-        # Party combo (hidden for Bank)
-        self.party_combo = QComboBox()
-        self.party_combo.setMinimumWidth(220)
-        self._party_lbl = QLabel("Party:")
-        form.addRow(self._party_lbl, self.party_combo)
+        # ── Footer ───────────────────────────────────────────────────────────
+        foot = QHBoxLayout()
+        self._total_lbl = QLabel("Total: PKR 0")
+        self._total_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self._total_lbl.setStyleSheet("color:#1d4ed8;")
+        foot.addWidget(self._total_lbl)
+        foot.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setStyleSheet(BTN_PRIMARY)
+        btn_save.clicked.connect(self._save)
+        foot.addWidget(btn_cancel)
+        foot.addWidget(btn_save)
+        layout.addLayout(foot)
 
-        # Bank account combo (shown for Bank)
-        self.bank_combo = QComboBox()
-        self.bank_combo.setMinimumWidth(220)
-        self._bank_lbl = QLabel("Bank Account:")
-        form.addRow(self._bank_lbl, self.bank_combo)
+        # Internal state: (type_combo, name_combo, amount_spin) per row
+        self._rows: list[tuple] = []
 
-        self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setRange(0.01, 99_999_999)
-        self.amount_spin.setDecimals(0)
-        self.amount_spin.setSingleStep(1000)
-        self.amount_spin.setGroupSeparatorShown(True)
-        self.amount_spin.setPrefix("PKR ")
-        form.addRow("Amount:", self.amount_spin)
+        self._add_row()   # start with one empty line
+        # CR defaults to Customer as the most common receipt scenario
+        if ptype == "CR" and self._rows:
+            tc, nc, _, _ = self._rows[0]
+            tc.setCurrentIndex(1)  # Customer is index 1
+            self._refresh_names(tc, nc)
 
-        self.notes_edit = QLineEdit()
-        self.notes_edit.setPlaceholderText("Reference, details, etc.")
-        form.addRow("Notes:", self.notes_edit)
+    # ── Row helpers ───────────────────────────────────────────────────────────
 
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    def _add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        num = QTableWidgetItem(str(r + 1))
+        num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        num.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.table.setItem(r, 0, num)
+
+        type_combo = QComboBox()
+        for label, key in self._PARTY_LABELS:
+            type_combo.addItem(label, key)
+
+        name_combo = QComboBox()
+
+        ref_edit = QLineEdit()
+        ref_edit.setPlaceholderText("Optional")
+
+        amount_spin = QDoubleSpinBox()
+        amount_spin.setRange(0.01, 99_999_999)
+        amount_spin.setDecimals(0)
+        amount_spin.setSingleStep(1000)
+        amount_spin.setGroupSeparatorShown(True)
+        amount_spin.setValue(0)
+        amount_spin.valueChanged.connect(self._update_total)
+
+        rem_btn = QPushButton("✕")
+        rem_btn.setStyleSheet(
+            "QPushButton{background:#fee2e2;color:#dc2626;border:none;"
+            "border-radius:4px;padding:2px 10px;font-size:11pt;font-weight:bold;}"
+            "QPushButton:hover{background:#fecaca;}"
         )
-        btns.accepted.connect(self._accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
 
-        self._reload_party_combo()
-        self._reload_bank_combo()
-        self._set_party_type("supplier")
+        self.table.setCellWidget(r, 1, type_combo)
+        self.table.setCellWidget(r, 2, name_combo)
+        self.table.setCellWidget(r, 3, ref_edit)
+        self.table.setCellWidget(r, 4, amount_spin)
+        self.table.setCellWidget(r, 5, rem_btn)
 
-    def _set_party_type(self, ptype):
-        self._party_type = ptype
-        _style_toggle(self._btn_sup,  ptype == "supplier",  "left")
-        _style_toggle(self._btn_cust, ptype == "customer",  "mid")
-        _style_toggle(self._btn_bank, ptype == "bank",      "right")
-        is_bank = ptype == "bank"
-        self._party_lbl.setVisible(not is_bank)
-        self.party_combo.setVisible(not is_bank)
-        self._bank_lbl.setVisible(is_bank)
-        self.bank_combo.setVisible(is_bank)
-        if is_bank:
-            self._hint_lbl.setText("Cash Withdrawal: money moves from Bank → Cash in Hand")
-        elif ptype == "supplier":
-            self._hint_lbl.setText("Refund received from supplier (reduces their balance)")
+        self._rows.append((type_combo, name_combo, ref_edit, amount_spin))
+
+        # Use widget identity in closures — avoids stale index captures
+        type_combo.currentIndexChanged.connect(
+            lambda _: self._refresh_names(type_combo, name_combo)
+        )
+        rem_btn.clicked.connect(lambda: self._remove_row(type_combo))
+
+        self._refresh_names(type_combo, name_combo)
+
+    def _refresh_names(self, type_combo: QComboBox, name_combo: QComboBox):
+        ptype   = type_combo.currentData()
+        parties = self._cache.get(ptype, [])
+        name_combo.blockSignals(True)
+        name_combo.clear()
+        if ptype == "bank":
+            if parties:
+                name_combo.addItem("— Select Bank Account —", None)
+                for pid, pname in parties:
+                    name_combo.addItem(pname, pid)
+            else:
+                name_combo.addItem("— No accounts (add in Settings) —", None)
         else:
-            self._hint_lbl.setText("Payment received from customer (reduces their balance)")
-        if not is_bank:
-            self._reload_party_combo()
+            lbl = {"supplier": "Supplier", "customer": "Customer", "other": "Party"}[ptype]
+            if parties:
+                name_combo.addItem(f"— Select {lbl} —", None)
+                for p in parties:
+                    name_combo.addItem(p["name"], p["id"])
+            else:
+                name_combo.addItem(f"— No {lbl.lower()}s found —", None)
+        name_combo.blockSignals(False)
 
-    def _reload_party_combo(self):
-        self.party_combo.clear()
-        parties = db_parties_list(self._party_type)
-        ph = (f"— Select {'Supplier' if self._party_type == 'supplier' else 'Customer'} —"
-              if parties else f"— No {'suppliers' if self._party_type == 'supplier' else 'credit customers'} found —")
-        self.party_combo.addItem(ph, None)
-        for p in parties:
-            self.party_combo.addItem(p["name"], p["id"])
+    def _remove_row(self, type_combo: QComboBox):
+        if len(self._rows) <= 1:
+            QMessageBox.information(self, "Info", "At least one line is required.")
+            return
+        idx = next(
+            (i for i, (tc, _, _, _) in enumerate(self._rows) if tc is type_combo), -1
+        )
+        if idx == -1:
+            return
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 1) is type_combo:
+                self.table.removeRow(r)
+                break
+        self._rows.pop(idx)
+        for i in range(self.table.rowCount()):
+            item = self.table.item(i, 0)
+            if item:
+                item.setText(str(i + 1))
+        self._update_total()
 
-    def _reload_bank_combo(self):
-        self.bank_combo.clear()
-        accounts = db_bank_accounts()
-        if not accounts:
-            self.bank_combo.addItem("— No bank accounts (add in Settings) —", None)
-        else:
-            self.bank_combo.addItem("— Select Account —", None)
-            for a in accounts:
-                self.bank_combo.addItem(a["name"], a["id"])
+    def _update_total(self):
+        total = sum(s.value() for _, _, _, s in self._rows)
+        self._total_lbl.setText(f"Total: PKR {fmt_pkr(total)}")
 
-    def _accept(self):
-        if self._party_type == "bank":
-            if self.bank_combo.currentData() is None:
-                QMessageBox.warning(self, "Validation", "Please select a bank account.")
+    # ── Save ─────────────────────────────────────────────────────────────────
+
+    def _save(self):
+        date_str = self.date_edit.date().toString("dd/MM/yyyy")
+        lines: list = []
+        for i, (tc, nc, ref_edit, spin) in enumerate(self._rows):
+            party_id = nc.currentData()
+            amount   = spin.value()
+            reference = ref_edit.text().strip()
+            if party_id is None:
+                QMessageBox.warning(
+                    self, "Validation", f"Row {i + 1}: please select a party."
+                )
                 return
-        else:
-            if self.party_combo.currentData() is None:
-                lbl = "supplier" if self._party_type == "supplier" else "customer"
-                QMessageBox.warning(self, "Validation", f"Please select a {lbl}.")
+            if amount <= 0:
+                QMessageBox.warning(
+                    self, "Validation",
+                    f"Row {i + 1}: amount must be greater than zero."
+                )
                 return
-        if self.amount_spin.value() <= 0:
-            QMessageBox.warning(self, "Validation", "Amount must be greater than zero.")
+            lines.append((tc.currentData(), party_id, amount, reference))
+
+        try:
+            self._voucher = db_save_multi_cp_cr(self._ptype, date_str, lines)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Failed to save: {ex}")
             return
         self.accept()
 
-    def get_data(self):
-        """Returns (party_type, party_id, date_str, amount, voucher_type, notes)"""
-        date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        amount   = self.amount_spin.value()
-        notes    = self.notes_edit.text().strip()
-        if self._party_type == "bank":
-            return ("bank", self.bank_combo.currentData(), date_str, amount, "CR", notes)
-        return (
-            self._party_type,
-            self.party_combo.currentData(),
-            date_str, amount, "CR", notes,
-        )
+    def get_voucher(self) -> str:
+        return self._voucher or ""
 
 
-class CashPaymentDialog(QDialog):
-    """
-    CP voucher — cash / bank going OUT.
-    Supplier:  payment to supplier          (reduces what you owe them)
-    Customer:  refund given to customer     (reduces what they owe you)
-    Bank:      cash deposit into bank       (Cash in Hand ↓, Bank ↑)
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Cash Payment Voucher (CP)")
-        self.setMinimumWidth(460)
-        self._party_type = "supplier"
-
-        form = QFormLayout(self)
-        form.setSpacing(12)
-        form.setContentsMargins(20, 20, 20, 20)
-
-        self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.setDisplayFormat("dd/MM/yyyy")
-        self.date_edit.setCalendarPopup(True)
-        form.addRow("Date:", self.date_edit)
-
-        type_row, self._btn_sup, self._btn_cust, self._btn_bank = _make_three_way_toggle(
-            "Supplier", "Customer", "Bank"
-        )
-        self._btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
-        self._btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
-        self._btn_bank.clicked.connect(lambda: self._set_party_type("bank"))
-        form.addRow("Party Type:", type_row)
-
-        self._hint_lbl = QLabel("")
-        self._hint_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
-        form.addRow("", self._hint_lbl)
-
-        self.party_combo = QComboBox()
-        self.party_combo.setMinimumWidth(220)
-        self._party_lbl = QLabel("Party:")
-        form.addRow(self._party_lbl, self.party_combo)
-
-        self.bank_combo = QComboBox()
-        self.bank_combo.setMinimumWidth(220)
-        self._bank_lbl = QLabel("Bank Account:")
-        form.addRow(self._bank_lbl, self.bank_combo)
-
-        self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setRange(0.01, 99_999_999)
-        self.amount_spin.setDecimals(0)
-        self.amount_spin.setSingleStep(1000)
-        self.amount_spin.setGroupSeparatorShown(True)
-        self.amount_spin.setPrefix("PKR ")
-        form.addRow("Amount:", self.amount_spin)
-
-        self.notes_edit = QLineEdit()
-        self.notes_edit.setPlaceholderText("Reference, details, etc.")
-        form.addRow("Notes:", self.notes_edit)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(self._accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
-
-        self._reload_party_combo()
-        self._reload_bank_combo()
-        self._set_party_type("supplier")
-
-    def _set_party_type(self, ptype):
-        self._party_type = ptype
-        _style_toggle(self._btn_sup,  ptype == "supplier",  "left")
-        _style_toggle(self._btn_cust, ptype == "customer",  "mid")
-        _style_toggle(self._btn_bank, ptype == "bank",      "right")
-        is_bank = ptype == "bank"
-        self._party_lbl.setVisible(not is_bank)
-        self.party_combo.setVisible(not is_bank)
-        self._bank_lbl.setVisible(is_bank)
-        self.bank_combo.setVisible(is_bank)
-        if is_bank:
-            self._hint_lbl.setText("Cash Deposit: money moves from Cash in Hand → Bank")
-        elif ptype == "supplier":
-            self._hint_lbl.setText("Payment to supplier (reduces what you owe them)")
-        else:
-            self._hint_lbl.setText("Refund to customer (reduces what they owe you)")
-        if not is_bank:
-            self._reload_party_combo()
-
-    def _reload_party_combo(self):
-        self.party_combo.clear()
-        parties = db_parties_list(self._party_type)
-        ph = (f"— Select {'Supplier' if self._party_type == 'supplier' else 'Customer'} —"
-              if parties else f"— No {'suppliers' if self._party_type == 'supplier' else 'credit customers'} found —")
-        self.party_combo.addItem(ph, None)
-        for p in parties:
-            self.party_combo.addItem(p["name"], p["id"])
-
-    def _reload_bank_combo(self):
-        self.bank_combo.clear()
-        accounts = db_bank_accounts()
-        if not accounts:
-            self.bank_combo.addItem("— No bank accounts (add in Settings) —", None)
-        else:
-            self.bank_combo.addItem("— Select Account —", None)
-            for a in accounts:
-                self.bank_combo.addItem(a["name"], a["id"])
-
-    def _accept(self):
-        if self._party_type == "bank":
-            if self.bank_combo.currentData() is None:
-                QMessageBox.warning(self, "Validation", "Please select a bank account.")
-                return
-        else:
-            if self.party_combo.currentData() is None:
-                lbl = "supplier" if self._party_type == "supplier" else "customer"
-                QMessageBox.warning(self, "Validation", f"Please select a {lbl}.")
-                return
-        if self.amount_spin.value() <= 0:
-            QMessageBox.warning(self, "Validation", "Amount must be greater than zero.")
-            return
-        self.accept()
-
-    def get_data(self):
-        date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        amount   = self.amount_spin.value()
-        notes    = self.notes_edit.text().strip()
-        if self._party_type == "bank":
-            return ("bank", self.bank_combo.currentData(), date_str, amount, "CP", notes)
-        return (
-            self._party_type,
-            self.party_combo.currentData(),
-            date_str, amount, "CP", notes,
-        )
+# Legacy aliases kept so any external reference still resolves.
+CashReceiptDialog = MultiLineCpCrDialog
+CashPaymentDialog = MultiLineCpCrDialog
 
 
 def _build_accounts_combo(combo: QComboBox):
@@ -825,6 +933,10 @@ def _build_accounts_combo(combo: QComboBox):
     accounts = db_bank_accounts()
     for a in accounts:
         combo.addItem(f"Bank — {a['name']}", {"type": "bank", "id": a["id"]})
+    # Income account — used as the Cr side when recording supplier incentives.
+    inc = db_income_account("Incentives Income")
+    if inc:
+        combo.addItem("Incentives Income", {"type": "income", "id": inc["id"]})
     conn = get_connection()
     suppliers = conn.execute(
         "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
@@ -956,7 +1068,8 @@ class DoubleEntryJournalDialog(QDialog):
         eg = QLabel(
             "Examples:  Bank transfer to supplier → Dr Supplier / Cr Bank\n"
             "           Customer pays via bank   → Dr Bank / Cr Customer\n"
-            "           Supplier rebate (cash)   → Dr Cash / Cr Supplier"
+            "           Supplier rebate (cash)   → Dr Cash / Cr Supplier\n"
+            "           Supplier incentive       → Dr Supplier / Cr Incentives Income"
         )
         eg.setStyleSheet("color:#64748b; font-size:9pt;")
         layout.addWidget(eg)
@@ -1054,7 +1167,7 @@ class BankLedgerWidget(QWidget):
         cl.addWidget(self.bank_combo)
 
         cl.addWidget(QLabel("From:"))
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-3))
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
         cl.addWidget(self.from_date)
@@ -1076,6 +1189,17 @@ class BankLedgerWidget(QWidget):
         cl.addWidget(btn_all)
 
         cl.addStretch()
+
+        # ── Export buttons (top-right, consistent with all other reports) ─────
+        btn_pdf = QPushButton("Export PDF")
+        btn_pdf.setStyleSheet(BTN_SECONDARY)
+        btn_pdf.clicked.connect(self._export_pdf_clicked)
+        cl.addWidget(btn_pdf)
+        btn_csv = QPushButton("Export CSV")
+        btn_csv.setStyleSheet(BTN_SECONDARY)
+        btn_csv.clicked.connect(self._export_csv_clicked)
+        cl.addWidget(btn_csv)
+
         layout.addWidget(ctrl)
 
         # ── Balance card ──────────────────────────────────────────────────────
@@ -1113,6 +1237,7 @@ class BankLedgerWidget(QWidget):
             2, QHeaderView.ResizeMode.Stretch
         )
         self.table.setStyleSheet(TABLE_STYLE)
+        self.table.doubleClicked.connect(self._edit_bank_entry)
         layout.addWidget(self.table, stretch=1)
 
         # ── Footer ────────────────────────────────────────────────────────────
@@ -1161,6 +1286,30 @@ class BankLedgerWidget(QWidget):
         acc_id = self.bank_combo.currentData()
         if acc_id is not None:
             self._load(acc_id)
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    def _export_pdf_clicked(self):
+        if self.bank_combo.currentData() is None:
+            QMessageBox.information(self, "Export", "Select a bank account first.")
+            return
+        _do_export_pdf(self)
+
+    def _export_csv_clicked(self):
+        if self.bank_combo.currentData() is None:
+            QMessageBox.information(self, "Export", "Select a bank account first.")
+            return
+        _do_export_csv(self)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        acc_name = self.bank_combo.currentText()
+        name = f"Bank_Ledger_{acc_name}"
+        title = f"Bank Ledger — {acc_name}"
+        bal = self._closing_lbl.text().strip()
+        if bal:
+            title += f"   ({bal})"
+        # Right-align Debit (IN), Credit (OUT), Balance columns.
+        return (name, title, headers, rows, {3, 4, 5})
 
     def _load(self, bank_account_id, from_iso=None, to_iso=None):
         entries = db_bank_ledger_entries(bank_account_id, from_iso, to_iso)
@@ -1218,6 +1367,46 @@ class BankLedgerWidget(QWidget):
         else:
             self._closing_lbl.setText("")
 
+    def _edit_bank_entry(self):
+        """Double-click on a bank ledger row — opens edit dialog for CP/CR entries."""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        voucher_item = self.table.item(row, 1)
+        if not voucher_item:
+            return
+        voucher = voucher_item.text().strip()
+        if not voucher or voucher in ("OB", ""):
+            return
+
+        from edit_vouchers import (
+            BankTransactionEditDialog, db_lookup_bank_transaction,
+        )
+
+        if voucher.startswith("CP-") or voucher.startswith("CR-"):
+            tx = db_lookup_bank_transaction(voucher)
+            if not tx:
+                QMessageBox.information(self, "Not Found",
+                    f"Bank transaction {voucher} not found.")
+                return
+            if tx.get("source") == "jv":
+                QMessageBox.information(self, "Journal Entry",
+                    f"{voucher} was created as part of a Journal Voucher.\n"
+                    "Edit it from the Journal Voucher (JV) dialog on the Ledger page.")
+                return
+            dlg = BankTransactionEditDialog(tx, self)
+            result = dlg.exec()
+            if result in (QDialog.DialogCode.Accepted, BankTransactionEditDialog.DELETED):
+                self._reload_bank_combo()
+        elif voucher.startswith("JV-"):
+            QMessageBox.information(self, "Journal Voucher",
+                f"{voucher} is a Journal Voucher entry.\n"
+                "Use the + Journal Voucher button to create new entries.")
+        elif voucher.startswith("SV-"):
+            QMessageBox.information(self, "Sale Record",
+                f"{voucher} is a sale payment. Edit it from the Sales page.")
+        # Other prefixes: silently ignore
+
     def refresh(self):
         """Called when switching to bank view — re-loads bank accounts list."""
         self._reload_bank_combo()
@@ -1242,33 +1431,6 @@ class LedgerPage(QWidget):
         title.setStyleSheet("color:#1e293b;")
         layout.addWidget(title)
 
-        # ── Standalone voucher buttons — always visible ───────────────────────
-        actions_card = QFrame()
-        actions_card.setStyleSheet(CARD_STYLE)
-        al = QHBoxLayout(actions_card)
-        al.setContentsMargins(12, 8, 12, 8)
-        al.setSpacing(8)
-        lbl_rec = QLabel("Record:")
-        lbl_rec.setStyleSheet("color:#64748b; font-size:9pt; font-weight:bold;")
-        al.addWidget(lbl_rec)
-        btn_cr = QPushButton("+ Cash Receipt (CR)")
-        btn_cr.setStyleSheet(BTN_GREEN)
-        btn_cr.setToolTip("Cash or bank withdrawal received (Supplier refund / Customer payment / Bank withdrawal)")
-        btn_cr.clicked.connect(self._standalone_cr)
-        al.addWidget(btn_cr)
-        btn_cp = QPushButton("+ Cash Payment (CP)")
-        btn_cp.setStyleSheet(BTN_PRIMARY)
-        btn_cp.setToolTip("Cash or bank deposit paid out (Supplier payment / Customer refund / Bank deposit)")
-        btn_cp.clicked.connect(self._standalone_cp)
-        al.addWidget(btn_cp)
-        btn_jv = QPushButton("+ Journal Voucher (JV)")
-        btn_jv.setStyleSheet(BTN_SECONDARY)
-        btn_jv.setToolTip("Double-entry journal entry (bank transfer, rebate, adjustment)")
-        btn_jv.clicked.connect(self._standalone_jv)
-        al.addWidget(btn_jv)
-        al.addStretch()
-        layout.addWidget(actions_card)
-
         # ── Party type toggle (Suppliers | Customers | Bank) ──────────────────
         type_card = QFrame()
         type_card.setStyleSheet(CARD_STYLE)
@@ -1279,16 +1441,21 @@ class LedgerPage(QWidget):
         self.btn_sup.setFixedHeight(32)
         self.btn_cust = QPushButton("Customers")
         self.btn_cust.setFixedHeight(32)
+        self.btn_other = QPushButton("Other Parties")
+        self.btn_other.setFixedHeight(32)
         self.btn_bank = QPushButton("Bank")
         self.btn_bank.setFixedHeight(32)
-        _style_toggle(self.btn_sup,  True,  "left")
-        _style_toggle(self.btn_cust, False, "mid")
-        _style_toggle(self.btn_bank, False, "right")
+        _style_toggle(self.btn_sup,   True,  "left")
+        _style_toggle(self.btn_cust,  False, "mid")
+        _style_toggle(self.btn_other, False, "mid")
+        _style_toggle(self.btn_bank,  False, "right")
         self.btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
         self.btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
+        self.btn_other.clicked.connect(lambda: self._set_party_type("other"))
         self.btn_bank.clicked.connect(lambda: self._set_party_type("bank"))
         tl.addWidget(self.btn_sup)
         tl.addWidget(self.btn_cust)
+        tl.addWidget(self.btn_other)
         tl.addWidget(self.btn_bank)
         tl.addStretch()
         layout.addWidget(type_card)
@@ -1299,40 +1466,54 @@ class LedgerPage(QWidget):
         cl = QHBoxLayout(self.ctrl_card)
         cl.setContentsMargins(12, 10, 12, 10)
         cl.setSpacing(10)
-        cl.addWidget(QLabel("Party:"))
+
+        lbl_party = QLabel("Party:")
+        lbl_party.setFixedWidth(36)
+        cl.addWidget(lbl_party)
         self.party_combo = QComboBox()
-        self.party_combo.setMinimumWidth(190)
+        self.party_combo.setMinimumWidth(200)
         self.party_combo.currentIndexChanged.connect(self._on_party_change)
         cl.addWidget(self.party_combo)
-        cl.addWidget(QLabel("From:"))
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-3))
+        cl.addSpacing(8)
+        lbl_from = QLabel("From:")
+        lbl_from.setFixedWidth(38)
+        cl.addWidget(lbl_from)
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
+        self.from_date.setMinimumWidth(120)
         cl.addWidget(self.from_date)
-        cl.addWidget(QLabel("To:"))
+        lbl_to = QLabel("To:")
+        lbl_to.setFixedWidth(24)
+        cl.addWidget(lbl_to)
         self.to_date = QDateEdit(QDate.currentDate())
         self.to_date.setDisplayFormat("dd/MM/yyyy")
         self.to_date.setCalendarPopup(True)
+        self.to_date.setMinimumWidth(120)
         cl.addWidget(self.to_date)
+        cl.addSpacing(8)
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
+        btn_search.setMinimumWidth(80)
         btn_search.clicked.connect(self._search)
         cl.addWidget(btn_search)
         btn_all = QPushButton("All")
         btn_all.setStyleSheet(BTN_SECONDARY)
+        btn_all.setMinimumWidth(60)
         btn_all.clicked.connect(self._show_all)
         cl.addWidget(btn_all)
         cl.addStretch()
-        self.btn_payment = QPushButton("+ Payment")
-        self.btn_payment.setStyleSheet(BTN_GREEN)
-        self.btn_payment.setEnabled(False)
-        self.btn_payment.clicked.connect(self._add_payment)
-        cl.addWidget(self.btn_payment)
-        self.btn_journal = QPushButton("+ Journal Entry")
-        self.btn_journal.setStyleSheet(BTN_SECONDARY)
-        self.btn_journal.setEnabled(False)
-        self.btn_journal.clicked.connect(self._add_journal)
-        cl.addWidget(self.btn_journal)
+        btn_pdf = QPushButton("Export PDF")
+        btn_pdf.setStyleSheet(BTN_SECONDARY)
+        btn_pdf.setMinimumWidth(100)
+        btn_pdf.clicked.connect(self._export_pdf_clicked)
+        cl.addWidget(btn_pdf)
+        btn_csv = QPushButton("Export CSV")
+        btn_csv.setStyleSheet(BTN_SECONDARY)
+        btn_csv.setMinimumWidth(100)
+        btn_csv.clicked.connect(self._export_csv_clicked)
+        cl.addWidget(btn_csv)
+
         layout.addWidget(self.ctrl_card)
 
         # ── Party info card ───────────────────────────────────────────────────
@@ -1409,9 +1590,10 @@ class LedgerPage(QWidget):
 
     def _set_party_type(self, ptype):
         self._party_type = ptype
-        _style_toggle(self.btn_sup,  ptype == "supplier", "left")
-        _style_toggle(self.btn_cust, ptype == "customer", "mid")
-        _style_toggle(self.btn_bank, ptype == "bank",     "right")
+        _style_toggle(self.btn_sup,   ptype == "supplier", "left")
+        _style_toggle(self.btn_cust,  ptype == "customer", "mid")
+        _style_toggle(self.btn_other, ptype == "other",    "mid")
+        _style_toggle(self.btn_bank,  ptype == "bank",     "right")
 
         is_bank = ptype == "bank"
         self.ctrl_card.setVisible(not is_bank)
@@ -1428,8 +1610,9 @@ class LedgerPage(QWidget):
     def _load_party_combo(self):
         self.party_combo.blockSignals(True)
         self.party_combo.clear()
-        label = ("— Select Supplier —" if self._party_type == "supplier"
-                 else "— Select Customer —")
+        label = {"supplier": "— Select Supplier —",
+                 "other": "— Select Party —"}.get(
+                     self._party_type, "— Select Customer —")
         self.party_combo.addItem(label, None)
         for p in db_parties_list(self._party_type):
             self.party_combo.addItem(p["name"], p["id"])
@@ -1437,8 +1620,6 @@ class LedgerPage(QWidget):
         self._party_id   = None
         self._party_name = ""
         self.info_card.setVisible(False)
-        self.btn_payment.setEnabled(False)
-        self.btn_journal.setEnabled(False)
         self.table.setRowCount(0)
         self.closing_label.setText("")
 
@@ -1449,16 +1630,12 @@ class LedgerPage(QWidget):
         if pid is None:
             self._party_id = None
             self.info_card.setVisible(False)
-            self.btn_payment.setEnabled(False)
-            self.btn_journal.setEnabled(False)
             self.table.setRowCount(0)
             self.closing_label.setText("")
             return
         self._party_id   = pid
         self._party_name = self.party_combo.currentText()
         self._update_info_card()
-        self.btn_payment.setEnabled(True)
-        self.btn_journal.setEnabled(True)
         self._load_ledger()
 
     def _update_info_card(self):
@@ -1486,6 +1663,31 @@ class LedgerPage(QWidget):
 
     def _show_all(self):
         self._load_ledger()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    def _export_pdf_clicked(self):
+        if self._party_id is None:
+            QMessageBox.information(self, "Export", "Select a party first.")
+            return
+        _do_export_pdf(self)
+
+    def _export_csv_clicked(self):
+        if self._party_id is None:
+            QMessageBox.information(self, "Export", "Select a party first.")
+            return
+        _do_export_csv(self)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        ptype_label = {"supplier": "Supplier", "customer": "Customer",
+                       "other": "Other_Party"}.get(self._party_type, "Customer")
+        name = f"{ptype_label}_Ledger_{self._party_name}"
+        title = f"{ptype_label.replace('_', ' ')} Ledger — {self._party_name}"
+        bal = self.closing_label.text().strip()
+        if bal:
+            title += f"   ({bal})"
+        # Right-align Debit, Credit, Balance columns.
+        return (name, title, headers, rows, {3, 4, 5})
 
     def _edit_ledger_entry(self):
         """Double-click on a ledger row — opens edit dialog for CP/CR/JV entries."""
@@ -1629,40 +1831,24 @@ class LedgerPage(QWidget):
     # ── Standalone voucher actions ────────────────────────────────────────────
 
     def _standalone_cr(self):
-        dlg = CashReceiptDialog(self)
+        dlg = MultiLineCpCrDialog("CR", self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        party_type, party_id, date_str, amount, ptype, notes = dlg.get_data()
-        try:
-            if party_type == "bank":
-                voucher = db_save_bank_cp_cr("CR", party_id, date_str, amount, notes)
-                if self._party_type == "bank":
-                    self._bank_widget.refresh()
-            else:
-                voucher = db_save_payment(party_type, party_id, date_str, amount, ptype, notes)
-                self._load_ledger()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
-            return
-        QMessageBox.information(self, "Saved", f"Cash receipt recorded as {voucher}.")
+        voucher = dlg.get_voucher()
+        self._load_ledger()
+        if hasattr(self, "_bank_widget"):
+            self._bank_widget.refresh()
+        QMessageBox.information(self, "Saved", f"Cash receipt {voucher} saved.")
 
     def _standalone_cp(self):
-        dlg = CashPaymentDialog(self)
+        dlg = MultiLineCpCrDialog("CP", self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        party_type, party_id, date_str, amount, ptype, notes = dlg.get_data()
-        try:
-            if party_type == "bank":
-                voucher = db_save_bank_cp_cr("CP", party_id, date_str, amount, notes)
-                if self._party_type == "bank":
-                    self._bank_widget.refresh()
-            else:
-                voucher = db_save_payment(party_type, party_id, date_str, amount, ptype, notes)
-                self._load_ledger()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
-            return
-        QMessageBox.information(self, "Saved", f"Cash payment recorded as {voucher}.")
+        voucher = dlg.get_voucher()
+        self._load_ledger()
+        if hasattr(self, "_bank_widget"):
+            self._bank_widget.refresh()
+        QMessageBox.information(self, "Saved", f"Cash payment {voucher} saved.")
 
     def _standalone_jv(self):
         dlg = DoubleEntryJournalDialog(self)

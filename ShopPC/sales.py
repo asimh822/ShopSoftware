@@ -131,6 +131,16 @@ def db_customers_list():
     return rows
 
 
+def db_suppliers_for_sale():
+    """Returns all suppliers for use as credit customers in a sale."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def db_customer_balance(customer_id):
     """Return outstanding balance for a single credit customer (amount they owe)."""
     conn = get_connection()
@@ -201,7 +211,7 @@ def db_save_sale(date_str, sale_type, customer_id, cash_name, cash_contact,
                  note, overall_discount, lines,
                  payment_method="cash", cash_paid=0.0,
                  bank_account_id=None, bank_amount=0.0, bank_ref="",
-                 salesman_id=None):
+                 salesman_id=None, supplier_as_customer_id=None):
     """
     lines = [(stock_item_id, model_id, imei, ref_price, final_price), ...]
     Returns (sv_number, sv_id).
@@ -224,12 +234,12 @@ def db_save_sale(date_str, sale_type, customer_id, cash_name, cash_contact,
             (sv_number, type, customer_id, cash_customer_name, cash_customer_contact,
              date, total_amount, discount, note, whatsapp_sent,
              payment_method, cash_paid, bank_account_id, bank_amount, bank_ref,
-             salesman_id)
-            VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)
+             salesman_id, supplier_as_customer_id)
+            VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)
         """, (sv_number, sale_type, customer_id, cash_name, cash_contact,
               date_str, total_amount, overall_discount or 0, note or "",
               payment_method, cash_paid, bank_account_id, bank_amount, bank_ref or "",
-              salesman_id))
+              salesman_id, supplier_as_customer_id))
         sv_id = c.lastrowid
 
         for stock_item_id, model_id, imei, ref_price, final_price in lines:
@@ -273,11 +283,12 @@ def db_load_sales(from_iso=None, to_iso=None, sale_type=None):
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     sql = f"""
         SELECT sv.id, sv.sv_number, sv.date, sv.type,
-               COALESCE(c.name, sv.cash_customer_name) AS customer_name,
+               COALESCE(c.name, sup_c.name, sv.cash_customer_name) AS customer_name,
                COUNT(sl.id) AS item_count,
                sv.total_amount, sv.discount, sv.note
         FROM sale_vouchers sv
         LEFT JOIN customers c ON c.id = sv.customer_id
+        LEFT JOIN suppliers sup_c ON sup_c.id = sv.supplier_as_customer_id
         LEFT JOIN sale_lines sl ON sl.sv_id = sv.id
         {where}
         GROUP BY sv.id
@@ -860,7 +871,14 @@ class SaleForm(QWidget):
         self.credit_combo.setMinimumWidth(220)
         self.credit_combo.addItem("— Select Customer —", None)
         for c in db_customers_list():
-            self.credit_combo.addItem(c["name"], c["id"])
+            self.credit_combo.addItem(c["name"], {"type": "customer", "id": c["id"]})
+        _sups_for_sale = db_suppliers_for_sale()
+        if _sups_for_sale:
+            _sep_idx = self.credit_combo.count()
+            self.credit_combo.addItem("── Suppliers ──", None)
+            self.credit_combo.model().item(_sep_idx).setEnabled(False)
+            for s in _sups_for_sale:
+                self.credit_combo.addItem(s['name'], {"type": "supplier", "id": s["id"]})
         credit_row.addWidget(self.credit_combo)
         self.credit_balance_lbl = QLabel("")
         self.credit_balance_lbl.setStyleSheet(STATUS_INFO)
@@ -869,7 +887,7 @@ class SaleForm(QWidget):
         credit_row.addStretch()
         self.customer_stack.addWidget(credit_widget)
 
-        # Disable Credit toggle if no credit customers exist
+        # Disable Credit toggle if no credit customers or suppliers exist
         if self.credit_combo.count() <= 1:
             self.btn_credit.setEnabled(False)
             self.btn_credit.setToolTip("No credit customers — add one in Masters first.")
@@ -1110,12 +1128,24 @@ class SaleForm(QWidget):
     # ── Credit customer balance ───────────────────────────────────────────────
 
     def _on_credit_customer_changed(self):
-        customer_id = self.credit_combo.currentData()
-        if customer_id is None:
+        data = self.credit_combo.currentData()
+        if data is None:
             self.credit_balance_lbl.setText("")
-        else:
-            bal = db_customer_balance(customer_id)
+        elif data["type"] == "customer":
+            bal = db_customer_balance(data["id"])
             self.credit_balance_lbl.setText(f"Balance: Rs. {fmt_pkr(bal)}")
+        else:
+            conn = get_connection()
+            row = conn.execute("""
+                SELECT COALESCE(s.opening_balance, 0)
+                       + COALESCE((SELECT SUM(pv.total_amount) FROM purchase_vouchers pv WHERE pv.supplier_id = s.id), 0)
+                       - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='supplier' AND p.party_id = s.id AND p.type='CP'), 0)
+                       AS balance
+                FROM suppliers s WHERE s.id = ?
+            """, (data["id"],)).fetchone()
+            conn.close()
+            bal = row["balance"] if row else 0
+            self.credit_balance_lbl.setText(f"Supplier Balance: Rs. {fmt_pkr(bal)}")
 
     # ── Type toggle ───────────────────────────────────────────────────────────
 
@@ -1470,11 +1500,17 @@ class SaleForm(QWidget):
             self.salesman_combo.setFocus()
             return
 
+        supplier_as_customer_id = None
         if self._sale_type == "credit":
-            if self.credit_combo.currentData() is None:
+            _cdata = self.credit_combo.currentData()
+            if _cdata is None:
                 QMessageBox.warning(self, "Missing", "Select a credit customer.")
                 return
-            customer_id = self.credit_combo.currentData()
+            if _cdata["type"] == "customer":
+                customer_id = _cdata["id"]
+            else:
+                customer_id = None
+                supplier_as_customer_id = _cdata["id"]
             cash_name = cash_contact = None
         else:
             cash_contact = self.cash_contact.text().strip()
@@ -1564,6 +1600,7 @@ class SaleForm(QWidget):
                 bank_account_id=pay_bank_id, bank_amount=pay_bank_amt,
                 bank_ref=pay_bank_ref,
                 salesman_id=salesman_id,
+                supplier_as_customer_id=supplier_as_customer_id,
             )
         except sqlite3.IntegrityError as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
@@ -1632,6 +1669,16 @@ class SaleListView(QWidget):
         title.setStyleSheet("color:#1e293b;")
         top.addWidget(title)
         top.addStretch()
+        top.addWidget(QLabel("Go to Voucher:"))
+        self._goto_edit = QLineEdit()
+        self._goto_edit.setPlaceholderText("SV-0001")
+        self._goto_edit.setMaximumWidth(110)
+        self._goto_edit.returnPressed.connect(self._goto_voucher)
+        top.addWidget(self._goto_edit)
+        btn_goto = QPushButton("Open")
+        btn_goto.setStyleSheet(BTN_SECONDARY)
+        btn_goto.clicked.connect(self._goto_voucher)
+        top.addWidget(btn_goto)
         self.btn_edit = QPushButton("✏ Edit")
         self.btn_edit.setStyleSheet(BTN_SECONDARY)
         self.btn_edit.setEnabled(False)
@@ -1651,7 +1698,7 @@ class SaleListView(QWidget):
         fl.setSpacing(10)
 
         fl.addWidget(QLabel("From:"))
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
         fl.addWidget(self.from_date)
@@ -1661,6 +1708,16 @@ class SaleListView(QWidget):
         self.to_date.setDisplayFormat("dd/MM/yyyy")
         self.to_date.setCalendarPopup(True)
         fl.addWidget(self.to_date)
+
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+        fl.addWidget(btn_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+        fl.addWidget(btn_yesterday)
 
         fl.addWidget(QLabel("Type:"))
         self.type_filter = QComboBox()
@@ -1700,6 +1757,21 @@ class SaleListView(QWidget):
         )
         layout.addWidget(self.table, stretch=1)
 
+        # Footer summary
+        footer_row = QHBoxLayout()
+        footer_row.addStretch()
+        self._footer_qty_lbl = QLabel("")
+        self._footer_qty_lbl.setStyleSheet(
+            "color:#475569; font-size:10pt; font-weight:bold; padding:4px 16px;"
+        )
+        self._footer_val_lbl = QLabel("")
+        self._footer_val_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold; padding:4px 16px;"
+        )
+        footer_row.addWidget(self._footer_qty_lbl)
+        footer_row.addWidget(self._footer_val_lbl)
+        layout.addLayout(footer_row)
+
         self.refresh()
 
     def refresh(self):
@@ -1710,6 +1782,8 @@ class SaleListView(QWidget):
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        total_qty = 0
+        total_val = 0.0
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
@@ -1730,14 +1804,57 @@ class SaleListView(QWidget):
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 )
                 self.table.setItem(row, col, item)
+            total_qty += int(r["item_count"] or 0)
+            total_val += float(r["total_amount"] or 0)
         self.table.setSortingEnabled(True)
         self.btn_edit.setEnabled(False)
+
+        n = len(rows)
+        self._footer_qty_lbl.setText(
+            f"{n} voucher{'s' if n != 1 else ''}    {total_qty} item{'s' if total_qty != 1 else ''}"
+        )
+        self._footer_val_lbl.setText(f"Total: Rs. {fmt_pkr(total_val)}")
 
     def _clear_filters(self):
         self.from_date.setDate(QDate.currentDate().addMonths(-1))
         self.to_date.setDate(QDate.currentDate())
         self.type_filter.setCurrentIndex(0)
         self.refresh()
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
+
+    def _goto_voucher(self):
+        raw = self._goto_edit.text().strip().upper()
+        if not raw:
+            return
+        import re
+        if not re.match(r'^[A-Z]+-\d+$', raw):
+            QMessageBox.warning(self, "Invalid Format",
+                "Please enter a full voucher number, e.g. SV-0001")
+            return
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id FROM sale_vouchers WHERE UPPER(sv_number)=?", (raw,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Voucher {raw} not found.")
+            return
+        from edit_vouchers import SaleEditDialog
+        dlg = SaleEditDialog(row["id"], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+        self._goto_edit.clear()
 
     def _edit_selected(self):
         row = self.table.currentRow()

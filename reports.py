@@ -1,15 +1,24 @@
 import csv
+import os
+import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QComboBox, QDateEdit,
     QHeaderView, QAbstractItemView, QFrame, QTabWidget,
     QFileDialog, QMessageBox, QLineEdit, QApplication,
-    QScrollArea,
+    QScrollArea, QTableView, QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, QDate, QTimer
-from PyQt6.QtGui import QFont, QBrush, QColor
+from PyQt6.QtCore import (
+    Qt, QDate, QTimer, QThread, QEvent, QModelIndex,
+    QAbstractTableModel, QSortFilterProxyModel, pyqtSignal,
+)
+from PyQt6.QtGui import QFont, QBrush, QColor, QPainter
 
-from database import get_connection
+from database import (
+    get_connection, db_incentives_income_total, get_setting,
+    db_cash_in_hand, db_bank_accounts, db_bank_account_closing_balance,
+    _party_closing_balance, EXPENSE_CATEGORIES,
+)
 
 # ── Shared styles ─────────────────────────────────────────────────────────────
 
@@ -120,6 +129,153 @@ def _export_table_csv(table: QTableWidget, default_name: str, parent=None):
         QMessageBox.information(parent, "Exported", f"Saved to:\n{path}")
     except Exception as e:
         QMessageBox.critical(parent, "Export Failed", str(e))
+
+
+# ── Unified report export (PDF + CSV) ──────────────────────────────────────────
+# Every report tab exposes a _export_payload() returning:
+#   (report_name, title, headers, rows, right_cols)
+# and places two consistently-styled buttons (Export PDF / Export CSV) top-right.
+# Files are written to a user-picked folder as <ReportName>_DDMMYYYY.<ext>.
+
+def _pick_export_path(report_name, ext, parent):
+    """Folder picker → full path <ReportName>_DDMMYYYY.<ext>, or None if cancelled."""
+    folder = QFileDialog.getExistingDirectory(parent, "Select Export Folder")
+    if not folder:
+        return None
+    today = datetime.date.today().strftime("%d%m%Y")
+    safe = report_name.replace(" ", "_")
+    return os.path.join(folder, f"{safe}_{today}.{ext}")
+
+
+def _export_csv(report_name, headers, rows, parent=None):
+    """Write headers + rows to <folder>/<ReportName>_DDMMYYYY.csv."""
+    path = _pick_export_path(report_name, "csv", parent)
+    if not path:
+        return
+    try:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow(r)
+        QMessageBox.information(parent, "Exported", f"Saved to:\n{path}")
+    except Exception as e:
+        QMessageBox.critical(parent, "Export Failed", str(e))
+
+
+def _export_pdf(report_name, title, headers, rows, parent=None, right_cols=None):
+    """Render headers + rows to a clean PDF: shop name, title, date, then a table."""
+    try:
+        from reportlab.lib.pagesizes import A4, landscape as _landscape
+        from reportlab.lib import colors
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        )
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    except ImportError:
+        QMessageBox.critical(
+            parent, "Missing Library",
+            "reportlab is not installed.\n\nInstall it with:\n  pip install reportlab"
+        )
+        return
+
+    path = _pick_export_path(report_name, "pdf", parent)
+    if not path:
+        return
+
+    right_cols = right_cols or set()
+    pagesize = _landscape(A4) if len(headers) >= 6 else A4
+    shop = get_setting("shop_name") or "United Mobile"
+    today = datetime.date.today().strftime("%d/%m/%Y")
+
+    title_ps = ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=14,
+                              alignment=TA_CENTER, leading=18)
+    sub_ps   = ParagraphStyle("s", fontName="Helvetica", fontSize=10,
+                              alignment=TA_CENTER, leading=14,
+                              textColor=colors.HexColor("#475569"))
+    cell_ps  = ParagraphStyle("c", fontName="Helvetica", fontSize=8, leading=10)
+    cellr_ps = ParagraphStyle("cr", fontName="Helvetica", fontSize=8, leading=10,
+                              alignment=TA_RIGHT)
+    head_ps  = ParagraphStyle("h", fontName="Helvetica-Bold", fontSize=8, leading=10,
+                              textColor=colors.white)
+
+    story = [
+        Paragraph(shop, title_ps),
+        Paragraph(title, sub_ps),
+        Paragraph(f"Date: {today}", sub_ps),
+        Spacer(1, 10),
+    ]
+
+    data = [[Paragraph(str(h), head_ps) for h in headers]]
+    for r in rows:
+        cells = []
+        for ci, val in enumerate(r):
+            ps = cellr_ps if ci in right_cols else cell_ps
+            cells.append(Paragraph("" if val is None else str(val), ps))
+        data.append(cells)
+
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#f8fafc")]),
+    ]))
+    story.append(t)
+
+    doc = SimpleDocTemplate(
+        path, pagesize=pagesize,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+        topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+    )
+    try:
+        doc.build(story)
+    except Exception as e:
+        QMessageBox.critical(parent, "Export Failed", str(e))
+        return
+    QMessageBox.information(parent, "PDF Exported", f"Saved to:\n{path}")
+
+
+def _table_to_rows(table):
+    """Extract (headers, rows) from a populated QTableWidget for export."""
+    headers = [
+        (table.horizontalHeaderItem(c).text() if table.horizontalHeaderItem(c) else "")
+        for c in range(table.columnCount())
+    ]
+    rows = [
+        [(table.item(r, c).text() if table.item(r, c) else "")
+         for c in range(table.columnCount())]
+        for r in range(table.rowCount())
+    ]
+    return headers, rows
+
+
+def _do_export_pdf(widget):
+    name, title, headers, rows, right_cols = widget._export_payload()
+    _export_pdf(name, title, headers, rows, widget, right_cols)
+
+
+def _do_export_csv(widget):
+    name, _title, headers, rows, _right = widget._export_payload()
+    _export_csv(name, headers, rows, widget)
+
+
+def _make_export_buttons(widget):
+    """Two consistently-styled export buttons wired to widget._export_payload()."""
+    btn_pdf = QPushButton("Export PDF")
+    btn_pdf.setStyleSheet(BTN_SECONDARY)
+    btn_pdf.clicked.connect(lambda: _do_export_pdf(widget))
+    btn_csv = QPushButton("Export CSV")
+    btn_csv.setStyleSheet(BTN_SECONDARY)
+    btn_csv.clicked.connect(lambda: _do_export_csv(widget))
+    return btn_pdf, btn_csv
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -551,7 +707,7 @@ def db_cash_book(date_str: str) -> dict:
     # 4. Cash purchases — walk-in seller purchases (no supplier)
     cash_purch = conn.execute(f"""
         SELECT pv.date, pv.pv_number,
-               COALESCE(pv.payment_method, 'cash') payment_method,
+               LOWER(COALESCE(pv.payment_method, 'cash')) payment_method,
                COALESCE(pv.egadget_ref, '') egadget_ref,
                COALESCE(pv.total_amount, 0) total_amount,
                COALESCE(pv.cash_amount,  0) cash_amount,
@@ -578,24 +734,19 @@ def db_cash_book(date_str: str) -> dict:
                          "description": f"Cash Purchase (Cash) — {ref}",
                          "cash_in": 0.0, "cash_out": total})
         elif pm == "bank":
-            # Bank paid out — no cash movement; show informational row
-            rows.append({"date": date, "voucher": pv_no,
-                         "description": f"Cash Purchase (Bank/{bname}) — {ref}",
-                         "cash_in": 0.0, "cash_out": 0.0})
-        else:  # split
+            # Bank-only purchase — no cash movement; excluded from Cash Book
+            continue
+        else:  # split — only the cash portion is a cash movement
             rows.append({"date": date, "voucher": pv_no,
                          "description": f"Cash Purchase (Split-Cash) — {ref}",
                          "cash_in": 0.0, "cash_out": camnt})
-            rows.append({"date": date, "voucher": pv_no,
-                         "description": f"Cash Purchase (Split-Bank/{bname}) — {ref}",
-                         "cash_in": 0.0, "cash_out": 0.0})
 
     # 5. Expenses
     de_e = _de("e.date")
     exp_rows = conn.execute(f"""
         SELECT e.expense_number, e.date, e.category,
                COALESCE(e.description, '') AS description,
-               e.amount, e.payment_method,
+               e.amount, LOWER(COALESCE(e.payment_method, 'cash')) AS payment_method,
                COALESCE(ba.name, 'Bank') AS bank_name
         FROM expenses e
         LEFT JOIN bank_accounts ba ON ba.id = e.bank_account_id
@@ -616,10 +767,8 @@ def db_cash_book(date_str: str) -> dict:
             rows.append({"date": date, "voucher": exp_no,
                          "description": f"Expense — {cat}{desc_part} (Cash)",
                          "cash_in": 0.0, "cash_out": amt})
-        else:  # bank — informational only; bank balance tracked via bank_transactions
-            rows.append({"date": date, "voucher": exp_no,
-                         "description": f"Expense — {cat}{desc_part} (Bank/{bname})",
-                         "cash_in": 0.0, "cash_out": 0.0})
+        else:  # bank — no cash movement; excluded from Cash Book
+            continue
 
     # Keep rows in voucher-number order
     rows.sort(key=lambda r: r["voucher"])
@@ -677,9 +826,10 @@ class StockReportTab(QWidget):
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("Brand:"), self.brand_combo,
-            btn_search, None,
+            btn_search, None, btn_pdf, btn_csv,
         ))
 
         # ── 3-column scroll grid ──────────────────────────────────────────
@@ -787,6 +937,12 @@ class StockReportTab(QWidget):
             f"{n} model{'s' if n != 1 else ''} in stock    |    Total Units: {total_units}"
         )
 
+    def _export_payload(self):
+        rows = db_stock_report_grouped(self.brand_combo.currentData())
+        data = [[r["brand"], r["model"], str(r["qty"])] for r in rows]
+        return ("Stock_Summary", "Stock Summary",
+                ["Brand", "Model", "Quantity"], data, {2})
+
 
 # ── Tab 2: Stock Valuation ────────────────────────────────────────────────────
 
@@ -809,9 +965,10 @@ class StockValuationTab(QWidget):
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("Brand:"), self.brand_combo,
-            btn_search, None,
+            btn_search, None, btn_pdf, btn_csv,
         ))
 
         # 3-column scroll grid — identical structure to StockReportTab
@@ -932,6 +1089,13 @@ class StockValuationTab(QWidget):
             f"Total Stock Value: PKR {fmt_pkr(total_value)}"
         )
 
+    def _export_payload(self):
+        rows = db_stock_valuation(self.brand_combo.currentData())
+        data = [[r["brand"], r["model"], str(r["units"] or 0), fmt_pkr(r["total_value"])]
+                for r in rows]
+        return ("Stock_Valuation", "Stock Valuation",
+                ["Brand", "Model", "Units", "Value (PKR)"], data, {2, 3})
+
 
 # ── Tab 3: Sales Report ───────────────────────────────────────────────────────
 
@@ -943,7 +1107,7 @@ class SalesReportTab(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
 
@@ -962,16 +1126,25 @@ class SalesReportTab(QWidget):
         for sm in db_salesmen_for_filter():
             self.salesman_combo.addItem(sm["name"], sm["id"])
 
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("From:"), self.from_date,
             QLabel("To:"), self.to_date,
             QLabel("Type:"), self.type_combo,
             QLabel("Salesman:"), self.salesman_combo,
-            btn_search, None,
+            btn_today, btn_yesterday, btn_search, None, btn_pdf, btn_csv,
         ))
 
         self.table = _make_table(
@@ -983,6 +1156,18 @@ class SalesReportTab(QWidget):
         self.footer = QLabel("")
         self.footer.setStyleSheet(TOTAL_STYLE)
         layout.addWidget(self.footer)
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
 
     def ensure_loaded(self):
         if not self._loaded:
@@ -1024,6 +1209,10 @@ class SalesReportTab(QWidget):
             f"{n} sale{'s' if n != 1 else ''}    |    Grand Total: PKR {fmt_pkr(grand_total)}"
         )
 
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        return ("Sales_Report", "Sales Report", headers, rows, {6, 7})
+
 
 # ── Tab 4: Purchase Report ────────────────────────────────────────────────────
 
@@ -1035,7 +1224,7 @@ class PurchaseReportTab(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
 
@@ -1055,16 +1244,25 @@ class PurchaseReportTab(QWidget):
         self.type_combo.addItem("Supplier Only", "supplier")
         self.type_combo.addItem("Cash Purchase", "cash")
 
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("From:"), self.from_date,
             QLabel("To:"), self.to_date,
             QLabel("Supplier:"), self.sup_combo,
             QLabel("Type:"), self.type_combo,
-            btn_search, None,
+            btn_today, btn_yesterday, btn_search, None, btn_pdf, btn_csv,
         ))
 
         self.table = _make_table(
@@ -1075,6 +1273,18 @@ class PurchaseReportTab(QWidget):
         self.footer = QLabel("")
         self.footer.setStyleSheet(TOTAL_STYLE)
         layout.addWidget(self.footer)
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
 
     def ensure_loaded(self):
         if not self._loaded:
@@ -1118,6 +1328,10 @@ class PurchaseReportTab(QWidget):
             f"{n} purchase{'s' if n != 1 else ''}    |    Grand Total: PKR {fmt_pkr(grand_total)}"
         )
 
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        return ("Purchases_Report", "Purchases Report", headers, rows, {4})
+
 
 # ── Tab 5: Profit Report ──────────────────────────────────────────────────────
 
@@ -1135,6 +1349,34 @@ def _profit_summary_card(title: str) -> tuple:
     lbl_val = QLabel("Rs. 0")
     lbl_val.setStyleSheet("color:#1e293b; font-size:11pt; font-weight:bold; border:none;")
     vl.addWidget(lbl_title)
+    vl.addWidget(lbl_val)
+    return card, lbl_val
+
+
+def _other_income_card() -> tuple:
+    """
+    Summary card for the 'Other Income' P&L section. Carries a distinct section
+    header ('OTHER INCOME') above the 'Incentives Income' line item so the figure
+    is clearly grouped as Other Income rather than trading profit.
+    Returns (QFrame card, value QLabel).
+    """
+    card = QFrame()
+    card.setStyleSheet(
+        "background:#ffffff; border:1px solid #e2e8f0; border-radius:8px;"
+    )
+    vl = QVBoxLayout(card)
+    vl.setContentsMargins(14, 10, 14, 10)
+    vl.setSpacing(2)
+    lbl_section = QLabel("OTHER INCOME")
+    lbl_section.setStyleSheet(
+        "color:#0369a1; font-size:7pt; font-weight:bold; letter-spacing:1px; border:none;"
+    )
+    lbl_item = QLabel("Incentives Income")
+    lbl_item.setStyleSheet("color:#64748b; font-size:9pt; border:none;")
+    lbl_val = QLabel("Rs. 0")
+    lbl_val.setStyleSheet("color:#1e293b; font-size:11pt; font-weight:bold; border:none;")
+    vl.addWidget(lbl_section)
+    vl.addWidget(lbl_item)
     vl.addWidget(lbl_val)
     return card, lbl_val
 
@@ -1159,10 +1401,11 @@ class ProfitReportTab(QWidget):
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("Date Sold From:"), self.from_date,
             QLabel("To:"), self.to_date,
-            btn_search, None,
+            btn_search, None, btn_pdf, btn_csv,
         ))
 
         # ── Summary cards row ─────────────────────────────────────────────
@@ -1172,15 +1415,34 @@ class ProfitReportTab(QWidget):
         c1, self._lbl_revenue  = _profit_summary_card("Sales Revenue")
         c2, self._lbl_cost     = _profit_summary_card("Purchase Cost")
         c3, self._lbl_gross    = _profit_summary_card("Gross Profit")
-        c4, self._lbl_expenses = _profit_summary_card("Total Expenses")
-        c5, self._lbl_net      = _profit_summary_card("Net Profit")
+        c4, self._lbl_incentive = _other_income_card()
+        c5, self._lbl_expenses = _profit_summary_card("Total Expenses")
+        c6, self._lbl_net      = _profit_summary_card("Net Profit")
 
-        for c in (c1, c2, c3, c4, c5):
+        for c in (c1, c2, c3, c4, c5, c6):
             cards_row.addWidget(c)
 
         layout.addLayout(cards_row)
 
+        # ── Daily breakdown table ─────────────────────────────────────────
+        daily_lbl = QLabel("Daily Breakdown")
+        daily_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        daily_lbl.setStyleSheet("color:#475569;")
+        layout.addWidget(daily_lbl)
+
+        self.daily_table = _make_table(
+            ["Date", "Units Sold", "Purchase Cost (PKR)",
+             "Sale Value (PKR)", "Gross Profit (PKR)", "Margin %"]
+        )
+        self.daily_table.setMaximumHeight(200)
+        layout.addWidget(self.daily_table)
+
         # ── Detail table ──────────────────────────────────────────────────
+        detail_lbl = QLabel("Per-IMEI Detail")
+        detail_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        detail_lbl.setStyleSheet("color:#475569;")
+        layout.addWidget(detail_lbl)
+
         self.table = _make_table(
             ["Date Sold", "Brand", "Model", "IMEI",
              "Purchase Price (PKR)", "Sale Price (PKR)", "Profit (PKR)"]
@@ -1232,6 +1494,39 @@ class ProfitReportTab(QWidget):
 
         self.table.setSortingEnabled(True)
 
+        # ── Daily breakdown table ─────────────────────────────────────────
+        from collections import defaultdict
+        daily: dict = defaultdict(lambda: {"units": 0, "cost": 0.0, "revenue": 0.0, "profit": 0.0})
+        for r in rows:
+            d = r["date_sold"] or "Unknown"
+            daily[d]["units"]   += 1
+            daily[d]["cost"]    += float(r["purchase_price"] or 0)
+            daily[d]["revenue"] += float(r["final_price"] or 0)
+            daily[d]["profit"]  += float(r["profit"] or 0)
+
+        self.daily_table.setSortingEnabled(False)
+        self.daily_table.setRowCount(0)
+        for date_key in sorted(daily.keys(), reverse=True):
+            d = daily[date_key]
+            margin = (d["profit"] / d["revenue"] * 100) if d["revenue"] else 0.0
+            drow = self.daily_table.rowCount()
+            self.daily_table.insertRow(drow)
+            self.daily_table.setItem(drow, 0, QTableWidgetItem(date_key))
+            units_item = QTableWidgetItem(str(d["units"]))
+            units_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.daily_table.setItem(drow, 1, units_item)
+            for col, val in [(2, d["cost"]), (3, d["revenue"]), (4, d["profit"])]:
+                item = QTableWidgetItem(fmt_pkr(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if col == 4:
+                    item.setForeground(QBrush(QColor("#16a34a") if d["profit"] >= 0 else QColor("#dc2626")))
+                    item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+                self.daily_table.setItem(drow, col, item)
+            margin_item = QTableWidgetItem(f"{margin:.1f}%")
+            margin_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.daily_table.setItem(drow, 5, margin_item)
+        self.daily_table.setSortingEnabled(True)
+
         # ── Expenses for the same date range ──────────────────────────────
         conn = get_connection()
         de_e = "substr(e.date,7,4)||'-'||substr(e.date,4,2)||'-'||substr(e.date,1,2)"
@@ -1242,7 +1537,10 @@ class ProfitReportTab(QWidget):
         ).fetchone()[0] or 0)
         conn.close()
 
-        net_profit = total_profit - total_expenses
+        # ── Incentives income earned to date (running income account balance) ──
+        incentives = db_incentives_income_total()
+
+        net_profit = total_profit + incentives - total_expenses
 
         # ── Update summary cards ──────────────────────────────────────────
         def _color_val(lbl: QLabel, amount: float, neutral: bool = False):
@@ -1255,11 +1553,12 @@ class ProfitReportTab(QWidget):
             )
             lbl.setText(f"Rs. {fmt_pkr(amount)}")
 
-        _color_val(self._lbl_revenue,  total_revenue,  neutral=True)
-        _color_val(self._lbl_cost,     total_cost,     neutral=True)
-        _color_val(self._lbl_gross,    total_profit)
-        _color_val(self._lbl_expenses, total_expenses, neutral=True)
-        _color_val(self._lbl_net,      net_profit)
+        _color_val(self._lbl_revenue,   total_revenue,  neutral=True)
+        _color_val(self._lbl_cost,      total_cost,     neutral=True)
+        _color_val(self._lbl_gross,     total_profit)
+        _color_val(self._lbl_incentive, incentives,     neutral=True)
+        _color_val(self._lbl_expenses,  total_expenses, neutral=True)
+        _color_val(self._lbl_net,       net_profit)
 
         # ── Footer ───────────────────────────────────────────────────────
         n = len(rows)
@@ -1268,6 +1567,8 @@ class ProfitReportTab(QWidget):
             f"{n} item{'s' if n != 1 else ''} sold    |    "
             f"<span style='color:{profit_color};'>Gross Profit: Rs. {fmt_pkr(total_profit)}</span>"
             f"    |    "
+            f"Other Income (Incentives): Rs. {fmt_pkr(incentives)}"
+            f"    |    "
             f"Expenses: Rs. {fmt_pkr(total_expenses)}"
             f"    |    "
             f"<span style='color:{'#16a34a' if net_profit >= 0 else '#dc2626'};'>"
@@ -1275,14 +1576,159 @@ class ProfitReportTab(QWidget):
         )
         self.footer.setTextFormat(Qt.TextFormat.RichText)
 
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        # Append the summary figures (shown as cards on screen) as trailing rows.
+        blank = ["", "", "", "", "", "", ""]
+        summary = [
+            ["", "", "", "", "", "Sales Revenue",     self._lbl_revenue.text()],
+            ["", "", "", "", "", "Purchase Cost",     self._lbl_cost.text()],
+            ["", "", "", "", "", "Gross Profit",      self._lbl_gross.text()],
+            ["", "", "", "", "", "Other Income (Incentives Income)", self._lbl_incentive.text()],
+            ["", "", "", "", "", "Total Expenses",    self._lbl_expenses.text()],
+            ["", "", "", "", "", "Net Profit",        self._lbl_net.text()],
+        ]
+        return ("Profit_Report", "Profit Report", headers,
+                rows + [blank] + summary, {4, 5, 6})
+
 
 # ── Tab 6: IMEI Stock (flat table: Brand | Model | IMEI | Supplier | Date | Price | Use) ──
+
+# QTableView selectors share QTableWidget's styling rules (QTableWidget subclasses
+# QTableView), so mirror the existing look by retargeting the selector name.
+TABLE_VIEW_STYLE = TABLE_STYLE.replace("QTableWidget", "QTableView")
+
+
+class _ImeiLoadWorker(QThread):
+    """Loads all in-stock IMEI rows off the UI thread so a large dataset
+    never freezes the window. Emits plain tuples (safe across threads)."""
+    loaded = pyqtSignal(list)
+
+    def run(self):
+        rows = db_stock_imei_report(None)   # load everything once; filter in memory
+        data = [
+            (r["brand"], r["model"], r["imei"], r["supplier"],
+             r["purchase_date"], r["purchase_price"])
+            for r in rows
+        ]
+        self.loaded.emit(data)
+
+
+class ImeiStockModel(QAbstractTableModel):
+    """Virtual data model — holds the full dataset in memory and feeds only the
+    rows the QTableView asks for (visible ones), so total record count no longer
+    drives rendering cost. Search filters the in-memory copy and resets the view."""
+
+    HEADERS = ["Brand", "Model", "IMEI", "Supplier",
+               "Purchase Date", "Purchase Price (PKR)", ""]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._all = []     # full dataset: list of (brand, model, imei, supplier, date, price)
+        self._rows = []    # currently visible (post-filter) subset
+        self._filter = ""
+
+    # ── Qt model interface ──
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else 7
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        r = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 5:
+                return fmt_pkr(r[5])
+            if col == 6:
+                return None          # button column — painted by the delegate
+            return r[col]
+        if role == Qt.ItemDataRole.TextAlignmentRole and col == 5:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.ToolTipRole and col == 2:
+            return "Double-click to copy IMEI"
+        if role == Qt.ItemDataRole.UserRole:
+            return r[2]              # IMEI for this row
+        return None
+
+    # ── data plumbing ──
+    def set_source(self, rows):
+        self._all = list(rows)
+        self._apply()
+
+    def set_filter(self, text):
+        self._filter = (text or "").strip().lower()
+        self._apply()
+
+    def _apply(self):
+        self.beginResetModel()
+        t = self._filter
+        if not t:
+            self._rows = list(self._all)
+        else:
+            # Same fields the old SQL search matched: brand, model, IMEI, supplier.
+            self._rows = [
+                r for r in self._all
+                if t in (r[0] or "").lower()
+                or t in (r[1] or "").lower()
+                or t in (r[2] or "").lower()
+                or t in (r[3] or "").lower()
+            ]
+        self.endResetModel()
+
+    def imei_at(self, row):
+        if 0 <= row < len(self._rows):
+            return self._rows[row][2]
+        return None
+
+    def displayed_rows(self):
+        return self._rows
+
+    def total_units(self):
+        return len(self._rows)
+
+
+class _UseButtonDelegate(QStyledItemDelegate):
+    """Paints a 'Use in Sale' button into the cell and emits clicked(index) when
+    pressed. Done as a delegate (not a real QPushButton per row) so the view stays
+    virtual — no widget is created for off-screen rows."""
+    clicked = pyqtSignal(QModelIndex)
+
+    def paint(self, painter, option, index):
+        rect = option.rect.adjusted(6, 5, -6, -5)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#dcfce7"))      # matches BTN_USE_SMALL
+        painter.drawRoundedRect(rect, 4, 4)
+        painter.setPen(QColor("#15803d"))
+        f = painter.font()
+        f.setPointSize(9)
+        painter.setFont(f)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Use in Sale")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            if option.rect.contains(event.position().toPoint()):
+                self.clicked.emit(index)
+                return True
+        return False
+
 
 class ImeiStockTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._use_in_sale_cb = None
-        self._loaded = False
+        self._load_worker = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -1299,7 +1745,8 @@ class ImeiStockTab(QWidget):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Type to filter...")
         self.search_input.setMinimumWidth(240)
-        self.search_input.textChanged.connect(self.refresh)
+        # Filtering is now in-memory and instant, so apply on every keystroke.
+        self.search_input.textChanged.connect(self._apply_filter)
         fl.addWidget(self.search_input)
 
         btn_refresh = QPushButton("Refresh")
@@ -1309,10 +1756,9 @@ class ImeiStockTab(QWidget):
 
         fl.addStretch()
 
-        btn_export = QPushButton("Export CSV")
-        btn_export.setStyleSheet(BTN_PRIMARY)
-        btn_export.clicked.connect(self._export)
-        fl.addWidget(btn_export)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        fl.addWidget(btn_pdf)
+        fl.addWidget(btn_csv)
 
         layout.addWidget(filter_card)
 
@@ -1325,13 +1771,18 @@ class ImeiStockTab(QWidget):
         self._copy_timer.timeout.connect(lambda: self.copy_status.setText(""))
 
         # 7 columns: Brand | Model | IMEI | Supplier | Purchase Date | Purchase Price | Use in Sale
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["Brand", "Model", "IMEI", "Supplier", "Purchase Date", "Purchase Price (PKR)", ""]
-        )
+        # Virtual view: QAbstractTableModel feeds rows on demand, QSortFilterProxyModel
+        # keeps header-click sorting working, QTableView renders only visible rows.
+        self.model = ImeiStockModel(self)
+        self.proxy = QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -1339,8 +1790,13 @@ class ImeiStockTab(QWidget):
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(6, 100)
-        self.table.setStyleSheet(TABLE_STYLE)
-        self.table.cellDoubleClicked.connect(self._on_cell_double_click)
+        self.table.setStyleSheet(TABLE_VIEW_STYLE)
+        self.table.doubleClicked.connect(self._on_double_click)
+
+        self._use_delegate = _UseButtonDelegate(self.table)
+        self._use_delegate.clicked.connect(self._on_use_clicked)
+        self.table.setItemDelegateForColumn(6, self._use_delegate)
+
         layout.addWidget(self.table, stretch=1)
 
         self.footer = QLabel("")
@@ -1355,53 +1811,44 @@ class ImeiStockTab(QWidget):
         self.refresh()
 
     def refresh(self):
-        search = self.search_input.text().strip()
-        rows = db_stock_imei_report(search if search else None)
+        # Load the full dataset once, off the UI thread, with a brief indicator.
+        if self._load_worker is not None and self._load_worker.isRunning():
+            return
+        self.footer.setText("Loading IMEI stock…")
+        worker = _ImeiLoadWorker(self)
+        worker.loaded.connect(self._on_loaded)
+        worker.finished.connect(self._on_worker_finished)
+        self._load_worker = worker
+        worker.start()
 
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
+    def _on_loaded(self, data):
+        self.model.set_source(data)
+        # Re-apply any active search term to the freshly loaded data.
+        self.model.set_filter(self.search_input.text())
+        self._update_footer()
 
-        total_units = 0
+    def _on_worker_finished(self):
+        self._load_worker = None
 
-        for r in rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            imei = r["imei"]
+    def _apply_filter(self, _text=None):
+        self.model.set_filter(self.search_input.text())
+        self._update_footer()
 
-            self.table.setItem(row, 0, QTableWidgetItem(r["brand"]))
-            self.table.setItem(row, 1, QTableWidgetItem(r["model"]))
+    def _update_footer(self):
+        self.footer.setText(f"Total Units in Stock: {self.model.total_units()}")
 
-            imei_item = QTableWidgetItem(imei)
-            imei_item.setData(Qt.ItemDataRole.UserRole, imei)
-            imei_item.setToolTip("Double-click to copy IMEI")
-            self.table.setItem(row, 2, imei_item)
-
-            self.table.setItem(row, 3, QTableWidgetItem(r["supplier"]))
-            self.table.setItem(row, 4, QTableWidgetItem(r["purchase_date"]))
-
-            price_item = QTableWidgetItem(fmt_pkr(r["purchase_price"]))
-            price_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            self.table.setItem(row, 5, price_item)
-
-            btn_use = QPushButton("Use in Sale")
-            btn_use.setStyleSheet(BTN_USE_SMALL)
-            btn_use.clicked.connect(lambda _, i=imei: self._use_in_sale(i))
-            self.table.setCellWidget(row, 6, btn_use)
-
-            total_units += 1
-
-        self.table.setSortingEnabled(True)
-        self.footer.setText(f"Total Units in Stock: {total_units}")
-
-    def _on_cell_double_click(self, row, col):
+    def _on_double_click(self, index):
         """Double-click any cell on a data row to copy that row's IMEI."""
-        item = self.table.item(row, 2)   # IMEI is always col 2
-        if item:
-            imei = item.data(Qt.ItemDataRole.UserRole)
-            if imei:
-                self._copy_imei(imei)
+        src = self.proxy.mapToSource(index)
+        imei = self.model.imei_at(src.row())
+        if imei:
+            self._copy_imei(imei)
+
+    def _on_use_clicked(self, index):
+        src = self.proxy.mapToSource(index)
+        imei = self.model.imei_at(src.row())
+        if imei:
+            self._use_in_sale(imei)
 
     def _copy_imei(self, imei: str):
         QApplication.clipboard().setText(imei)
@@ -1418,8 +1865,13 @@ class ImeiStockTab(QWidget):
             )
             self._copy_timer.start(4000)
 
-    def _export(self):
-        _export_table_csv(self.table, "imei_stock_report.csv", self)
+    def _export_payload(self):
+        headers = list(ImeiStockModel.HEADERS[:6])   # drop the action column
+        rows = [
+            [r[0], r[1], r[2], r[3], r[4], fmt_pkr(r[5])]
+            for r in self.model.displayed_rows()
+        ]
+        return ("IMEI_Stock", "IMEI Stock", headers, rows, {5})
 
 
 # ── Tab 7: Cash Book ──────────────────────────────────────────────────────────
@@ -1461,10 +1913,9 @@ class CashBookTab(QWidget):
 
         fl.addStretch()
 
-        btn_export = QPushButton("⬇ Export CSV")
-        btn_export.setStyleSheet(BTN_PRIMARY)
-        btn_export.clicked.connect(self._export)
-        fl.addWidget(btn_export)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        fl.addWidget(btn_pdf)
+        fl.addWidget(btn_csv)
 
         layout.addWidget(filter_card)
 
@@ -1581,9 +2032,10 @@ class CashBookTab(QWidget):
         )
         self.footer.setTextFormat(Qt.TextFormat.RichText)
 
-    def _export(self):
-        date_str = self.date_edit.date().toString("dd_MM_yyyy")
-        _export_table_csv(self.table, f"cash_book_{date_str}.csv", self)
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        date_str = self.date_edit.date().toString("dd/MM/yyyy")
+        return ("Cash_Book", f"Cash Book — {date_str}", headers, rows, {3, 4})
 
 
 # ── Tab 8: Customer Insights ──────────────────────────────────────────────────
@@ -1915,10 +2367,7 @@ class CustomerInsightsTab(QWidget):
 
 
 # ── Tab 9: Expenses by Category ───────────────────────────────────────────────
-
-_EXPENSE_CATEGORIES = [
-    "Rent", "Salaries", "Electricity", "Internet", "Travel", "Miscellaneous"
-]
+# Categories come from the single source of truth: database.EXPENSE_CATEGORIES.
 
 
 class ExpensesReportTab(QWidget):
@@ -1960,7 +2409,7 @@ class ExpensesReportTab(QWidget):
         fl.addWidget(QLabel("Category:"))
         self.cat_combo = QComboBox()
         self.cat_combo.addItem("All Categories", "")
-        for c in _EXPENSE_CATEGORIES:
+        for c in EXPENSE_CATEGORIES:
             self.cat_combo.addItem(c, c)
         self.cat_combo.setMinimumWidth(140)
         fl.addWidget(self.cat_combo)
@@ -2116,6 +2565,178 @@ class ExpensesReportTab(QWidget):
 
 # ── Reports Page ──────────────────────────────────────────────────────────────
 
+# ── Closing Balances ──────────────────────────────────────────────────────────
+
+def db_closing_balances() -> dict:
+    """
+    Gather every account's current closing balance for the Closing Balances report.
+      Receivables  — each credit customer (positive = they owe you)
+      Payables     — each supplier (positive = you owe them); id=0 / OPENING STOCK excluded
+      Other Parties— each loan/personal account with balance + direction
+      Bank Accounts— each bank with current balance
+      Cash in Hand — current cash balance
+      Incentives   — total accumulated income
+    """
+    conn = get_connection()
+
+    customers = conn.execute(
+        "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    receivables = [
+        {"name": c["name"], "balance": _party_closing_balance(conn, "customer", c["id"])}
+        for c in customers
+    ]
+
+    suppliers = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
+    payables = []
+    for s in suppliers:
+        if "OPENING STOCK" in s["name"].upper():
+            continue
+        payables.append({"name": s["name"],
+                         "balance": _party_closing_balance(conn, "supplier", s["id"])})
+
+    others = []
+    try:
+        rows = conn.execute("SELECT id, name FROM other_parties ORDER BY name").fetchall()
+        for op in rows:
+            bal = _party_closing_balance(conn, "other", op["id"])
+            direction = "Payable" if bal > 0 else ("Receivable" if bal < 0 else "-")
+            others.append({"name": op["name"], "balance": bal, "direction": direction})
+    except Exception:
+        pass  # other_parties table absent on very old DBs
+
+    conn.close()
+
+    banks = [
+        {"name": ba["name"], "balance": db_bank_account_closing_balance(ba["id"])}
+        for ba in db_bank_accounts()
+    ]
+
+    return {
+        "receivables":       receivables,
+        "receivables_total": sum(r["balance"] for r in receivables),
+        "payables":          payables,
+        "payables_total":    sum(p["balance"] for p in payables),
+        "others":            others,
+        "others_total":      sum(o["balance"] for o in others),
+        "banks":             banks,
+        "banks_total":       sum(b["balance"] for b in banks),
+        "cash":              db_cash_in_hand(),
+        "incentives":        db_incentives_income_total(),
+    }
+
+
+class ClosingBalancesTab(QWidget):
+    """All account closing balances in one place, grouped with per-group totals."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._date_lbl = QLabel("")
+        self._date_lbl.setStyleSheet("color:#1e293b; font-size:12pt; font-weight:bold;")
+        header.addWidget(self._date_lbl)
+        header.addStretch()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setStyleSheet(BTN_SECONDARY)
+        btn_refresh.clicked.connect(self.refresh)
+        header.addWidget(btn_refresh)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        header.addWidget(btn_pdf)
+        header.addWidget(btn_csv)
+        layout.addLayout(header)
+
+        self.table = _make_table(["Account", "Type", "Balance (PKR)"])
+        layout.addWidget(self.table, stretch=1)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        import datetime as _dt
+        today = _dt.date.today().strftime("%d/%m/%Y")
+        self._date_lbl.setText(f"Closing Balances  —  as at {today}")
+
+        d = db_closing_balances()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+
+        def _section(title):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            item = QTableWidgetItem(title)
+            item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            item.setBackground(QBrush(QColor("#cbd5e1")))
+            item.setForeground(QBrush(QColor("#1e293b")))
+            self.table.setItem(row, 0, item)
+            self.table.setSpan(row, 0, 1, 3)
+
+        def _item(name, typ, bal, total=False):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name_item = QTableWidgetItem(name)
+            type_item = QTableWidgetItem(typ)
+            bal_item = QTableWidgetItem(fmt_pkr(bal))
+            bal_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            bal_item.setForeground(
+                QBrush(QColor("#16a34a") if bal >= 0 else QColor("#dc2626"))
+            )
+            if total:
+                bold = QFont("Segoe UI", 10, QFont.Weight.Bold)
+                for it in (name_item, type_item, bal_item):
+                    it.setFont(bold)
+                    it.setBackground(QBrush(QColor("#f1f5f9")))
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, type_item)
+            self.table.setItem(row, 2, bal_item)
+
+        _section("RECEIVABLES — Credit Customers")
+        for r in d["receivables"]:
+            _item(r["name"], "Receivable", r["balance"])
+        _item("Total Receivables", "", d["receivables_total"], total=True)
+
+        _section("PAYABLES — Suppliers")
+        for p in d["payables"]:
+            _item(p["name"], "Payable", p["balance"])
+        _item("Total Payables", "", d["payables_total"], total=True)
+
+        if d["others"]:
+            _section("OTHER PARTIES")
+            for o in d["others"]:
+                _item(o["name"], o["direction"], o["balance"])
+            _item("Total Other Parties", "", d["others_total"], total=True)
+
+        _section("BANK ACCOUNTS")
+        for b in d["banks"]:
+            _item(b["name"], "Bank", b["balance"])
+        _item("Total Bank", "", d["banks_total"], total=True)
+
+        _section("CASH IN HAND")
+        _item("Cash in Hand", "Cash", d["cash"], total=True)
+
+        _section("INCENTIVES INCOME")
+        _item("Incentives Income (accumulated)", "Income", d["incentives"], total=True)
+
+    def _export_payload(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+        headers, rows = _table_to_rows(self.table)
+        today = datetime.date.today().strftime("%d/%m/%Y")
+        return ("Closing_Balances", f"Closing Balances — as at {today}",
+                headers, rows, {2})
+
+
 class ReportsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2156,6 +2777,7 @@ class ReportsPage(QWidget):
         self._tab_cashbook   = CashBookTab()
         self._tab_customers  = CustomerInsightsTab()
         self._tab_expenses   = ExpensesReportTab()
+        self._tab_closing    = ClosingBalancesTab()
 
         self.tabs.addTab(self._tab_stock,      "Stock Summary")
         self.tabs.addTab(self._tab_imei_stock, "IMEI Stock")
@@ -2166,6 +2788,7 @@ class ReportsPage(QWidget):
         self.tabs.addTab(self._tab_cashbook,   "Cash Book")
         self.tabs.addTab(self._tab_customers,  "Customer Insights")
         self.tabs.addTab(self._tab_expenses,   "Expenses")
+        self.tabs.addTab(self._tab_closing,    "Closing Balances")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
         layout.addWidget(self.tabs)

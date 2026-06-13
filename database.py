@@ -4,9 +4,6 @@ import os
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
-# Increment this whenever a new _migrate_vN function is added below.
-CURRENT_DB_VERSION = 5
-
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -151,6 +148,9 @@ def _seed_settings(c):
     _yr = _dt.date.today().year
     defaults = {
         "pin_hash": hashlib.sha256(b"119211").hexdigest(),
+        # Owner PIN — gates Capital and Settings. Seeded once via INSERT OR IGNORE
+        # below, so a later change to this value is never overwritten on startup.
+        "owner_pin": "9211",
         "shop_name": "United Mobile",
         "shop_address": "Shop 1-2, Rehma Commercial Center, Kutchery Road, Multan",
         "shop_contact": "0323-9637000",
@@ -211,7 +211,9 @@ def _run_migrations(conn) -> None:
     To add a future migration:
     1. Write  def _migrate_v2(conn): ...  below
     2. Add it to the `_MIGRATIONS` dict: {2: _migrate_v2}
-    3. Bump CURRENT_DB_VERSION to 2 at the top of this file.
+       The runner applies every dict entry whose version > the stored
+       db_version, so the dict is the single source of truth — there is no
+       separate version constant to keep in sync.
     """
     # Register every migration here — key = target version number
     _MIGRATIONS: dict[int, callable] = {
@@ -220,6 +222,11 @@ def _run_migrations(conn) -> None:
         3: _migrate_v3,
         4: _migrate_v4,
         5: _migrate_v5,
+        6: _migrate_v6,
+        7: _migrate_v7,
+        8: _migrate_v8,
+        9: _migrate_v9,
+        10: _migrate_v10,
     }
 
     current = _get_db_version(conn)
@@ -518,6 +525,213 @@ def _migrate_v5(conn) -> None:
     """)
 
 
+def _migrate_v6(conn) -> None:
+    """
+    Version 6 — Incentives Income account.
+    A single system income account used as the Cr side of a JV when recording
+    supplier incentives, rebates or margin adjustments. Its running balance is
+    held directly on income_accounts.balance.
+    Do NOT add a conn.commit() here — _run_migrations() commits per version.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS income_accounts (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            name    TEXT NOT NULL,
+            balance REAL DEFAULT 0
+        )
+    """)
+    # Seed the single 'Incentives Income' account (idempotent).
+    conn.execute(
+        "INSERT INTO income_accounts (name, balance) "
+        "SELECT 'Incentives Income', 0 "
+        "WHERE NOT EXISTS (SELECT 1 FROM income_accounts WHERE name='Incentives Income')"
+    )
+
+
+def _migrate_v7(conn) -> None:
+    """
+    Version 7 — Other Parties (personal loans / friend accounts).
+    1. Creates the other_parties table.
+    2. Relaxes the party_type CHECK on payments and journal_entries to also
+       allow 'other', so the existing ledger code can record CP/CR and journal
+       entries against these accounts unchanged. SQLite cannot ALTER a CHECK
+       constraint, so each table is rebuilt in place, preserving all rows/ids.
+    Do NOT add a conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS other_parties (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT NOT NULL,
+            contact         TEXT,
+            opening_balance REAL DEFAULT 0,
+            notes           TEXT
+        )
+    """)
+
+    # ── Relax payments.party_type CHECK → add 'other' ────────────────────────
+    pay = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'"
+    ).fetchone()
+    if pay and "'other'" not in pay[0]:
+        c.execute("ALTER TABLE payments RENAME TO _payments_old")
+        c.execute("""
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voucher_number TEXT UNIQUE NOT NULL,
+                party_type TEXT CHECK(party_type IN ('supplier', 'customer', 'other')),
+                party_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                type TEXT CHECK(type IN ('CP', 'CR')),
+                notes TEXT
+            )
+        """)
+        c.execute(
+            "INSERT INTO payments "
+            "(id, voucher_number, party_type, party_id, date, amount, type, notes) "
+            "SELECT id, voucher_number, party_type, party_id, date, amount, type, notes "
+            "FROM _payments_old"
+        )
+        c.execute("DROP TABLE _payments_old")
+
+    # ── Relax journal_entries.party_type CHECK → add 'other' ─────────────────
+    je = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_entries'"
+    ).fetchone()
+    if je and "'other'" not in je[0]:
+        c.execute("ALTER TABLE journal_entries RENAME TO _je_old")
+        c.execute("""
+            CREATE TABLE journal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                jv_number TEXT UNIQUE NOT NULL,
+                party_type TEXT CHECK(party_type IN ('supplier', 'customer', 'other')),
+                party_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                type TEXT CHECK(type IN ('debit', 'credit')),
+                notes TEXT
+            )
+        """)
+        c.execute(
+            "INSERT INTO journal_entries "
+            "(id, jv_number, party_type, party_id, date, amount, type, notes) "
+            "SELECT id, jv_number, party_type, party_id, date, amount, type, notes "
+            "FROM _je_old"
+        )
+        c.execute("DROP TABLE _je_old")
+
+
+def _migrate_v8(conn) -> None:
+    """
+    Version 8 — Remove UNIQUE constraint from payments.voucher_number.
+    Multi-line CP/CR vouchers share the same voucher_number across multiple rows.
+    Idempotent: if UNIQUE is already absent the function returns immediately.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'"
+    ).fetchone()
+    if row is None:
+        return                          # payments table absent — nothing to do
+    if "UNIQUE" not in row[0].upper():
+        return                          # UNIQUE already removed — idempotent skip
+
+    c.execute("ALTER TABLE payments RENAME TO _payments_v8_old")
+    c.execute("""
+        CREATE TABLE payments (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            voucher_number TEXT NOT NULL,
+            party_type     TEXT CHECK(party_type IN ('supplier','customer','other')),
+            party_id       INTEGER NOT NULL,
+            date           TEXT NOT NULL,
+            amount         REAL NOT NULL,
+            type           TEXT CHECK(type IN ('CP','CR')),
+            notes          TEXT
+        )
+    """)
+    c.execute("""
+        INSERT INTO payments
+            (id, voucher_number, party_type, party_id, date, amount, type, notes)
+        SELECT id, voucher_number, party_type, party_id, date, amount, type, notes
+        FROM _payments_v8_old
+    """)
+    c.execute("DROP TABLE _payments_v8_old")
+
+
+def _migrate_v9(conn) -> None:
+    """
+    Version 9 — Cross-party selling, salesman on purchase, and JV UNIQUE fix.
+    - Adds supplier_as_customer_id to sale_vouchers
+    - Adds customer_as_supplier_id and salesman_id to purchase_vouchers
+    - Removes UNIQUE constraint from journal_entries.jv_number so that
+      double-entry JVs (Dr+Cr both hitting journal_entries) no longer fail.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    try:
+        c.execute(
+            "ALTER TABLE sale_vouchers ADD COLUMN supplier_as_customer_id "
+            "INTEGER REFERENCES suppliers(id)"
+        )
+    except Exception:
+        pass
+
+    try:
+        c.execute(
+            "ALTER TABLE purchase_vouchers ADD COLUMN customer_as_supplier_id "
+            "INTEGER REFERENCES customers(id)"
+        )
+    except Exception:
+        pass
+
+    try:
+        c.execute(
+            "ALTER TABLE purchase_vouchers ADD COLUMN salesman_id "
+            "INTEGER REFERENCES salesmen(id)"
+        )
+    except Exception:
+        pass
+
+    # Remove UNIQUE from journal_entries.jv_number — SQLite requires table rebuild
+    je = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_entries'"
+    ).fetchone()
+    if je and "jv_number TEXT UNIQUE" in (je[0] or ""):
+        c.execute("ALTER TABLE journal_entries RENAME TO _je_v9_old")
+        c.execute("""
+            CREATE TABLE journal_entries (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                jv_number  TEXT NOT NULL,
+                party_type TEXT CHECK(party_type IN ('supplier', 'customer', 'other')),
+                party_id   INTEGER NOT NULL,
+                date       TEXT NOT NULL,
+                amount     REAL NOT NULL,
+                type       TEXT CHECK(type IN ('debit', 'credit')),
+                notes      TEXT
+            )
+        """)
+        c.execute("""
+            INSERT INTO journal_entries
+                (id, jv_number, party_type, party_id, date, amount, type, notes)
+            SELECT id, jv_number, party_type, party_id, date, amount, type, notes
+            FROM _je_v9_old
+        """)
+        c.execute("DROP TABLE _je_v9_old")
+
+
+def _migrate_v10(conn) -> None:
+    """Version 10 — Add per-line reference column to payments table."""
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE payments ADD COLUMN reference TEXT")
+    except Exception:
+        pass  # Column already exists
+
+
 # ── Expense helpers ───────────────────────────────────────────────────────────
 
 EXPENSE_CATEGORIES = [
@@ -759,6 +973,12 @@ def set_pin(new_pin: str):
     set_setting("pin_hash", _hash_pin(new_pin))
 
 
+def check_owner_pin(entered: str) -> bool:
+    """Owner PIN gating Capital & Settings. Stored in plaintext under 'owner_pin'."""
+    stored = get_setting("owner_pin")
+    return stored is not None and entered == stored
+
+
 # ── Bank account helpers ──────────────────────────────────────────────────────
 
 def db_bank_accounts():
@@ -900,6 +1120,14 @@ def _jv_side(c, jv_number: str, date_str: str, notes: str,
             "VALUES (?,?,?,?,?)",
             (jv_number, date_str, amount, direction, notes),
         )
+    elif acct_type == "income":
+        # Cr Income → income earned (balance ↑); Dr Income → reversal (balance ↓).
+        # Income has no dated ledger of its own — only a running balance.
+        delta = -amount if is_debit else amount
+        c.execute(
+            "UPDATE income_accounts SET balance = COALESCE(balance, 0) + ? WHERE id=?",
+            (delta, acct_id),
+        )
 
 
 def db_save_double_entry_jv(date_str: str, notes: str,
@@ -929,6 +1157,24 @@ def db_save_double_entry_jv(date_str: str, notes: str,
         raise
     conn.close()
     return jv_number
+
+
+# ── Income account helpers ────────────────────────────────────────────────────
+
+def db_income_account(name: str = "Incentives Income"):
+    """Return the income account row {id, name, balance} or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, name, balance FROM income_accounts WHERE name=?", (name,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def db_incentives_income_total() -> float:
+    """Total incentives income earned to date (running balance)."""
+    acct = db_income_account("Incentives Income")
+    return float(acct["balance"] or 0) if acct else 0.0
 
 
 def db_cash_in_hand() -> float:
@@ -975,11 +1221,38 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
     Compute the running ledger balance for a supplier or customer using the
     same DR/CR logic as ledger.py — without importing it (avoids circular import).
     """
-    table = "suppliers" if party_type == "supplier" else "customers"
+    table = {"supplier": "suppliers", "customer": "customers",
+             "other": "other_parties"}.get(party_type, "customers")
     ob_row = conn.execute(
         f"SELECT opening_balance FROM {table} WHERE id=?", (party_id,)
     ).fetchone()
     ob = float(ob_row["opening_balance"] or 0) if ob_row else 0.0
+
+    if party_type == "other":
+        # No purchases/sales — only cash payments and journal entries.
+        # Mirrors the supplier direction: CR received → balance ↑ (you owe more),
+        # CP paid → balance ↓; positive balance = you owe them.
+        cr = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments "
+            "WHERE party_type='other' AND party_id=? AND type='CR'",
+            (party_id,)
+        ).fetchone()[0]
+        cp = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments "
+            "WHERE party_type='other' AND party_id=? AND type='CP'",
+            (party_id,)
+        ).fetchone()[0]
+        jv_dr = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM journal_entries "
+            "WHERE party_type='other' AND party_id=? AND type='debit'",
+            (party_id,)
+        ).fetchone()[0]
+        jv_cr = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM journal_entries "
+            "WHERE party_type='other' AND party_id=? AND type='credit'",
+            (party_id,)
+        ).fetchone()[0]
+        return ob + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
 
     if party_type == "supplier":
         # Purchases → DR (increases what you owe)
@@ -1111,12 +1384,8 @@ def db_year_end_summary(year_start_iso: str, year_end_iso: str) -> dict:
     ).fetchall()
     conn.close()
 
-    supplier_balances = [
-        {"name": s["name"],
-         "balance": _party_closing_balance(get_connection(), "supplier", s["id"])}
-        for s in suppliers
-    ]
-    # Close each temp connection used above properly — use a single conn instead
+    # Compute supplier & customer closing balances over a single shared
+    # connection (conn2), explicitly closed below.
     conn2 = get_connection()
     supplier_balances = [
         {"name": s["name"],
@@ -1185,6 +1454,18 @@ def db_perform_year_end_close(archive_path: str):
                 (round(bal, 2), cust["id"])
             )
 
+        # ── 2b2. Carry forward other-party (loan) balances ───────────────────
+        try:
+            others = c.execute("SELECT id FROM other_parties").fetchall()
+            for op in others:
+                bal = _party_closing_balance(conn, "other", op["id"])
+                c.execute(
+                    "UPDATE other_parties SET opening_balance=? WHERE id=?",
+                    (round(bal, 2), op["id"])
+                )
+        except Exception:
+            pass  # table absent on very old DBs — nothing to carry
+
         # ── 2c. Carry forward bank account balances ──────────────────────────
         bank_accounts = c.execute("SELECT id FROM bank_accounts").fetchall()
         for ba in bank_accounts:
@@ -1216,6 +1497,12 @@ def db_perform_year_end_close(archive_path: str):
             "expenses",
         ]:
             c.execute(f"DELETE FROM {tbl}")
+
+        # ── 4b. Close income accounts to retained (reset for the new year) ────
+        try:
+            c.execute("UPDATE income_accounts SET balance = 0")
+        except Exception:
+            pass  # table absent on very old DBs
 
         # ── 5. Remove sold/returned stock items (their vouchers are gone) ─────
         c.execute("DELETE FROM stock_items WHERE status != 'in_stock'")

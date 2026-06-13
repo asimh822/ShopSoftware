@@ -238,6 +238,10 @@ def db_update_sale(sv_id, date_str, sale_type, customer_id, cash_name, cash_cont
                 (sl_id, stock_item_id),
             )
 
+        # For cash sales, cash_paid must equal the net total
+        if payment_method == "cash":
+            cash_paid = total_amount
+
         c.execute("""
             UPDATE sale_vouchers
             SET date=?, type=?, customer_id=?, cash_customer_name=?,
@@ -342,12 +346,12 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines):
     conn.close()
 
 
-def db_update_payment(payment_id, date_str, amount, notes):
+def db_update_payment(payment_id, date_str, amount, reference):
     """Update a payments record. Ledger recomputes automatically."""
     conn = get_connection()
     conn.execute(
-        "UPDATE payments SET date=?, amount=?, notes=? WHERE id=?",
-        (date_str, amount, notes or "", payment_id),
+        "UPDATE payments SET date=?, amount=?, reference=? WHERE id=?",
+        (date_str, amount, reference or "", payment_id),
     )
     conn.commit()
     conn.close()
@@ -1477,11 +1481,12 @@ class PaymentEditDialog(QDialog):
 
         g3 = QHBoxLayout()
         g3.setSpacing(10)
-        lbl_n = QLabel("Notes:")
+        lbl_n = QLabel("Reference No.:")
         lbl_n.setFixedWidth(110)
         g3.addWidget(lbl_n)
-        self.notes_edit = QLineEdit(payment_dict.get("notes") or "")
-        g3.addWidget(self.notes_edit)
+        self.ref_edit = QLineEdit(payment_dict.get("reference") or "")
+        self.ref_edit.setPlaceholderText("Optional")
+        g3.addWidget(self.ref_edit)
         layout.addLayout(g3)
 
         # ── Button row: Delete (left) | Cancel + Save (right) ────────────────
@@ -1513,9 +1518,9 @@ class PaymentEditDialog(QDialog):
     def _save(self):
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
         amount = self.amount_spin.value()
-        notes = self.notes_edit.text().strip()
+        reference = self.ref_edit.text().strip()
         try:
-            db_update_payment(self._pay["id"], date_str, amount, notes)
+            db_update_payment(self._pay["id"], date_str, amount, reference)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return

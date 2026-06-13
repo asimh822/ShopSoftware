@@ -306,8 +306,9 @@ def db_delete_other_party(party_id):
 # ── Dialogs ───────────────────────────────────────────────────────────────────
 
 class BrandDialog(QDialog):
-    def __init__(self, parent=None, name=""):
+    def __init__(self, parent=None, name="", existing_id=None):
         super().__init__(parent)
+        self._existing_id = existing_id
         self.setWindowTitle("Brand")
         self.setFixedWidth(320)
         self.setStyleSheet(FORM_INPUT_STYLE)
@@ -328,8 +329,18 @@ class BrandDialog(QDialog):
         form.addRow(btns)
 
     def _accept(self):
-        if not self.name_edit.text().strip():
+        name = self.name_edit.text().strip().upper()
+        if not name:
             QMessageBox.warning(self, "Validation", "Brand name is required.")
+            return
+        conn = get_connection()
+        dup = conn.execute(
+            "SELECT id FROM brands WHERE UPPER(name)=? AND id!=?",
+            (name, self._existing_id or -1)
+        ).fetchone()
+        conn.close()
+        if dup:
+            QMessageBox.warning(self, "Duplicate", f"Brand '{name}' already exists.")
             return
         self.accept()
 
@@ -338,8 +349,9 @@ class BrandDialog(QDialog):
 
 
 class ModelDialog(QDialog):
-    def __init__(self, parent=None, brand_id=None, name="", ref_price=0.0):
+    def __init__(self, parent=None, brand_id=None, name="", ref_price=0.0, existing_id=None):
         super().__init__(parent)
+        self._existing_id = existing_id
         self.setWindowTitle("Model")
         self.setFixedWidth(380)
         self.setStyleSheet(FORM_INPUT_STYLE)
@@ -390,8 +402,21 @@ class ModelDialog(QDialog):
         if self.brand_combo.count() == 0:
             QMessageBox.warning(self, "Validation", "Add a brand first.")
             return
-        if not self.name_edit.text().strip():
+        name = self.name_edit.text().strip().upper()
+        if not name:
             QMessageBox.warning(self, "Validation", "Model name is required.")
+            return
+        brand_id = self.brand_combo.currentData()
+        conn = get_connection()
+        dup = conn.execute(
+            "SELECT id FROM models WHERE brand_id=? AND UPPER(name)=? AND id!=?",
+            (brand_id, name, self._existing_id or -1)
+        ).fetchone()
+        conn.close()
+        if dup:
+            brand_name = self.brand_combo.currentText()
+            QMessageBox.warning(self, "Duplicate",
+                f"Model '{name}' already exists under {brand_name}.")
             return
         self.accept()
 
@@ -404,8 +429,9 @@ class ModelDialog(QDialog):
 
 
 class SupplierDialog(QDialog):
-    def __init__(self, parent=None, name="", contact="", ob=0.0):
+    def __init__(self, parent=None, name="", contact="", ob=0.0, existing_id=None):
         super().__init__(parent)
+        self._existing_id = existing_id
         self.setWindowTitle("Supplier")
         self.setFixedWidth(380)
         self.setStyleSheet(FORM_INPUT_STYLE)
@@ -445,7 +471,8 @@ class SupplierDialog(QDialog):
         form.addRow(btns)
 
     def _accept(self):
-        if not self.name_edit.text().strip():
+        name = self.name_edit.text().strip()
+        if not name:
             QMessageBox.warning(self, "Validation", "Supplier name is required.")
             return
         contact = self.contact_edit.text().strip()
@@ -453,6 +480,16 @@ class SupplierDialog(QDialog):
             QMessageBox.warning(self, "Invalid Phone Number",
                 "Phone number must start with 03 and be exactly 11 digits.\n"
                 "Example: 03155344522")
+            return
+        conn = get_connection()
+        dup = conn.execute(
+            "SELECT id FROM suppliers WHERE UPPER(name)=UPPER(?) AND id!=?",
+            (name, self._existing_id or -1)
+        ).fetchone()
+        conn.close()
+        if dup:
+            QMessageBox.warning(self, "Duplicate",
+                f"Supplier '{name}' already exists.")
             return
         self.accept()
 
@@ -465,8 +502,9 @@ class SupplierDialog(QDialog):
 
 
 class CustomerDialog(QDialog):
-    def __init__(self, parent=None, name="", contact="", ob=0.0):
+    def __init__(self, parent=None, name="", contact="", ob=0.0, existing_id=None):
         super().__init__(parent)
+        self._existing_id = existing_id
         self.setWindowTitle("Credit Customer")
         self.setFixedWidth(380)
         self.setStyleSheet(FORM_INPUT_STYLE)
@@ -506,7 +544,8 @@ class CustomerDialog(QDialog):
         form.addRow(btns)
 
     def _accept(self):
-        if not self.name_edit.text().strip():
+        name = self.name_edit.text().strip()
+        if not name:
             QMessageBox.warning(self, "Validation", "Customer name is required.")
             return
         contact = self.contact_edit.text().strip()
@@ -514,6 +553,16 @@ class CustomerDialog(QDialog):
             QMessageBox.warning(self, "Invalid Phone Number",
                 "Phone number must start with 03 and be exactly 11 digits.\n"
                 "Example: 03155344522")
+            return
+        conn = get_connection()
+        dup = conn.execute(
+            "SELECT id FROM customers WHERE UPPER(name)=UPPER(?) AND id!=?",
+            (name, self._existing_id or -1)
+        ).fetchone()
+        conn.close()
+        if dup:
+            QMessageBox.warning(self, "Duplicate",
+                f"Customer '{name}' already exists.")
             return
         self.accept()
 
@@ -528,8 +577,9 @@ class CustomerDialog(QDialog):
 class OtherPartyDialog(QDialog):
     """Personal / loan account — friends, partners, cash-only parties."""
 
-    def __init__(self, parent=None, name="", contact="", ob=0.0, notes=""):
+    def __init__(self, parent=None, name="", contact="", ob=0.0, notes="", existing_id=None):
         super().__init__(parent)
+        self._existing_id = existing_id
         self.setWindowTitle("Other Party")
         self.setFixedWidth(380)
         self.setStyleSheet(FORM_INPUT_STYLE)
@@ -577,7 +627,8 @@ class OtherPartyDialog(QDialog):
         form.addRow(btns)
 
     def _accept(self):
-        if not self.name_edit.text().strip():
+        name = self.name_edit.text().strip()
+        if not name:
             QMessageBox.warning(self, "Validation", "Name is required.")
             return
         contact = self.contact_edit.text().strip()
@@ -585,6 +636,16 @@ class OtherPartyDialog(QDialog):
             QMessageBox.warning(self, "Invalid Phone Number",
                 "Phone number must start with 03 and be exactly 11 digits.\n"
                 "Example: 03155344522")
+            return
+        conn = get_connection()
+        dup = conn.execute(
+            "SELECT id FROM other_parties WHERE UPPER(name)=UPPER(?) AND id!=?",
+            (name, self._existing_id or -1)
+        ).fetchone()
+        conn.close()
+        if dup:
+            QMessageBox.warning(self, "Duplicate",
+                f"Party '{name}' already exists.")
             return
         self.accept()
 
@@ -661,7 +722,7 @@ class BrandsTab(QWidget):
         bid, name = self._current()
         if bid is None:
             return
-        dlg = BrandDialog(self, name=name)
+        dlg = BrandDialog(self, name=name, existing_id=bid)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             db_save_brand(dlg.get_data(), brand_id=bid)
             self.refresh()
@@ -780,7 +841,7 @@ class ModelsTab(QWidget):
         if not data:
             return
         model_id, brand_id, name, ref_price = data
-        dlg = ModelDialog(self, brand_id=brand_id, name=name, ref_price=ref_price or 0)
+        dlg = ModelDialog(self, brand_id=brand_id, name=name, ref_price=ref_price or 0, existing_id=model_id)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             db_save_model(*dlg.get_data(), model_id=model_id)
             self.refresh()
@@ -875,7 +936,8 @@ class SuppliersTab(QWidget):
         conn.close()
         dlg = SupplierDialog(self, name=r["name"],
                              contact=r["contact"] or "",
-                             ob=r["opening_balance"] or 0)
+                             ob=r["opening_balance"] or 0,
+                             existing_id=sid)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             db_save_supplier(*dlg.get_data(), supplier_id=sid)
             self.refresh()
@@ -978,7 +1040,8 @@ class CustomersTab(QWidget):
         conn.close()
         dlg = CustomerDialog(self, name=r["name"],
                              contact=r["contact"] or "",
-                             ob=r["opening_balance"] or 0)
+                             ob=r["opening_balance"] or 0,
+                             existing_id=cid)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             db_save_customer(*dlg.get_data(), customer_id=cid)
             self.refresh()
@@ -1084,7 +1147,8 @@ class OtherPartiesTab(QWidget):
         dlg = OtherPartyDialog(self, name=r["name"],
                                contact=r["contact"] or "",
                                ob=r["opening_balance"] or 0,
-                               notes=r["notes"] or "")
+                               notes=r["notes"] or "",
+                               existing_id=pid)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             db_save_other_party(*dlg.get_data(), party_id=pid)
             self.refresh()

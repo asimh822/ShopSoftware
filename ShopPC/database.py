@@ -225,6 +225,8 @@ def _run_migrations(conn) -> None:
         6: _migrate_v6,
         7: _migrate_v7,
         8: _migrate_v8,
+        9: _migrate_v9,
+        10: _migrate_v10,
     }
 
     current = _get_db_version(conn)
@@ -657,6 +659,77 @@ def _migrate_v8(conn) -> None:
         FROM _payments_v8_old
     """)
     c.execute("DROP TABLE _payments_v8_old")
+
+
+def _migrate_v9(conn) -> None:
+    """
+    Version 9 — Cross-party selling, salesman on purchase, and JV UNIQUE fix.
+    - Adds supplier_as_customer_id to sale_vouchers
+    - Adds customer_as_supplier_id and salesman_id to purchase_vouchers
+    - Removes UNIQUE constraint from journal_entries.jv_number so that
+      double-entry JVs (Dr+Cr both hitting journal_entries) no longer fail.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    try:
+        c.execute(
+            "ALTER TABLE sale_vouchers ADD COLUMN supplier_as_customer_id "
+            "INTEGER REFERENCES suppliers(id)"
+        )
+    except Exception:
+        pass
+
+    try:
+        c.execute(
+            "ALTER TABLE purchase_vouchers ADD COLUMN customer_as_supplier_id "
+            "INTEGER REFERENCES customers(id)"
+        )
+    except Exception:
+        pass
+
+    try:
+        c.execute(
+            "ALTER TABLE purchase_vouchers ADD COLUMN salesman_id "
+            "INTEGER REFERENCES salesmen(id)"
+        )
+    except Exception:
+        pass
+
+    # Remove UNIQUE from journal_entries.jv_number — SQLite requires table rebuild
+    je = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_entries'"
+    ).fetchone()
+    if je and "jv_number TEXT UNIQUE" in (je[0] or ""):
+        c.execute("ALTER TABLE journal_entries RENAME TO _je_v9_old")
+        c.execute("""
+            CREATE TABLE journal_entries (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                jv_number  TEXT NOT NULL,
+                party_type TEXT CHECK(party_type IN ('supplier', 'customer', 'other')),
+                party_id   INTEGER NOT NULL,
+                date       TEXT NOT NULL,
+                amount     REAL NOT NULL,
+                type       TEXT CHECK(type IN ('debit', 'credit')),
+                notes      TEXT
+            )
+        """)
+        c.execute("""
+            INSERT INTO journal_entries
+                (id, jv_number, party_type, party_id, date, amount, type, notes)
+            SELECT id, jv_number, party_type, party_id, date, amount, type, notes
+            FROM _je_v9_old
+        """)
+        c.execute("DROP TABLE _je_v9_old")
+
+
+def _migrate_v10(conn) -> None:
+    """Version 10 — Add per-line reference column to payments table."""
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE payments ADD COLUMN reference TEXT")
+    except Exception:
+        pass  # Column already exists
 
 
 # ── Expense helpers ───────────────────────────────────────────────────────────

@@ -238,6 +238,10 @@ def db_update_sale(sv_id, date_str, sale_type, customer_id, cash_name, cash_cont
                 (sl_id, stock_item_id),
             )
 
+        # For cash sales, cash_paid must equal the net total
+        if payment_method == "cash":
+            cash_paid = total_amount
+
         c.execute("""
             UPDATE sale_vouchers
             SET date=?, type=?, customer_id=?, cash_customer_name=?,
@@ -342,12 +346,12 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines):
     conn.close()
 
 
-def db_update_payment(payment_id, date_str, amount, notes):
+def db_update_payment(payment_id, date_str, amount, reference):
     """Update a payments record. Ledger recomputes automatically."""
     conn = get_connection()
     conn.execute(
-        "UPDATE payments SET date=?, amount=?, notes=? WHERE id=?",
-        (date_str, amount, notes or "", payment_id),
+        "UPDATE payments SET date=?, amount=?, reference=? WHERE id=?",
+        (date_str, amount, reference or "", payment_id),
     )
     conn.commit()
     conn.close()
@@ -357,6 +361,38 @@ def db_delete_payment(payment_id):
     """Permanently delete a CP or CR payment record."""
     conn = get_connection()
     conn.execute("DELETE FROM payments WHERE id=?", (payment_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_lookup_bank_transaction(voucher_number):
+    """Look up a bank_transactions row by voucher number (includes bank account name)."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT bt.*, COALESCE(ba.name, '') AS bank_name
+        FROM bank_transactions bt
+        LEFT JOIN bank_accounts ba ON ba.id = bt.bank_account_id
+        WHERE bt.voucher_number = ?
+    """, (voucher_number,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def db_update_bank_transaction(tx_id, date_str, amount, notes):
+    """Update date, amount and notes on a bank_transactions row."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bank_transactions SET date=?, amount=?, notes=? WHERE id=?",
+        (date_str, amount, notes or "", tx_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_bank_transaction(tx_id):
+    """Permanently delete a bank_transactions row."""
+    conn = get_connection()
+    conn.execute("DELETE FROM bank_transactions WHERE id=?", (tx_id,))
     conn.commit()
     conn.close()
 
@@ -608,6 +644,7 @@ class SaleEditDialog(QDialog):
             | Qt.WindowType.WindowMinimizeButtonHint
             | Qt.WindowType.WindowCloseButtonHint
         )
+        self._sv_id = sv_id
         sv, lines, cust = db_load_sale_for_edit(sv_id)
         self._sv = sv
 
@@ -986,7 +1023,7 @@ class SaleEditDialog(QDialog):
 
             price_edit = QLineEdit(str(int(ln["final_price"])))
             price_edit.setFixedWidth(168)
-            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:12pt; font-weight:bold; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
             price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
             price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
@@ -1280,7 +1317,7 @@ class PurchaseEditDialog(QDialog):
 
             price_edit = QLineEdit(str(int(ln["purchase_price"])))
             price_edit.setFixedWidth(178)
-            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:12pt; font-weight:bold; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
             price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
             price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
@@ -1349,7 +1386,14 @@ class PurchaseEditDialog(QDialog):
         self._rebuild_lines_table()
 
     def _save(self):
-        if self.supplier_combo.currentData() is None:
+        # Cash purchases have no real supplier (system supplier_id=0), so the
+        # supplier selection is only required for supplier/credit purchases.
+        # Prefer the loaded purchase_type; fall back to supplier_id when it's
+        # NULL/empty (legacy rows without a purchase_type).
+        ptype = (self._pv.get("purchase_type") or "").strip().lower()
+        is_cash_purchase = ptype == "cash" or not self._pv.get("supplier_id")
+
+        if not is_cash_purchase and self.supplier_combo.currentData() is None:
             QMessageBox.warning(self, "Missing", "Select a supplier.")
             return
         if not self._lines:
@@ -1357,7 +1401,12 @@ class PurchaseEditDialog(QDialog):
             return
 
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        supplier_id = self.supplier_combo.currentData()
+        # Keep the original supplier for cash purchases (system id=0); use the
+        # chosen supplier for supplier/credit purchases.
+        if is_cash_purchase:
+            supplier_id = self._pv.get("supplier_id")
+        else:
+            supplier_id = self.supplier_combo.currentData()
         notes = self.notes_edit.text().strip()
         db_lines = [(ln["model_id"], ln["imei"], ln["purchase_price"]) for ln in self._lines]
 
@@ -1432,11 +1481,12 @@ class PaymentEditDialog(QDialog):
 
         g3 = QHBoxLayout()
         g3.setSpacing(10)
-        lbl_n = QLabel("Notes:")
+        lbl_n = QLabel("Reference No.:")
         lbl_n.setFixedWidth(110)
         g3.addWidget(lbl_n)
-        self.notes_edit = QLineEdit(payment_dict.get("notes") or "")
-        g3.addWidget(self.notes_edit)
+        self.ref_edit = QLineEdit(payment_dict.get("reference") or "")
+        self.ref_edit.setPlaceholderText("Optional")
+        g3.addWidget(self.ref_edit)
         layout.addLayout(g3)
 
         # ── Button row: Delete (left) | Cancel + Save (right) ────────────────
@@ -1468,9 +1518,9 @@ class PaymentEditDialog(QDialog):
     def _save(self):
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
         amount = self.amount_spin.value()
-        notes = self.notes_edit.text().strip()
+        reference = self.ref_edit.text().strip()
         try:
-            db_update_payment(self._pay["id"], date_str, amount, notes)
+            db_update_payment(self._pay["id"], date_str, amount, reference)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
@@ -1494,6 +1544,134 @@ class PaymentEditDialog(QDialog):
             QMessageBox.critical(self, "Error", str(ex))
             return
         self.done(PaymentEditDialog.DELETED)
+
+
+# ── Bank Transaction Edit Dialog ──────────────────────────────────────────────
+
+class BankTransactionEditDialog(QDialog):
+    """Edit or delete a bank CP/CR transaction (cash deposit or withdrawal)."""
+
+    DELETED = 2
+
+    def __init__(self, tx_dict, parent=None):
+        super().__init__(parent)
+        self._tx = tx_dict
+        vnum  = tx_dict["voucher_number"]
+        vtype = tx_dict["type"]
+        direction = "Cash Deposit (CP)" if vtype == "CP" else "Cash Withdrawal (CR)"
+        self.setWindowTitle(f"Edit Bank Transaction — {vnum}")
+        self.setMinimumWidth(500)
+        self.resize(520, 270)
+        self.setStyleSheet(FORM_INPUT_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        lbl = QLabel(f"Edit {direction} — {vnum}")
+        lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        lbl.setStyleSheet("color:#1e293b;")
+        layout.addWidget(lbl)
+
+        bank_row = QHBoxLayout()
+        bank_row.setSpacing(10)
+        lbl_b = QLabel("Bank Account:")
+        lbl_b.setFixedWidth(120)
+        bank_row.addWidget(lbl_b)
+        bank_name_lbl = QLabel(tx_dict.get("bank_name") or "—")
+        bank_name_lbl.setStyleSheet("color:#475569;")
+        bank_row.addWidget(bank_name_lbl)
+        bank_row.addStretch()
+        layout.addLayout(bank_row)
+
+        date_row = QHBoxLayout()
+        date_row.setSpacing(10)
+        lbl_d = QLabel("Date:")
+        lbl_d.setFixedWidth(120)
+        date_row.addWidget(lbl_d)
+        self.date_edit = QDateEdit()
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setMinimumWidth(140)
+        d = tx_dict["date"].split("/")
+        self.date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
+        date_row.addWidget(self.date_edit)
+        date_row.addStretch()
+        layout.addLayout(date_row)
+
+        amt_row = QHBoxLayout()
+        amt_row.setSpacing(10)
+        lbl_a = QLabel("Amount (PKR):")
+        lbl_a.setFixedWidth(120)
+        amt_row.addWidget(lbl_a)
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setRange(0.01, 9_999_999)
+        self.amount_spin.setDecimals(0)
+        self.amount_spin.setSingleStep(1000)
+        self.amount_spin.setMinimumWidth(160)
+        self.amount_spin.setValue(float(tx_dict["amount"]))
+        amt_row.addWidget(self.amount_spin)
+        amt_row.addStretch()
+        layout.addLayout(amt_row)
+
+        notes_row = QHBoxLayout()
+        notes_row.setSpacing(10)
+        lbl_n = QLabel("Notes:")
+        lbl_n.setFixedWidth(120)
+        notes_row.addWidget(lbl_n)
+        self.notes_edit = QLineEdit(tx_dict.get("notes") or "")
+        notes_row.addWidget(self.notes_edit)
+        layout.addLayout(notes_row)
+
+        btn_row = QHBoxLayout()
+        btn_delete = QPushButton("🗑 Delete")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(self._delete)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("Save")
+        btn_save.setStyleSheet(BTN_PRIMARY)
+        btn_save.clicked.connect(self._save)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def _save(self):
+        date_str = self.date_edit.date().toString("dd/MM/yyyy")
+        amount   = self.amount_spin.value()
+        notes    = self.notes_edit.text().strip()
+        try:
+            db_update_bank_transaction(self._tx["id"], date_str, amount, notes)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+            return
+        QMessageBox.information(self, "Saved", f"{self._tx['voucher_number']} updated.")
+        self.accept()
+
+    def _delete(self):
+        vnum = self._tx["voucher_number"]
+        amt  = float(self._tx["amount"])
+        ans = QMessageBox.warning(
+            self, "Delete Transaction",
+            f"Delete {vnum} (PKR {amt:,.0f})?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            db_delete_bank_transaction(self._tx["id"])
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+            return
+        self.done(BankTransactionEditDialog.DELETED)
 
 
 # ── Journal Entry Edit Dialog (single-party JV) ───────────────────────────────

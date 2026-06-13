@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QFrame, QGridLayout,
     QDoubleSpinBox, QSpinBox, QComboBox, QDateEdit, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QTextEdit,
+    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QRegularExpression
+from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QRegularExpression, QDate
 from PyQt6.QtGui import QFont, QColor, QRegularExpressionValidator
 
 from database import init_db, check_pin, check_owner_pin
@@ -106,9 +107,7 @@ NAV_ITEMS = [
     ("Masters",          "masters"),
     ("Purchase",         "purchase"),
     ("Sales",            "sales"),
-    ("Cash Payment",     "cp"),
-    ("Cash Receipt",     "cr"),
-    ("Journal Voucher",  "jv"),
+    ("Vouchers",         "vouchers"),
     ("Ledger",           "ledger"),
     ("Capital",          "capital"),
     ("Expenses",         "expenses"),
@@ -152,6 +151,22 @@ class EnterAsTabFilter(QObject):
                     if obj.isEnabled() and obj.isVisible():
                         obj.click()
                         return True
+        return False
+
+
+class _IdleResetFilter(QObject):
+    """Reset the idle timer on any mouse movement, button press, or key press."""
+    def __init__(self, on_activity, parent=None):
+        super().__init__(parent)
+        self._on_activity = on_activity
+
+    def eventFilter(self, obj, event):
+        if event.type() in (
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.KeyPress,
+        ):
+            self._on_activity()
         return False
 
 
@@ -228,8 +243,6 @@ class Sidebar(QWidget):
         self.buttons: dict[str, NavButton] = {}
         for label, key in NAV_ITEMS:
             btn = NavButton(label)
-            if key in ("cp", "cr", "jv"):
-                btn.setCheckable(False)   # dialog launchers — no persistent active state
             self.buttons[key] = btn
             layout.addWidget(btn)
 
@@ -1064,6 +1077,481 @@ class OwnerPinDialog(QDialog):
             self._err.setText("Incorrect PIN")
 
 
+class VouchersPage(QWidget):
+    """Vouchers page — CP, CR, JV tabs with date filters, party filter, list, and footer."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background: {CONTENT_BG};")
+        from ledger import BTN_PRIMARY, BTN_GREEN, BTN_SECONDARY, CARD_STYLE, TABLE_STYLE
+        self._CARD = CARD_STYLE
+        self._TABLE = TABLE_STYLE
+        self._BS = BTN_SECONDARY
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        # ── Title row + Go to Voucher ─────────────────────────────────────────
+        top = QHBoxLayout()
+        title = QLabel("Vouchers")
+        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+        title.setStyleSheet("color:#1e293b;")
+        top.addWidget(title)
+        top.addStretch()
+        top.addWidget(QLabel("Go to:"))
+        self._goto_edit = QLineEdit()
+        self._goto_edit.setPlaceholderText("CP-0001 / CR-0001 / JV-0001")
+        self._goto_edit.setFixedWidth(200)
+        self._goto_edit.returnPressed.connect(self._goto_voucher)
+        top.addWidget(self._goto_edit)
+        btn_goto = QPushButton("Open")
+        btn_goto.setStyleSheet(BTN_SECONDARY)
+        btn_goto.clicked.connect(self._goto_voucher)
+        top.addWidget(btn_goto)
+        layout.addLayout(top)
+
+        # ── Tabs ─────────────────────────────────────────────────────────────
+        self._tabs = QTabWidget()
+        self._cp_tab = self._build_cp_cr_tab("CP", BTN_PRIMARY)
+        self._cr_tab = self._build_cp_cr_tab("CR", BTN_GREEN)
+        self._jv_tab = self._build_jv_tab()
+        self._tabs.addTab(self._cp_tab["widget"], "Cash Payments (CP)")
+        self._tabs.addTab(self._cr_tab["widget"], "Cash Receipts (CR)")
+        self._tabs.addTab(self._jv_tab["widget"], "Journal Vouchers (JV)")
+        layout.addWidget(self._tabs, stretch=1)
+
+    # ── Table factory ─────────────────────────────────────────────────────────
+
+    def _make_table(self, headers):
+        t = QTableWidget(0, len(headers))
+        t.setHorizontalHeaderLabels(headers)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        t.verticalHeader().setVisible(False)
+        t.setStyleSheet(self._TABLE)
+        return t
+
+    # ── Tab builders ──────────────────────────────────────────────────────────
+
+    def _build_cp_cr_tab(self, ptype, btn_new_style):
+        widget = QWidget()
+        widget.setStyleSheet(f"background: {CONTENT_BG};")
+        vbox = QVBoxLayout(widget)
+        vbox.setContentsMargins(0, 10, 0, 0)
+        vbox.setSpacing(10)
+
+        # Filter card
+        card = QFrame()
+        card.setStyleSheet(self._CARD)
+        fl = QHBoxLayout(card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(10)
+
+        fl.addWidget(QLabel("From:"))
+        from_date = QDateEdit(QDate.currentDate())
+        from_date.setDisplayFormat("dd/MM/yyyy")
+        from_date.setCalendarPopup(True)
+        from_date.setMinimumWidth(110)
+        fl.addWidget(from_date)
+
+        fl.addWidget(QLabel("To:"))
+        to_date = QDateEdit(QDate.currentDate())
+        to_date.setDisplayFormat("dd/MM/yyyy")
+        to_date.setCalendarPopup(True)
+        to_date.setMinimumWidth(110)
+        fl.addWidget(to_date)
+
+        fl.addWidget(QLabel("Party:"))
+        party_combo = QComboBox()
+        party_combo.setMinimumWidth(190)
+        party_combo.addItem("— All —", None)
+        from database import get_connection as _gc
+        _conn = _gc()
+        for r in _conn.execute("SELECT id, name FROM suppliers WHERE id!=0 ORDER BY name"):
+            party_combo.addItem(f"[Supplier] {r['name']}", {"ptype": "supplier", "pid": r["id"]})
+        for r in _conn.execute("SELECT id, name FROM customers ORDER BY name"):
+            party_combo.addItem(f"[Customer] {r['name']}", {"ptype": "customer", "pid": r["id"]})
+        _conn.close()
+        fl.addWidget(party_combo)
+
+        fl.addSpacing(6)
+        for label in ("Today", "Yesterday", "Search", "Clear"):
+            b = QPushButton(label)
+            b.setStyleSheet(self._BS)
+            fl.addWidget(b)
+            if label == "Today":
+                btn_today = b
+            elif label == "Yesterday":
+                btn_yesterday = b
+            elif label == "Search":
+                btn_search = b
+            else:
+                btn_clear = b
+
+        fl.addStretch()
+        btn_new = QPushButton(f"+ New {ptype}")
+        btn_new.setStyleSheet(btn_new_style)
+        fl.addWidget(btn_new)
+        vbox.addWidget(card)
+
+        # Table
+        table = self._make_table(["#", "Date", "Voucher", "Party Type", "Party Name", "Amount (PKR)"])
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        hdr.setStretchLastSection(False)
+        table.setColumnWidth(0, 40)
+        table.setColumnWidth(1, 110)
+        table.setColumnWidth(2, 100)
+        table.setColumnWidth(3, 100)
+        table.setColumnWidth(5, 130)
+        vbox.addWidget(table, stretch=1)
+
+        # Footer
+        footer = QLabel("Total Vouchers: 0   |   Total Amount: Rs. 0")
+        footer.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        footer.setStyleSheet("color:#1e293b; padding:4px 2px;")
+        vbox.addWidget(footer)
+
+        state = {
+            "widget": widget, "ptype": ptype,
+            "from_date": from_date, "to_date": to_date,
+            "party_combo": party_combo, "table": table, "footer": footer,
+        }
+
+        btn_today.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate()),
+            to_date.setDate(QDate.currentDate()),
+            self._refresh_cp_cr(state),
+        ))
+        btn_yesterday.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate().addDays(-1)),
+            to_date.setDate(QDate.currentDate().addDays(-1)),
+            self._refresh_cp_cr(state),
+        ))
+        btn_search.clicked.connect(lambda: self._refresh_cp_cr(state))
+        btn_clear.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate()),
+            to_date.setDate(QDate.currentDate()),
+            party_combo.setCurrentIndex(0),
+            self._refresh_cp_cr(state),
+        ))
+        btn_new.clicked.connect(lambda: self._new_cp_or_cr(state))
+        table.doubleClicked.connect(lambda _idx, s=state: self._edit_cp_cr_row(s))
+
+        return state
+
+    def _build_jv_tab(self):
+        widget = QWidget()
+        widget.setStyleSheet(f"background: {CONTENT_BG};")
+        vbox = QVBoxLayout(widget)
+        vbox.setContentsMargins(0, 10, 0, 0)
+        vbox.setSpacing(10)
+
+        card = QFrame()
+        card.setStyleSheet(self._CARD)
+        fl = QHBoxLayout(card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(10)
+
+        fl.addWidget(QLabel("From:"))
+        from_date = QDateEdit(QDate.currentDate())
+        from_date.setDisplayFormat("dd/MM/yyyy")
+        from_date.setCalendarPopup(True)
+        from_date.setMinimumWidth(110)
+        fl.addWidget(from_date)
+
+        fl.addWidget(QLabel("To:"))
+        to_date = QDateEdit(QDate.currentDate())
+        to_date.setDisplayFormat("dd/MM/yyyy")
+        to_date.setCalendarPopup(True)
+        to_date.setMinimumWidth(110)
+        fl.addWidget(to_date)
+
+        fl.addSpacing(6)
+        for label in ("Today", "Yesterday", "Search", "Clear"):
+            b = QPushButton(label)
+            b.setStyleSheet(self._BS)
+            fl.addWidget(b)
+            if label == "Today":
+                btn_today = b
+            elif label == "Yesterday":
+                btn_yesterday = b
+            elif label == "Search":
+                btn_search = b
+            else:
+                btn_clear = b
+
+        fl.addStretch()
+        btn_new = QPushButton("+ New JV")
+        btn_new.setStyleSheet(self._BS)
+        fl.addWidget(btn_new)
+        vbox.addWidget(card)
+
+        table = self._make_table(["#", "Date", "Voucher", "Dr Party", "Cr Party", "Amount (PKR)"])
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        hdr.setStretchLastSection(False)
+        table.setColumnWidth(0, 40)
+        table.setColumnWidth(1, 110)
+        table.setColumnWidth(2, 100)
+        table.setColumnWidth(5, 130)
+        vbox.addWidget(table, stretch=1)
+
+        footer = QLabel("Total Vouchers: 0   |   Total Amount: Rs. 0")
+        footer.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        footer.setStyleSheet("color:#1e293b; padding:4px 2px;")
+        vbox.addWidget(footer)
+
+        state = {
+            "widget": widget,
+            "from_date": from_date, "to_date": to_date,
+            "table": table, "footer": footer,
+        }
+
+        btn_today.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate()),
+            to_date.setDate(QDate.currentDate()),
+            self._refresh_jv(state),
+        ))
+        btn_yesterday.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate().addDays(-1)),
+            to_date.setDate(QDate.currentDate().addDays(-1)),
+            self._refresh_jv(state),
+        ))
+        btn_search.clicked.connect(lambda: self._refresh_jv(state))
+        btn_clear.clicked.connect(lambda: (
+            from_date.setDate(QDate.currentDate()),
+            to_date.setDate(QDate.currentDate()),
+            self._refresh_jv(state),
+        ))
+        btn_new.clicked.connect(self._new_jv)
+        table.doubleClicked.connect(lambda _idx, s=state: self._edit_jv_row(s))
+
+        return state
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def _refresh_cp_cr(self, state):
+        from database import get_connection
+        ptype = state["ptype"]
+        from_iso = state["from_date"].date().toString("yyyy-MM-dd")
+        to_iso   = state["to_date"].date().toString("yyyy-MM-dd")
+        party_data = state["party_combo"].currentData()
+
+        params = [from_iso, to_iso, ptype]
+        extra = ""
+        if party_data is not None:
+            extra = " AND p.party_type=? AND p.party_id=?"
+            params += [party_data["ptype"], party_data["pid"]]
+
+        sql = f"""
+            SELECT p.id, p.date, p.voucher_number, p.party_type,
+                   COALESCE(s.name, c.name, op.name, '') AS party_name,
+                   p.amount
+            FROM payments p
+            LEFT JOIN suppliers s  ON s.id=p.party_id  AND p.party_type='supplier'
+            LEFT JOIN customers c  ON c.id=p.party_id  AND p.party_type='customer'
+            LEFT JOIN other_parties op ON op.id=p.party_id AND p.party_type='other'
+            WHERE substr(p.date,7,4)||'-'||substr(p.date,4,2)||'-'||substr(p.date,1,2)
+                  BETWEEN ? AND ?
+              AND p.type=?{extra}
+            ORDER BY p.id DESC
+        """
+        conn = get_connection()
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+
+        table = state["table"]
+        table.setRowCount(0)
+        total = 0.0
+        for i, r in enumerate(rows):
+            row = table.rowCount()
+            table.insertRow(row)
+            pt_label = r["party_type"].capitalize() if r["party_type"] else ""
+            for col, val in enumerate([
+                str(i + 1), r["date"], r["voucher_number"],
+                pt_label, r["party_name"] or "",
+                f"{float(r['amount']):,.0f}",
+            ]):
+                item = QTableWidgetItem(str(val))
+                if col == 5:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, r["id"])
+                table.setItem(row, col, item)
+            total += float(r["amount"])
+
+        state["footer"].setText(
+            f"Total Vouchers: {len(rows)}   |   Total Amount: Rs. {total:,.0f}"
+        )
+
+    def _refresh_jv(self, state):
+        from database import get_connection
+        from_iso = state["from_date"].date().toString("yyyy-MM-dd")
+        to_iso   = state["to_date"].date().toString("yyyy-MM-dd")
+
+        sql = """
+            SELECT d.jv_number, d.date,
+                   COALESCE(sd.name, cd.name, opd.name, 'Cash/Bank') AS dr_party,
+                   COALESCE(sc.name, cc.name, opc.name, 'Cash/Bank') AS cr_party,
+                   d.amount
+            FROM journal_entries d
+            LEFT JOIN journal_entries c
+                   ON c.jv_number=d.jv_number AND c.type='credit'
+            LEFT JOIN suppliers  sd  ON sd.id=d.party_id  AND d.party_type='supplier'
+            LEFT JOIN customers  cd  ON cd.id=d.party_id  AND d.party_type='customer'
+            LEFT JOIN other_parties opd ON opd.id=d.party_id AND d.party_type='other'
+            LEFT JOIN suppliers  sc  ON sc.id=c.party_id  AND c.party_type='supplier'
+            LEFT JOIN customers  cc  ON cc.id=c.party_id  AND c.party_type='customer'
+            LEFT JOIN other_parties opc ON opc.id=c.party_id AND c.party_type='other'
+            WHERE d.type='debit'
+              AND substr(d.date,7,4)||'-'||substr(d.date,4,2)||'-'||substr(d.date,1,2)
+                  BETWEEN ? AND ?
+            ORDER BY d.id DESC
+        """
+        conn = get_connection()
+        rows = conn.execute(sql, [from_iso, to_iso]).fetchall()
+        conn.close()
+
+        table = state["table"]
+        table.setRowCount(0)
+        total = 0.0
+        for i, r in enumerate(rows):
+            row = table.rowCount()
+            table.insertRow(row)
+            for col, val in enumerate([
+                str(i + 1), r["date"], r["jv_number"],
+                r["dr_party"], r["cr_party"],
+                f"{float(r['amount']):,.0f}",
+            ]):
+                item = QTableWidgetItem(str(val))
+                if col == 5:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, r["jv_number"])
+                table.setItem(row, col, item)
+            total += float(r["amount"])
+
+        state["footer"].setText(
+            f"Total Vouchers: {len(rows)}   |   Total Amount: Rs. {total:,.0f}"
+        )
+
+    def refresh(self):
+        self._refresh_cp_cr(self._cp_tab)
+        self._refresh_cp_cr(self._cr_tab)
+        self._refresh_jv(self._jv_tab)
+
+    # ── New voucher ───────────────────────────────────────────────────────────
+
+    def _new_cp_or_cr(self, state):
+        from ledger import MultiLineCpCrDialog
+        ptype = state["ptype"]
+        dlg = MultiLineCpCrDialog(ptype, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        label = "Cash Payment" if ptype == "CP" else "Cash Receipt"
+        QMessageBox.information(self, "Saved", f"{label} {dlg.get_voucher()} saved.")
+        self._refresh_cp_cr(state)
+
+    def _new_jv(self):
+        from ledger import DoubleEntryJournalDialog
+        from database import db_save_double_entry_jv
+        dlg = DoubleEntryJournalDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        date_str, notes, dr_type, dr_id, cr_type, cr_id, amount = dlg.get_data()
+        try:
+            jv = db_save_double_entry_jv(date_str, notes, dr_type, dr_id, cr_type, cr_id, amount)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+            return
+        QMessageBox.information(self, "Saved", f"Journal Voucher {jv} saved.")
+        self._refresh_jv(self._jv_tab)
+
+    # ── Edit on double-click ──────────────────────────────────────────────────
+
+    def _edit_cp_cr_row(self, state):
+        table = state["table"]
+        row = table.currentRow()
+        if row < 0:
+            return
+        pay_id = table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from database import get_connection
+        conn = get_connection()
+        r = conn.execute("SELECT * FROM payments WHERE id=?", (pay_id,)).fetchone()
+        conn.close()
+        if not r:
+            return
+        from edit_vouchers import PaymentEditDialog
+        dlg = PaymentEditDialog(dict(r), self)
+        result = dlg.exec()
+        if result in (QDialog.DialogCode.Accepted, PaymentEditDialog.DELETED):
+            self._refresh_cp_cr(state)
+
+    def _edit_jv_row(self, state):
+        table = state["table"]
+        row = table.currentRow()
+        if row < 0:
+            return
+        jv_number = table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from edit_vouchers import JVEditDialog, db_lookup_journal_entry
+        je = db_lookup_journal_entry(jv_number)
+        if not je:
+            return
+        dlg = JVEditDialog(je, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_jv(state)
+
+    # ── Go to voucher ─────────────────────────────────────────────────────────
+
+    def _goto_voucher(self):
+        import re
+        raw = self._goto_edit.text().strip().upper()
+        if not raw:
+            return
+        if not re.match(r'^[A-Z]+-\d+$', raw):
+            QMessageBox.warning(self, "Invalid Format",
+                "Please enter a full voucher number, e.g. CP-0001")
+            return
+        from edit_vouchers import (
+            PaymentEditDialog, JVEditDialog,
+            db_lookup_payment, db_lookup_journal_entry,
+        )
+        opened = False
+        if raw.startswith("CP-") or raw.startswith("CR-"):
+            pay = db_lookup_payment(raw)
+            if pay:
+                dlg = PaymentEditDialog(pay, self)
+                result = dlg.exec()
+                if result in (QDialog.DialogCode.Accepted, PaymentEditDialog.DELETED):
+                    self.refresh()
+                opened = True
+        elif raw.startswith("JV-"):
+            je = db_lookup_journal_entry(raw)
+            if je:
+                dlg = JVEditDialog(je, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.refresh()
+                opened = True
+        if not opened:
+            QMessageBox.warning(self, "Not Found", f"Voucher {raw} not found.")
+        self._goto_edit.clear()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1107,6 +1595,7 @@ class MainWindow(QMainWindow):
         self._register_page("masters", MastersPage())
         self._register_page("purchase", PurchasePage())
         self._register_page("sales", SalePage())
+        self._register_page("vouchers", VouchersPage())
         self._register_page("ledger", LedgerPage())
         self._register_page("capital", CapitalPage())
         self._register_page("expenses", ExpensesPage())
@@ -1137,6 +1626,15 @@ class MainWindow(QMainWindow):
         # Kick off auto-backup 800 ms after the window is ready
         # (runs in a daemon thread so startup is never blocked)
         QTimer.singleShot(800, self._start_auto_backup)
+
+        # Auto-lock after 5 minutes of inactivity
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(5 * 60 * 1000)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._auto_lock)
+        self._idle_timer.start()
+        self._idle_filter = _IdleResetFilter(self._reset_idle_timer, self)
+        QApplication.instance().installEventFilter(self._idle_filter)
 
     # ── Auto Monthly Backup ───────────────────────────────────────────────────
 
@@ -1209,18 +1707,6 @@ class MainWindow(QMainWindow):
     _OWNER_PROTECTED = {"capital", "settings"}
 
     def _navigate(self, key: str):
-        # Dialog-only items — open the form without switching pages or updating active state
-        if key in ("cp", "cr", "jv"):
-            ledger = self._pages.get("ledger")
-            if ledger:
-                if key == "cp":
-                    ledger._standalone_cp()
-                elif key == "cr":
-                    ledger._standalone_cr()
-                elif key == "jv":
-                    ledger._standalone_jv()
-            return
-
         label = dict(NAV_ITEMS).get(key, key.capitalize())
         if key in self._OWNER_PROTECTED:
             dlg = OwnerPinDialog(self, target_name=label)
@@ -1233,11 +1719,27 @@ class MainWindow(QMainWindow):
         self._header_page_label.setText(label)
         self._current_key = key
 
+        # Refresh pages that need live data when navigated to
+        page = self._pages.get(key)
+        if key == "vouchers" and page and hasattr(page, "refresh"):
+            page.refresh()
+
     def _open_duplicate_print(self):
         DuplicatePrintDialog(self).exec()
 
     def _open_imei_lookup(self):
         ImeiLookupDialog(self).exec()
+
+    def _reset_idle_timer(self):
+        if getattr(self, "_idle_timer", None):
+            self._idle_timer.start()
+
+    def _auto_lock(self):
+        if QApplication.activeModalWidget() is not None:
+            self._idle_timer.start()
+            return
+        if getattr(self, "_lock_overlay", None) and not self._lock_overlay.isVisible():
+            self._lock()
 
     def _lock(self):
         """Cover the whole window with the PIN overlay. The app keeps running."""

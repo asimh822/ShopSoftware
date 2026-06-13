@@ -5,11 +5,13 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QDateEdit, QDialog, QDialogButtonBox,
     QMessageBox, QHeaderView, QAbstractItemView, QFrame,
     QStackedWidget, QListWidget, QListWidgetItem, QCheckBox, QTabWidget,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QPoint, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QBrush, QColor
 
 from database import get_connection, db_bank_accounts, db_active_salesmen
+from widgets import SearchableComboBox
 
 
 def validate_phone(phone: str) -> bool:
@@ -113,8 +115,7 @@ def _make_table(headers):
     t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     t.setAlternatingRowColors(True)
     t.verticalHeader().setVisible(False)
-    t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    t.horizontalHeader().setStretchLastSection(True)
+    t.horizontalHeader().setStretchLastSection(False)
     t.setStyleSheet(TABLE_STYLE)
     return t
 
@@ -125,6 +126,16 @@ def db_customers_list():
     conn = get_connection()
     rows = conn.execute(
         "SELECT id, name, contact FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def db_suppliers_for_sale():
+    """Returns all suppliers for use as credit customers in a sale."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
     ).fetchall()
     conn.close()
     return rows
@@ -169,7 +180,7 @@ def db_imei_lookup(suffix):
     conn = get_connection()
     rows = conn.execute("""
         SELECT si.id, TRIM(si.imei) AS imei, b.name AS brand_name, m.name AS model_name,
-               m.reference_price, m.id AS model_id
+               m.reference_price, m.id AS model_id, si.purchase_price
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -185,7 +196,7 @@ def db_imei_browse_all():
     conn = get_connection()
     rows = conn.execute("""
         SELECT si.id, TRIM(si.imei) AS imei, b.name AS brand_name, m.name AS model_name,
-               m.reference_price, m.id AS model_id
+               m.reference_price, m.id AS model_id, si.purchase_price
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -200,7 +211,7 @@ def db_save_sale(date_str, sale_type, customer_id, cash_name, cash_contact,
                  note, overall_discount, lines,
                  payment_method="cash", cash_paid=0.0,
                  bank_account_id=None, bank_amount=0.0, bank_ref="",
-                 salesman_id=None):
+                 salesman_id=None, supplier_as_customer_id=None):
     """
     lines = [(stock_item_id, model_id, imei, ref_price, final_price), ...]
     Returns (sv_number, sv_id).
@@ -223,12 +234,12 @@ def db_save_sale(date_str, sale_type, customer_id, cash_name, cash_contact,
             (sv_number, type, customer_id, cash_customer_name, cash_customer_contact,
              date, total_amount, discount, note, whatsapp_sent,
              payment_method, cash_paid, bank_account_id, bank_amount, bank_ref,
-             salesman_id)
-            VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)
+             salesman_id, supplier_as_customer_id)
+            VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)
         """, (sv_number, sale_type, customer_id, cash_name, cash_contact,
               date_str, total_amount, overall_discount or 0, note or "",
               payment_method, cash_paid, bank_account_id, bank_amount, bank_ref or "",
-              salesman_id))
+              salesman_id, supplier_as_customer_id))
         sv_id = c.lastrowid
 
         for stock_item_id, model_id, imei, ref_price, final_price in lines:
@@ -272,11 +283,12 @@ def db_load_sales(from_iso=None, to_iso=None, sale_type=None):
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     sql = f"""
         SELECT sv.id, sv.sv_number, sv.date, sv.type,
-               COALESCE(c.name, sv.cash_customer_name) AS customer_name,
+               COALESCE(c.name, sup_c.name, sv.cash_customer_name) AS customer_name,
                COUNT(sl.id) AS item_count,
                sv.total_amount, sv.discount, sv.note
         FROM sale_vouchers sv
         LEFT JOIN customers c ON c.id = sv.customer_id
+        LEFT JOIN suppliers sup_c ON sup_c.id = sv.supplier_as_customer_id
         LEFT JOIN sale_lines sl ON sl.sv_id = sv.id
         {where}
         GROUP BY sv.id
@@ -583,6 +595,8 @@ class ImeiSelectDialog(QDialog):
         layout.addWidget(QLabel(f"{len(results)} items match. Select one:"))
 
         self.table = _make_table(["IMEI", "Brand", "Model", "Ref Price (PKR)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setFixedHeight(220)
         for r in results:
             row = self.table.rowCount()
@@ -666,6 +680,8 @@ class SaleDetailDialog(QDialog):
         table = _make_table(
             ["Brand", "Model", "IMEI", "Ref Price (PKR)", "Final Price (PKR)", "Disc (PKR)"]
         )
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
         for r in db_load_sale_lines(sv_row["id"]):
             row = table.rowCount()
             table.insertRow(row)
@@ -709,13 +725,28 @@ class SaleForm(QWidget):
         super().__init__(parent)
         self._on_save = on_save
         self._on_cancel = on_cancel
-        self._lines = []      # (stock_item_id, model_id, brand, model, imei, ref_price, final_price)
-        self._staged = None   # (stock_item_id, model_id, brand, model, imei, ref_price)
+        self._lines = []      # (stock_item_id, model_id, brand, model, imei, ref_price, final_price, purchase_price)
+        self._staged = None   # (stock_item_id, model_id, brand, model, imei, ref_price, purchase_price)
 
-        layout = QVBoxLayout(self)
+        self.setStyleSheet(FORM_INPUT_STYLE)
+
+        # Outer layout holds only the scroll area
+        _outer = QVBoxLayout(self)
+        _outer.setContentsMargins(0, 0, 0, 0)
+        _outer.setSpacing(0)
+
+        _scroll = QScrollArea()
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QFrame.Shape.NoFrame)
+        _outer.addWidget(_scroll)
+
+        _container = QWidget()
+        _container.setStyleSheet("background:#f1f5f9;")
+        _scroll.setWidget(_container)
+
+        layout = QVBoxLayout(_container)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
-        self.setStyleSheet(FORM_INPUT_STYLE)
 
         # ── Title bar ────────────────────────────────────────────────────────
         top = QHBoxLayout()
@@ -741,50 +772,28 @@ class SaleForm(QWidget):
         hl.setContentsMargins(16, 12, 16, 12)
         hl.setSpacing(8)
 
-        # ── Salesman row (mandatory) ──────────────────────────────────────────
-        sal_row = QHBoxLayout()
-        sal_row.setSpacing(16)
-        sal_lbl = QLabel("Salesman *")
-        sal_lbl.setStyleSheet("color:#dc2626; font-weight:bold;")
-        sal_row.addWidget(sal_lbl)
-        self.salesman_combo = QComboBox()
-        self.salesman_combo.setMinimumWidth(220)
-        self.salesman_combo.addItem("— Select Salesman —", None)
-        for sm in db_active_salesmen():
-            self.salesman_combo.addItem(sm["name"], sm["id"])
-        if self.salesman_combo.count() <= 1:
-            self.salesman_combo.setToolTip(
-                "No active salesmen — add one in Masters → Salesmen first."
-            )
-        sal_row.addWidget(self.salesman_combo)
-        sal_row.addStretch()
-        hl.addLayout(sal_row)
-
+        # ── Date | Sale Type | Salesman — single inline row ──────────────────
         row1 = QHBoxLayout()
-        row1.setSpacing(16)
+        row1.setSpacing(10)
 
-        # Date
-        dc = QVBoxLayout()
-        dc.addWidget(QLabel("Date"))
+        row1.addWidget(QLabel("Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setMinimumWidth(130)
-        dc.addWidget(self.date_edit)
-        row1.addLayout(dc)
+        row1.addWidget(self.date_edit)
 
-        # Sale type toggle
-        tc = QVBoxLayout()
-        tc.addWidget(QLabel("Sale Type"))
+        row1.addSpacing(12)
+        row1.addWidget(QLabel("Sale Type:"))
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(0)
         self.btn_cash = QPushButton("Cash")
-        self.btn_cash.setFixedHeight(32)
+        self.btn_cash.setFixedHeight(30)
         self.btn_cash.setStyleSheet(
             BTN_TOGGLE_ON + "QPushButton { border-radius: 5px 0 0 5px; }"
         )
         self.btn_credit = QPushButton("Credit")
-        self.btn_credit.setFixedHeight(32)
+        self.btn_credit.setFixedHeight(30)
         self.btn_credit.setStyleSheet(
             BTN_TOGGLE_OFF + "QPushButton { border-radius: 0 5px 5px 0; "
             "border-left: none; }"
@@ -793,18 +802,22 @@ class SaleForm(QWidget):
         self.btn_credit.clicked.connect(lambda: self._set_type("credit"))
         toggle_row.addWidget(self.btn_cash)
         toggle_row.addWidget(self.btn_credit)
-        tc.addLayout(toggle_row)
-        row1.addLayout(tc)
+        row1.addLayout(toggle_row)
 
-        # Note
-        nc = QVBoxLayout()
-        nc.addWidget(QLabel("Note (printed on invoice)"))
-        self.note_edit = QLineEdit()
-        self.note_edit.setPlaceholderText("Optional — appears at bottom of receipt")
-        self.note_edit.setMinimumWidth(220)
-        self.note_edit.returnPressed.connect(lambda: self.note_edit.focusNextChild())
-        nc.addWidget(self.note_edit)
-        row1.addLayout(nc)
+        row1.addSpacing(12)
+        sal_lbl = QLabel("Salesman *:")
+        sal_lbl.setStyleSheet("color:#dc2626; font-weight:bold;")
+        row1.addWidget(sal_lbl)
+        self.salesman_combo = SearchableComboBox()
+        self.salesman_combo.setMinimumWidth(200)
+        self.salesman_combo.addItem("— Select Salesman —", None)
+        for sm in db_active_salesmen():
+            self.salesman_combo.addItem(sm["name"], sm["id"])
+        if self.salesman_combo.count() <= 1:
+            self.salesman_combo.setToolTip(
+                "No active salesmen — add one in Masters → Salesmen first."
+            )
+        row1.addWidget(self.salesman_combo)
         row1.addStretch()
         hl.addLayout(row1)
 
@@ -841,7 +854,7 @@ class SaleForm(QWidget):
         cash_row.addWidget(self.cash_name)
 
         self.chk_whatsapp = QCheckBox("Send WhatsApp")
-        self.chk_whatsapp.setChecked(True)
+        self.chk_whatsapp.setChecked(False)
         self.chk_whatsapp.setStyleSheet("font-size:10pt; color:#1e293b; padding-left:8px;")
         cash_row.addWidget(self.chk_whatsapp)
 
@@ -854,11 +867,18 @@ class SaleForm(QWidget):
         credit_row.setContentsMargins(0, 0, 0, 0)
         credit_row.setSpacing(12)
         credit_row.addWidget(QLabel("Credit Customer *"))
-        self.credit_combo = QComboBox()
+        self.credit_combo = SearchableComboBox()
         self.credit_combo.setMinimumWidth(220)
         self.credit_combo.addItem("— Select Customer —", None)
         for c in db_customers_list():
-            self.credit_combo.addItem(c["name"], c["id"])
+            self.credit_combo.addItem(c["name"], {"type": "customer", "id": c["id"]})
+        _sups_for_sale = db_suppliers_for_sale()
+        if _sups_for_sale:
+            _sep_idx = self.credit_combo.count()
+            self.credit_combo.addItem("── Suppliers ──", None)
+            self.credit_combo.model().item(_sep_idx).setEnabled(False)
+            for s in _sups_for_sale:
+                self.credit_combo.addItem(s['name'], {"type": "supplier", "id": s["id"]})
         credit_row.addWidget(self.credit_combo)
         self.credit_balance_lbl = QLabel("")
         self.credit_balance_lbl.setStyleSheet(STATUS_INFO)
@@ -867,7 +887,7 @@ class SaleForm(QWidget):
         credit_row.addStretch()
         self.customer_stack.addWidget(credit_widget)
 
-        # Disable Credit toggle if no credit customers exist
+        # Disable Credit toggle if no credit customers or suppliers exist
         if self.credit_combo.count() <= 1:
             self.btn_credit.setEnabled(False)
             self.btn_credit.setToolTip("No credit customers — add one in Masters first.")
@@ -884,23 +904,17 @@ class SaleForm(QWidget):
 
         search_row = QHBoxLayout()
         search_row.setSpacing(10)
-        search_row.addWidget(QLabel("IMEI (last digits):"))
         self.imei_input = QLineEdit()
-        self.imei_input.setPlaceholderText("Type last 5 digits of IMEI — matching phones appear instantly")
-        self.imei_input.setMinimumWidth(200)
+        self.imei_input.setPlaceholderText("Type last 5 digits of IMEI to search stock…")
+        self.imei_input.setMinimumWidth(260)
         self.imei_input.setProperty("enterKeepDefault", True)
         self.imei_input.textChanged.connect(self._on_imei_changed)
         self.imei_input.returnPressed.connect(self._imei_enter)
-        search_row.addWidget(self.imei_input)
+        search_row.addWidget(self.imei_input, stretch=1)
 
         self._imei_dropdown = ImeiDropdown(self)
         self._imei_dropdown.imei_chosen.connect(self._on_dropdown_select)
         self.imei_input.installEventFilter(self)
-
-        btn_lookup = QPushButton("Search")
-        btn_lookup.setStyleSheet(BTN_SECONDARY)
-        btn_lookup.clicked.connect(self._imei_enter)
-        search_row.addWidget(btn_lookup)
 
         btn_browse = QPushButton("Browse All Stock")
         btn_browse.setStyleSheet(BTN_SECONDARY)
@@ -908,7 +922,6 @@ class SaleForm(QWidget):
         btn_browse.clicked.connect(self._imei_browse)
         search_row.addWidget(btn_browse)
 
-        search_row.addStretch()
         ll.addLayout(search_row)
 
         # Staged result row
@@ -931,7 +944,12 @@ class SaleForm(QWidget):
         self.price_spin.setMinimumWidth(130)
         self.price_spin.setVisible(False)
         self.price_spin.returnPressed = None
+        self.price_spin.valueChanged.connect(self._check_staged_price)
         result_row.addWidget(self.price_spin)
+
+        self.price_warn_lbl = QLabel("")
+        self.price_warn_lbl.setStyleSheet(STATUS_WARN)
+        result_row.addWidget(self.price_warn_lbl)
 
         self.btn_add_line = QPushButton("+ Add")
         self.btn_add_line.setStyleSheet(BTN_PRIMARY)
@@ -943,15 +961,31 @@ class SaleForm(QWidget):
 
         # ── Lines table ───────────────────────────────────────────────────────
         self.lines_table = _make_table(
-            ["#", "Brand", "Model", "IMEI", "Ref Price (PKR)", "Final Price (PKR)", "Disc", ""]
+            ["#", "Brand", "Model", "IMEI", "Ref Price (PKR)", "Final Price (PKR)", "Disc", "Warning", ""]
         )
-        self.lines_table.setColumnWidth(0, 40)
-        self.lines_table.setColumnWidth(7, 70)
-        for col in (0, 7):
-            self.lines_table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.Fixed
-            )
-        layout.addWidget(self.lines_table, stretch=1)
+        _lh = self.lines_table.horizontalHeader()
+        _lh.setStretchLastSection(False)
+        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)       # #
+        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)     # Brand
+        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)     # Model
+        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IMEI
+        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Ref Price
+        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Final Price
+        _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Disc
+        _lh.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)     # Warning
+        _lh.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        self.lines_table.setColumnWidth(0, 35)
+        self.lines_table.setColumnWidth(4, 130)
+        self.lines_table.setColumnWidth(5, 140)
+        self.lines_table.setColumnWidth(6, 90)
+        self.lines_table.setColumnWidth(8, 80)
+        self.lines_table.setMinimumHeight(360)
+        self.lines_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked |
+            QAbstractItemView.EditTrigger.AnyKeyPressed
+        )
+        self.lines_table.cellChanged.connect(self._on_price_cell_changed)
+        layout.addWidget(self.lines_table)
 
         # ── Footer ────────────────────────────────────────────────────────────
         footer = QHBoxLayout()
@@ -1094,12 +1128,24 @@ class SaleForm(QWidget):
     # ── Credit customer balance ───────────────────────────────────────────────
 
     def _on_credit_customer_changed(self):
-        customer_id = self.credit_combo.currentData()
-        if customer_id is None:
+        data = self.credit_combo.currentData()
+        if data is None:
             self.credit_balance_lbl.setText("")
-        else:
-            bal = db_customer_balance(customer_id)
+        elif data["type"] == "customer":
+            bal = db_customer_balance(data["id"])
             self.credit_balance_lbl.setText(f"Balance: Rs. {fmt_pkr(bal)}")
+        else:
+            conn = get_connection()
+            row = conn.execute("""
+                SELECT COALESCE(s.opening_balance, 0)
+                       + COALESCE((SELECT SUM(pv.total_amount) FROM purchase_vouchers pv WHERE pv.supplier_id = s.id), 0)
+                       - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='supplier' AND p.party_id = s.id AND p.type='CP'), 0)
+                       AS balance
+                FROM suppliers s WHERE s.id = ?
+            """, (data["id"],)).fetchone()
+            conn.close()
+            bal = row["balance"] if row else 0
+            self.credit_balance_lbl.setText(f"Supplier Balance: Rs. {fmt_pkr(bal)}")
 
     # ── Type toggle ───────────────────────────────────────────────────────────
 
@@ -1211,7 +1257,8 @@ class SaleForm(QWidget):
                     f"Type {5 - len(text)} more digit(s)…", STATUS_INFO
                 )
             return
-        results = db_imei_lookup(text)
+        already = {l[4] for l in self._lines}
+        results = [r for r in db_imei_lookup(text) if r["imei"] not in already]
         if len(results) == 0:
             self._imei_dropdown.show_below(self.imei_input, [])
             self._clear_staged("No in-stock phone found for these digits", STATUS_ERR)
@@ -1237,7 +1284,8 @@ class SaleForm(QWidget):
         if not text:
             self._imei_browse()
             return
-        results = db_imei_lookup(text)
+        already = {l[4] for l in self._lines}
+        results = [r for r in db_imei_lookup(text) if r["imei"] not in already]
         if len(results) == 0:
             self._clear_staged("No in-stock phone found — try Browse All Stock", STATUS_ERR)
         elif len(results) == 1:
@@ -1254,7 +1302,8 @@ class SaleForm(QWidget):
         self._stage(data)
 
     def _imei_browse(self):
-        results = db_imei_browse_all()
+        already = {l[4] for l in self._lines}
+        results = [r for r in db_imei_browse_all() if r["imei"] not in already]
         if not results:
             QMessageBox.information(self, "No Stock", "No phones currently in stock.")
             return
@@ -1270,17 +1319,25 @@ class SaleForm(QWidget):
         self.imei_input.setText(imei.strip())
 
     def _stage(self, r):
+        # Pre-fill price with same-model existing price if already in invoice
+        existing_price = next(
+            (line[6] for line in self._lines if line[1] == r["model_id"]),
+            None,
+        )
         self._staged = (r["id"], r["model_id"], r["brand_name"],
-                        r["model_name"], r["imei"], r["reference_price"])
+                        r["model_name"], r["imei"], r["reference_price"],
+                        r["purchase_price"])
         self.lookup_status.setText(
             f"Found: {r['brand_name']} {r['model_name']}  ·  IMEI: {r['imei']}  "
             f"·  Ref: PKR {fmt_pkr(r['reference_price'])}"
         )
         self.lookup_status.setStyleSheet(STATUS_OK)
-        self.price_spin.setValue(r["reference_price"] or 0)
+        price = existing_price if existing_price is not None else (r["reference_price"] or 0)
+        self.price_spin.setValue(price)
         self.price_label.setVisible(True)
         self.price_spin.setVisible(True)
         self.btn_add_line.setVisible(True)
+        self._check_staged_price()
         self.price_spin.setFocus()
         self.price_spin.selectAll()
 
@@ -1290,14 +1347,29 @@ class SaleForm(QWidget):
         self.lookup_status.setStyleSheet(style)
         self.price_label.setVisible(False)
         self.price_spin.setVisible(False)
+        self.price_warn_lbl.setText("")
         self.btn_add_line.setVisible(False)
+
+    # ── Below-cost staging check ──────────────────────────────────────────────
+
+    def _check_staged_price(self):
+        if self._staged is None:
+            self.price_warn_lbl.setText("")
+            return
+        pp = self._staged[6]
+        if pp is not None and self.price_spin.value() < pp:
+            self.price_warn_lbl.setText(
+                f"⚠ Selling below cost — Purchase price: Rs. {fmt_pkr(pp)}"
+            )
+        else:
+            self.price_warn_lbl.setText("")
 
     # ── Line management ───────────────────────────────────────────────────────
 
     def _add_line(self):
         if self._staged is None:
             return
-        stock_id, model_id, brand, model, imei, ref_price = self._staged
+        stock_id, model_id, brand, model, imei, ref_price, purchase_price = self._staged
         final_price = self.price_spin.value()
 
         # Check not already in this sale
@@ -1305,7 +1377,14 @@ class SaleForm(QWidget):
             QMessageBox.warning(self, "Duplicate", f"IMEI {imei} already added to this sale.")
             return
 
-        self._lines.append((stock_id, model_id, brand, model, imei, ref_price, final_price))
+        self._lines.append((stock_id, model_id, brand, model, imei, ref_price, final_price, purchase_price))
+
+        # Sync all existing lines of the same model to this price
+        for i in range(len(self._lines)):
+            if self._lines[i][1] == model_id:
+                sid, mid, b, m, im, ref, _, pp = self._lines[i]
+                self._lines[i] = (sid, mid, b, m, im, ref, final_price, pp)
+
         self._refresh_lines_table()
         self._imei_dropdown.hide()
         self.imei_input.clear()
@@ -1313,36 +1392,83 @@ class SaleForm(QWidget):
         self.imei_input.setFocus()
 
     def _refresh_lines_table(self):
+        self.lines_table.blockSignals(True)
         self.lines_table.setRowCount(0)
-        for idx, (sid, mid, brand, model, imei, ref, final) in enumerate(self._lines):
+        for idx, (sid, mid, brand, model, imei, ref, final, pp) in enumerate(self._lines):
             r = self.lines_table.rowCount()
             self.lines_table.insertRow(r)
+
             num = QTableWidgetItem(str(idx + 1))
             num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            num.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.lines_table.setItem(r, 0, num)
-            self.lines_table.setItem(r, 1, QTableWidgetItem(brand))
-            self.lines_table.setItem(r, 2, QTableWidgetItem(model))
-            self.lines_table.setItem(r, 3, QTableWidgetItem(imei))
-            for col, val in [(4, ref), (5, final)]:
-                item = QTableWidgetItem(fmt_pkr(val))
-                item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                )
-                self.lines_table.setItem(r, col, item)
+
+            for col, text in [(1, brand), (2, model), (3, imei)]:
+                it = QTableWidgetItem(text)
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.lines_table.setItem(r, col, it)
+
+            ref_item = QTableWidgetItem(fmt_pkr(ref))
+            ref_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            ref_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.lines_table.setItem(r, 4, ref_item)
+
+            # Final Price — editable so user can adjust in-table; sync on change
+            price_item = QTableWidgetItem(fmt_pkr(final))
+            price_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            price_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable
+            )
+            self.lines_table.setItem(r, 5, price_item)
+
             disc = (ref or 0) - final
             disc_item = QTableWidgetItem(fmt_pkr(disc) if disc else "—")
-            disc_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
+            disc_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            disc_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             if disc > 0:
                 disc_item.setForeground(Qt.GlobalColor.red)
             self.lines_table.setItem(r, 6, disc_item)
 
+            # Warning column (col 7)
+            warn_item = QTableWidgetItem()
+            warn_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if pp is not None and final < pp:
+                warn_item.setText(f"⚠ Selling below cost — Purchase price: Rs. {fmt_pkr(pp)}")
+                warn_item.setForeground(QBrush(QColor("#d97706")))
+                warn_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            self.lines_table.setItem(r, 7, warn_item)
+
             del_btn = QPushButton("Remove")
             del_btn.setStyleSheet(BTN_DANGER_SMALL)
             del_btn.clicked.connect(lambda _, i=idx: self._remove_line(i))
-            self.lines_table.setCellWidget(r, 7, del_btn)
+            self.lines_table.setCellWidget(r, 8, del_btn)
+
+        self.lines_table.blockSignals(False)
         self._update_total()
+
+    def _on_price_cell_changed(self, row, col):
+        """Sync final price across all lines with the same model when col 5 is edited."""
+        if col != 5 or row >= len(self._lines):
+            return
+        item = self.lines_table.item(row, col)
+        if item is None:
+            return
+        text = item.text().replace(",", "").strip()
+        try:
+            new_price = float(text)
+            if new_price < 0:
+                raise ValueError
+        except ValueError:
+            self.lines_table.blockSignals(True)
+            item.setText(fmt_pkr(self._lines[row][6]))
+            self.lines_table.blockSignals(False)
+            return
+        model_id = self._lines[row][1]
+        for i in range(len(self._lines)):
+            if self._lines[i][1] == model_id:
+                sid, mid, b, m, im, ref, _, pp = self._lines[i]
+                self._lines[i] = (sid, mid, b, m, im, ref, new_price, pp)
+        self._refresh_lines_table()
 
     def _remove_line(self, idx):
         self._lines.pop(idx)
@@ -1374,11 +1500,17 @@ class SaleForm(QWidget):
             self.salesman_combo.setFocus()
             return
 
+        supplier_as_customer_id = None
         if self._sale_type == "credit":
-            if self.credit_combo.currentData() is None:
+            _cdata = self.credit_combo.currentData()
+            if _cdata is None:
                 QMessageBox.warning(self, "Missing", "Select a credit customer.")
                 return
-            customer_id = self.credit_combo.currentData()
+            if _cdata["type"] == "customer":
+                customer_id = _cdata["id"]
+            else:
+                customer_id = None
+                supplier_as_customer_id = _cdata["id"]
             cash_name = cash_contact = None
         else:
             cash_contact = self.cash_contact.text().strip()
@@ -1402,9 +1534,26 @@ class SaleForm(QWidget):
             customer_id = None
 
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        note = self.note_edit.text().strip()
+        note = ""
         overall_discount = self.discount_spin.value()
-        db_lines = [(s, m, imei, ref, final) for s, m, _, _, imei, ref, final in self._lines]
+        db_lines = [(s, m, imei, ref, final) for s, m, _, _, imei, ref, final, _pp in self._lines]
+
+        # ── Below-cost confirmation ───────────────────────────────────────────
+        below_cost = any(pp is not None and final < pp
+                         for _, _, _, _, _, _, final, pp in self._lines)
+        if below_cost:
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Below Cost Warning")
+            dlg.setText(
+                "One or more items are being sold below purchase price.\n"
+                "Do you want to continue?"
+            )
+            dlg.setIcon(QMessageBox.Icon.Warning)
+            btn_continue = dlg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+            dlg.addButton("Go Back", QMessageBox.ButtonRole.RejectRole)
+            dlg.exec()
+            if dlg.clickedButton() != btn_continue:
+                return
 
         # ── Resolve payment method ────────────────────────────────────────────
         if self._sale_type == "credit":
@@ -1451,6 +1600,7 @@ class SaleForm(QWidget):
                 bank_account_id=pay_bank_id, bank_amount=pay_bank_amt,
                 bank_ref=pay_bank_ref,
                 salesman_id=salesman_id,
+                supplier_as_customer_id=supplier_as_customer_id,
             )
         except sqlite3.IntegrityError as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
@@ -1519,6 +1669,16 @@ class SaleListView(QWidget):
         title.setStyleSheet("color:#1e293b;")
         top.addWidget(title)
         top.addStretch()
+        top.addWidget(QLabel("Go to Voucher:"))
+        self._goto_edit = QLineEdit()
+        self._goto_edit.setPlaceholderText("SV-0001")
+        self._goto_edit.setMaximumWidth(110)
+        self._goto_edit.returnPressed.connect(self._goto_voucher)
+        top.addWidget(self._goto_edit)
+        btn_goto = QPushButton("Open")
+        btn_goto.setStyleSheet(BTN_SECONDARY)
+        btn_goto.clicked.connect(self._goto_voucher)
+        top.addWidget(btn_goto)
         self.btn_edit = QPushButton("✏ Edit")
         self.btn_edit.setStyleSheet(BTN_SECONDARY)
         self.btn_edit.setEnabled(False)
@@ -1538,7 +1698,7 @@ class SaleListView(QWidget):
         fl.setSpacing(10)
 
         fl.addWidget(QLabel("From:"))
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
         fl.addWidget(self.from_date)
@@ -1548,6 +1708,16 @@ class SaleListView(QWidget):
         self.to_date.setDisplayFormat("dd/MM/yyyy")
         self.to_date.setCalendarPopup(True)
         fl.addWidget(self.to_date)
+
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+        fl.addWidget(btn_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+        fl.addWidget(btn_yesterday)
 
         fl.addWidget(QLabel("Type:"))
         self.type_filter = QComboBox()
@@ -1572,11 +1742,35 @@ class SaleListView(QWidget):
         self.table = _make_table(
             ["SV Number", "Date", "Type", "Customer", "Items", "Total (PKR)", "Discount (PKR)"]
         )
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)   # Customer stretches
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)      # Items
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Total (PKR)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)      # Discount (PKR)
+        self.table.setColumnWidth(4, 55)
+        self.table.setColumnWidth(5, 130)
+        self.table.setColumnWidth(6, 130)
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit.setEnabled(self.table.currentRow() >= 0)
         )
         layout.addWidget(self.table, stretch=1)
+
+        # Footer summary
+        footer_row = QHBoxLayout()
+        footer_row.addStretch()
+        self._footer_qty_lbl = QLabel("")
+        self._footer_qty_lbl.setStyleSheet(
+            "color:#475569; font-size:10pt; font-weight:bold; padding:4px 16px;"
+        )
+        self._footer_val_lbl = QLabel("")
+        self._footer_val_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold; padding:4px 16px;"
+        )
+        footer_row.addWidget(self._footer_qty_lbl)
+        footer_row.addWidget(self._footer_val_lbl)
+        layout.addLayout(footer_row)
 
         self.refresh()
 
@@ -1588,6 +1782,8 @@ class SaleListView(QWidget):
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        total_qty = 0
+        total_val = 0.0
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
@@ -1608,14 +1804,57 @@ class SaleListView(QWidget):
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 )
                 self.table.setItem(row, col, item)
+            total_qty += int(r["item_count"] or 0)
+            total_val += float(r["total_amount"] or 0)
         self.table.setSortingEnabled(True)
         self.btn_edit.setEnabled(False)
+
+        n = len(rows)
+        self._footer_qty_lbl.setText(
+            f"{n} voucher{'s' if n != 1 else ''}    {total_qty} item{'s' if total_qty != 1 else ''}"
+        )
+        self._footer_val_lbl.setText(f"Total: Rs. {fmt_pkr(total_val)}")
 
     def _clear_filters(self):
         self.from_date.setDate(QDate.currentDate().addMonths(-1))
         self.to_date.setDate(QDate.currentDate())
         self.type_filter.setCurrentIndex(0)
         self.refresh()
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
+
+    def _goto_voucher(self):
+        raw = self._goto_edit.text().strip().upper()
+        if not raw:
+            return
+        import re
+        if not re.match(r'^[A-Z]+-\d+$', raw):
+            QMessageBox.warning(self, "Invalid Format",
+                "Please enter a full voucher number, e.g. SV-0001")
+            return
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id FROM sale_vouchers WHERE UPPER(sv_number)=?", (raw,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Voucher {raw} not found.")
+            return
+        from edit_vouchers import SaleEditDialog
+        dlg = SaleEditDialog(row["id"], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+        self._goto_edit.clear()
 
     def _edit_selected(self):
         row = self.table.currentRow()
@@ -1821,12 +2060,19 @@ class SaleReturnForm(QWidget):
         self.lines_table = _make_table(
             ["#", "Brand", "Model", "IMEI", "Sale Date", "Sale Price (PKR)", ""]
         )
-        self.lines_table.setColumnWidth(0, 40)
+        _lh = self.lines_table.horizontalHeader()
+        _lh.setStretchLastSection(False)
+        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)       # #
+        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)     # Brand
+        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)     # Model
+        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IMEI
+        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Sale Date
+        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Sale Price
+        _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        self.lines_table.setColumnWidth(0, 35)
+        self.lines_table.setColumnWidth(4, 100)
+        self.lines_table.setColumnWidth(5, 140)
         self.lines_table.setColumnWidth(6, 80)
-        for col in (0, 6):
-            self.lines_table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.Fixed
-            )
         layout.addWidget(self.lines_table, stretch=1)
 
         # ── Footer ────────────────────────────────────────────────────────────
@@ -2073,6 +2319,14 @@ class SaleReturnListView(QWidget):
         self.table = _make_table(
             ["SR Number", "Date", "Customer", "Items", "Return Amount (PKR)", "Notes"]
         )
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)   # Customer stretches
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)      # Items
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)      # Return Amount (PKR)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)    # Notes stretches
+        self.table.setColumnWidth(3, 55)
+        self.table.setColumnWidth(4, 150)
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit_sr.setEnabled(self.table.currentRow() >= 0)

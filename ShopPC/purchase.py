@@ -128,6 +128,16 @@ def db_suppliers_list():
     return rows
 
 
+def db_credit_customers_for_purchase():
+    """Returns credit customers who can act as purchase suppliers (buying back from them)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def db_supplier_balance(supplier_id):
     """Return outstanding balance for a single supplier (amount you owe them)."""
     conn = get_connection()
@@ -183,7 +193,8 @@ def db_imei_exists_active(imei):
 def db_save_purchase(date_str, supplier_id, notes, lines,
                       purchase_type="supplier", egadget_ref="",
                       payment_method="", cash_amount=0.0, bank_amount=0.0,
-                      bank_account_id=None, bank_ref=""):
+                      bank_account_id=None, bank_ref="",
+                      customer_as_supplier_id=None):
     """
     lines = [(model_id, imei, price), ...]  Returns pv_number.
     For cash purchases: supplier_id=0 (system record), egadget_ref required.
@@ -204,12 +215,14 @@ def db_save_purchase(date_str, supplier_id, notes, lines,
             "INSERT INTO purchase_vouchers "
             "(pv_number, supplier_id, date, total_amount, notes, "
             " purchase_type, egadget_ref, payment_method, "
-            " cash_amount, bank_amount, bank_account_id, bank_ref) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cash_amount, bank_amount, bank_account_id, bank_ref, "
+            " customer_as_supplier_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pv_number, supplier_id, date_str, total, notes or "",
              purchase_type, egadget_ref or "", payment_method or "",
              float(cash_amount or 0), float(bank_amount or 0),
-             bank_account_id, bank_ref or ""),
+             bank_account_id, bank_ref or "",
+             customer_as_supplier_id),
         )
         pv_id = c.lastrowid
 
@@ -1084,7 +1097,14 @@ class PurchaseForm(QWidget):
         self.supplier_combo.setMinimumWidth(200)
         self.supplier_combo.addItem("— Select Supplier —", None)
         for s in db_suppliers_list():
-            self.supplier_combo.addItem(s["name"], s["id"])
+            self.supplier_combo.addItem(s["name"], {"type": "supplier", "id": s["id"]})
+        _cust_for_pur = db_credit_customers_for_purchase()
+        if _cust_for_pur:
+            _sep_idx = self.supplier_combo.count()
+            self.supplier_combo.addItem("── Credit Customers ──", None)
+            self.supplier_combo.model().item(_sep_idx).setEnabled(False)
+            for cc in _cust_for_pur:
+                self.supplier_combo.addItem(cc['name'], {"type": "customer", "id": cc["id"]})
         sup_inner.addWidget(self.supplier_combo)
         self.supplier_balance_lbl = QLabel("")
         self.supplier_balance_lbl.setStyleSheet(STATUS_INFO)
@@ -1362,12 +1382,24 @@ class PurchaseForm(QWidget):
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_supplier_changed(self):
-        supplier_id = self.supplier_combo.currentData()
-        if supplier_id is None:
+        data = self.supplier_combo.currentData()
+        if data is None:
             self.supplier_balance_lbl.setText("")
-        else:
-            bal = db_supplier_balance(supplier_id)
+        elif data["type"] == "supplier":
+            bal = db_supplier_balance(data["id"])
             self.supplier_balance_lbl.setText(f"Outstanding: Rs. {fmt_pkr(bal)}")
+        else:
+            conn = get_connection()
+            row = conn.execute("""
+                SELECT COALESCE(c.opening_balance, 0)
+                       + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id = c.id), 0)
+                       - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id = c.id AND p.type='CR'), 0)
+                       AS balance
+                FROM customers c WHERE c.id = ?
+            """, (data["id"],)).fetchone()
+            conn.close()
+            bal = row["balance"] if row else 0
+            self.supplier_balance_lbl.setText(f"Customer Balance: Rs. {fmt_pkr(bal)}")
 
     def _on_brand_change(self):
         self.model_combo.blockSignals(True)
@@ -1511,13 +1543,20 @@ class PurchaseForm(QWidget):
         total    = sum(price for _, _, price in db_lines)
 
         if self._purchase_type == "supplier":
-            # ── Supplier purchase (existing flow unchanged) ───────────────
-            if self.supplier_combo.currentData() is None:
+            # ── Supplier purchase ─────────────────────────────────────────
+            _sup_data = self.supplier_combo.currentData()
+            if _sup_data is None:
                 QMessageBox.warning(self, "Missing", "Please select a supplier.")
                 return
-            supplier_id = self.supplier_combo.currentData()
+            if _sup_data["type"] == "supplier":
+                supplier_id = _sup_data["id"]
+                customer_as_supplier_id = None
+            else:
+                supplier_id = None
+                customer_as_supplier_id = _sup_data["id"]
             try:
-                pv_number = db_save_purchase(date_str, supplier_id, notes, db_lines)
+                pv_number = db_save_purchase(date_str, supplier_id, notes, db_lines,
+                                             customer_as_supplier_id=customer_as_supplier_id)
             except sqlite3.IntegrityError as e:
                 QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
                 return
@@ -1610,6 +1649,16 @@ class PurchaseListView(QWidget):
         title.setStyleSheet("color:#1e293b;")
         top.addWidget(title)
         top.addStretch()
+        top.addWidget(QLabel("Go to Voucher:"))
+        self._goto_edit = QLineEdit()
+        self._goto_edit.setPlaceholderText("PV-0001")
+        self._goto_edit.setMaximumWidth(110)
+        self._goto_edit.returnPressed.connect(self._goto_voucher)
+        top.addWidget(self._goto_edit)
+        btn_goto = QPushButton("Open")
+        btn_goto.setStyleSheet(BTN_SECONDARY)
+        btn_goto.clicked.connect(self._goto_voucher)
+        top.addWidget(btn_goto)
         self.btn_edit = QPushButton("✏ Edit")
         self.btn_edit.setStyleSheet(BTN_SECONDARY)
         self.btn_edit.setEnabled(False)
@@ -1629,7 +1678,7 @@ class PurchaseListView(QWidget):
         fl.setSpacing(10)
 
         fl.addWidget(QLabel("From:"))
-        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date = QDateEdit(QDate.currentDate())
         self.from_date.setDisplayFormat("dd/MM/yyyy")
         self.from_date.setCalendarPopup(True)
         fl.addWidget(self.from_date)
@@ -1639,6 +1688,16 @@ class PurchaseListView(QWidget):
         self.to_date.setDisplayFormat("dd/MM/yyyy")
         self.to_date.setCalendarPopup(True)
         fl.addWidget(self.to_date)
+
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+        fl.addWidget(btn_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+        fl.addWidget(btn_yesterday)
 
         fl.addWidget(QLabel("Supplier:"))
         self.sup_filter = QComboBox()
@@ -1729,6 +1788,41 @@ class PurchaseListView(QWidget):
         self.sup_filter.setCurrentIndex(0)
         self.type_filter.setCurrentIndex(0)
         self.refresh()
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self.refresh()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self.refresh()
+
+    def _goto_voucher(self):
+        raw = self._goto_edit.text().strip().upper()
+        if not raw:
+            return
+        import re
+        if not re.match(r'^[A-Z]+-\d+$', raw):
+            QMessageBox.warning(self, "Invalid Format",
+                "Please enter a full voucher number, e.g. PV-0001")
+            return
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id FROM purchase_vouchers WHERE UPPER(pv_number)=?", (raw,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Voucher {raw} not found.")
+            return
+        from edit_vouchers import PurchaseEditDialog
+        dlg = PurchaseEditDialog(row["id"], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+        self._goto_edit.clear()
 
     def _edit_selected(self):
         row = self.table.currentRow()

@@ -11,8 +11,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QFont, QColor
+import os
 import sqlite3
 from datetime import date
+
+# Resolve the DB next to this script (consistent with database.py), so capital
+# works regardless of the process working directory.
+_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 
 # ─────────────────────────────────────────────
@@ -29,7 +34,7 @@ def title_case(text):
 
 
 def get_db():
-    conn = sqlite3.connect("united_mobile.db")
+    conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -6,7 +6,10 @@ from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QFont, QColor
 import datetime
 
-from database import get_connection, db_cash_in_hand, db_bank_total_balance, get_setting
+from database import (
+    get_connection, db_cash_in_hand, db_bank_total_balance, get_setting,
+    db_incentives_income_total, db_bank_account_closing_balance,
+)
 
 
 def _fmt(amount: float) -> str:
@@ -14,11 +17,37 @@ def _fmt(amount: float) -> str:
 
 
 def _party_balance(conn, party_type: str, party_id: int) -> float:
-    table = "suppliers" if party_type == "supplier" else "customers"
+    table = {"supplier": "suppliers", "customer": "customers",
+             "other": "other_parties"}.get(party_type, "customers")
     ob_row = conn.execute(
         f"SELECT opening_balance FROM {table} WHERE id=?", (party_id,)
     ).fetchone()
     ob = float(ob_row["opening_balance"] or 0) if ob_row else 0.0
+
+    if party_type == "other":
+        # No purchases/sales — only cash CP/CR vouchers and journal entries.
+        # Mirrors the supplier direction: positive balance = you owe them.
+        cr = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payments "
+            "WHERE party_type='other' AND party_id=? AND type='CR'",
+            (party_id,)
+        ).fetchone()[0]
+        cp = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payments "
+            "WHERE party_type='other' AND party_id=? AND type='CP'",
+            (party_id,)
+        ).fetchone()[0]
+        jv_dr = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
+            "WHERE party_type='other' AND party_id=? AND type='debit'",
+            (party_id,)
+        ).fetchone()[0]
+        jv_cr = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
+            "WHERE party_type='other' AND party_id=? AND type='credit'",
+            (party_id,)
+        ).fetchone()[0]
+        return ob + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
 
     if party_type == "supplier":
         purchases = conn.execute(
@@ -93,45 +122,81 @@ def bs_data() -> dict:
     ).fetchone()[0]
     stock = float(stock or 0)
 
+    # Customers Receivable — single summarized total (sum of all credit customer
+    # balances). Per-customer detail is not shown on the balance sheet; it lives
+    # in the ledger.
     customers = conn.execute(
         "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
     ).fetchall()
-    receivables = []
-    for c in customers:
-        bal = _party_balance(conn, "customer", c["id"])
-        if bal > 0:
-            receivables.append({"name": c["name"], "balance": bal})
-    total_recv = sum(r["balance"] for r in receivables)
+    total_recv = sum(_party_balance(conn, "customer", c["id"]) for c in customers)
 
     cash = db_cash_in_hand()
+
+    # Bank Accounts — each account listed separately with its own balance.
+    bank_rows = conn.execute(
+        "SELECT id, name FROM bank_accounts ORDER BY name"
+    ).fetchall()
+    bank_accounts = [
+        {"name": ba["name"], "balance": db_bank_account_closing_balance(ba["id"])}
+        for ba in bank_rows
+    ]
     bank = db_bank_total_balance()
-    total_current = stock + total_recv + cash + bank
+
+    # ── Other parties (personal/loan accounts) ───────────────────────────────
+    # Positive balance → you owe them → Loan Payable (liability).
+    # Negative balance → they owe you → Loan Receivable (asset, shown positive).
+    # Each party is listed individually, not as a single total.
+    loan_payables = []
+    loan_receivables = []
+    try:
+        others = conn.execute(
+            "SELECT id, name FROM other_parties ORDER BY name"
+        ).fetchall()
+        for op in others:
+            bal = _party_balance(conn, "other", op["id"])
+            if bal > 0:
+                loan_payables.append({"name": op["name"], "balance": bal})
+            elif bal < 0:
+                loan_receivables.append({"name": op["name"], "balance": -bal})
+    except Exception:
+        pass  # table absent on very old DBs
+    total_loan_recv = sum(r["balance"] for r in loan_receivables)
+    total_loan_pay = sum(p["balance"] for p in loan_payables)
+
+    total_current = stock + total_recv + cash + bank + total_loan_recv
     total_assets = total_fixed + total_current
 
+    # Suppliers Payable — single summarized total (sum of all supplier balances).
+    # The system 'Cash Purchase' (id=0) and 'OPENING STOCK' suppliers are excluded
+    # as before. Per-supplier detail is not shown on the balance sheet; it lives
+    # in the ledger.
     suppliers = conn.execute(
         "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
     ).fetchall()
-    payables = []
+    total_payables = 0.0
     for s in suppliers:
-        if s["name"].upper().strip() == "OPENING STOCK" or "OPENING STOCK" in s["name"].upper():
+        if "OPENING STOCK" in s["name"].upper():
             continue
-        bal = _party_balance(conn, "supplier", s["id"])
-        if bal > 0:
-            payables.append({"name": s["name"], "balance": bal})
-    total_payables = sum(p["balance"] for p in payables)
+        total_payables += _party_balance(conn, "supplier", s["id"])
 
     committee_items = []
     total_committees = 0.0
     try:
+        # 'remaining' is not a stored column — committees.py computes it as
+        # max(0, total_amount - monthly_installment * months_paid). Compute the
+        # same here in SQL (SQLite MAX(a,b) is scalar 2-arg max) so committee
+        # liabilities actually appear on the sheet.
         rows = conn.execute(
-            "SELECT name, remaining FROM committees ORDER BY name"
+            "SELECT name, "
+            "MAX(total_amount - monthly_installment * months_paid, 0) AS remaining "
+            "FROM committees ORDER BY name"
         ).fetchall()
         committee_items = [{"name": r["name"], "remaining": float(r["remaining"] or 0)} for r in rows]
         total_committees = sum(ci["remaining"] for ci in committee_items)
     except Exception:
         pass
 
-    total_liabilities = total_payables + total_committees
+    total_liabilities = total_payables + total_committees + total_loan_pay
 
     capital_items = []
     try:
@@ -161,28 +226,39 @@ def bs_data() -> dict:
             pass
 
     total_capital = sum(ci["balance"] for ci in capital_items)
+    # Retained is the balancing figure (assets - liabilities - capital). Every
+    # P&L movement, including Incentive Income, is captured inside it
+    # automatically. We pull Incentive Income (Other Income) out onto its own
+    # equity line so it is visible, and show the remaining trading result as
+    # Retained Profit/Loss. Splitting one equity figure into two lines keeps the
+    # sheet balanced — the total of the two equals the original retained figure.
     retained = total_assets - total_liabilities - total_capital
-    check = total_liabilities + total_capital + retained
+    incentives = db_incentives_income_total()
+    retained_trading = retained - incentives
+    check = total_liabilities + total_capital + retained_trading + incentives
 
     conn.close()
     return {
         "fixed_assets":      fixed_assets,
         "total_fixed":       total_fixed,
         "stock":             stock,
-        "receivables":       receivables,
         "total_recv":        total_recv,
+        "total_loan_recv":   total_loan_recv,
         "cash":              cash,
         "bank":              bank,
+        "bank_accounts":     bank_accounts,
         "total_current":     total_current,
         "total_assets":      total_assets,
-        "payables":          payables,
         "total_payables":    total_payables,
+        "total_loan_pay":    total_loan_pay,
         "committee_items":   committee_items,
         "total_committees":  total_committees,
         "total_liabilities": total_liabilities,
         "capital_items":     capital_items,
         "total_capital":     total_capital,
         "retained":          retained,
+        "retained_trading":  retained_trading,
+        "incentives":        incentives,
         "check":             check,
     }
 
@@ -236,10 +312,18 @@ class BalanceSheetPage(QWidget):
         )
         export_btn.clicked.connect(self._export_pdf)
 
+        export_csv_btn = QPushButton("Export CSV")
+        export_csv_btn.setFixedHeight(32)
+        export_csv_btn.setStyleSheet(
+            "background:#1e293b;color:white;border-radius:4px;padding:0 14px;font-weight:bold;"
+        )
+        export_csv_btn.clicked.connect(self._export_csv)
+
         top_lyt.addWidget(as_at_lbl)
         top_lyt.addWidget(self._date_edit)
         top_lyt.addWidget(refresh_btn)
         top_lyt.addWidget(export_btn)
+        top_lyt.addWidget(export_csv_btn)
         root.addWidget(top)
 
         self._scroll = QScrollArea()
@@ -395,10 +479,14 @@ class BalanceSheetPage(QWidget):
         ca_lbl.setStyleSheet("background:transparent;color:#1e293b;")
         lyt.addWidget(ca_lbl)
 
-        self._add_item(lyt, "Stock (at Cost)", d["stock"], indent=True)
-        self._add_item(lyt, "Trade Receivables", d["total_recv"], indent=True)
         self._add_item(lyt, "Cash in Hand", d["cash"], indent=True)
-        self._add_item(lyt, "Bank Balance", d["bank"], indent=True)
+        for ba in d.get("bank_accounts", []):
+            self._add_item(lyt, f"Bank — {ba['name']}", ba["balance"], indent=True)
+        self._add_item(lyt, "Customers Receivable", d["total_recv"], indent=True)
+        if d.get("total_loan_recv"):
+            self._add_item(lyt, "Other Parties Receivable", d["total_loan_recv"],
+                           indent=True)
+        self._add_item(lyt, "Stock Valuation", d["stock"], indent=True)
         self._add_item(lyt, "Total Current Assets", d["total_current"],
                        bold=True, bg="#e5f0f5")
 
@@ -412,31 +500,11 @@ class BalanceSheetPage(QWidget):
         self._add_section(lyt, "LIABILITIES", "#8b3535")
         self._add_gap(lyt, 6)
 
-        tp_lbl = QLabel("Trade Payables")
-        tpf = QFont()
-        tpf.setBold(True)
-        tp_lbl.setFont(tpf)
-        tp_lbl.setContentsMargins(16, 6, 16, 2)
-        tp_lbl.setStyleSheet("background:transparent;color:#1e293b;")
-        lyt.addWidget(tp_lbl)
-        for p in d["payables"]:
-            self._add_item(lyt, p["name"], p["balance"], indent=True)
-        self._add_item(lyt, "Total Trade Payables", d["total_payables"],
-                       bold=True, bg="#f0e5e5")
-
-        if d["committee_items"]:
-            self._add_gap(lyt, 10)
-            cm_lbl = QLabel("Committees")
-            cmf = QFont()
-            cmf.setBold(True)
-            cm_lbl.setFont(cmf)
-            cm_lbl.setContentsMargins(16, 6, 16, 2)
-            cm_lbl.setStyleSheet("background:transparent;color:#1e293b;")
-            lyt.addWidget(cm_lbl)
-            for ci in d["committee_items"]:
-                self._add_item(lyt, ci["name"], ci["remaining"], indent=True)
-            self._add_item(lyt, "Total Committees", d["total_committees"],
-                           bold=True, bg="#f0e5e5")
+        self._add_item(lyt, "Suppliers Payable", d["total_payables"], indent=True)
+        if d.get("total_loan_pay"):
+            self._add_item(lyt, "Other Parties Payable", d["total_loan_pay"], indent=True)
+        if d.get("total_committees"):
+            self._add_item(lyt, "Committees", d["total_committees"], indent=True)
 
         self._add_gap(lyt, 10)
         self._add_grand_total(lyt, "TOTAL LIABILITIES", d["total_liabilities"], "#8b3535")
@@ -455,13 +523,26 @@ class BalanceSheetPage(QWidget):
         self._add_sep(lyt, thick=True)
         self._add_gap(lyt, 16)
 
-        retained = d["retained"]
+        retained = d.get("retained_trading", d["retained"])
         if retained >= 0:
             self._add_item(lyt, "Retained Profit", retained,
                            bold=True, label_color="#2d7a4f", amount_color="#2d7a4f")
         else:
             self._add_item(lyt, "Retained Loss", retained,
                            bold=True, label_color="#8b3535", amount_color="#8b3535")
+
+        # Incentive Income (Other Income) — broken out of retained for visibility.
+        incentives = d.get("incentives", 0.0)
+        inc_color = "#2d7a4f" if incentives >= 0 else "#8b3535"
+        self._add_item(lyt, "Incentive Income (Other Income)", incentives,
+                       bold=True, label_color=inc_color, amount_color=inc_color)
+
+        # Subtotal: detail lines above summed into one clear total.
+        total_retained = retained + incentives
+        tr_color = "#2d7a4f" if total_retained >= 0 else "#8b3535"
+        self._add_item(lyt, "Total Retained Profit", total_retained,
+                       bold=True, bg="#eef2ff",
+                       label_color=tr_color, amount_color=tr_color)
 
         self._add_gap(lyt, 16)
         self._add_sep(lyt, thick=True)
@@ -481,6 +562,57 @@ class BalanceSheetPage(QWidget):
         lyt.addWidget(check_lbl)
 
         lyt.addStretch()
+
+    def _export_csv(self):
+        import os
+        import csv as _csv
+        folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
+        if not folder:
+            return
+        d = self._data or bs_data()
+        date_str = self._date_edit.date().toString("dd/MM/yyyy")
+        fname = "Balance_Sheet_" + datetime.date.today().strftime("%d%m%Y") + ".csv"
+        path = os.path.join(folder, fname)
+
+        def _a(x):
+            return int(round(x))
+
+        rows = [["Section", "Account", "Amount (PKR)"],
+                ["", f"Statement of Financial Position as at {date_str}", ""]]
+        for fa in d["fixed_assets"]:
+            rows.append(["Assets — Fixed", fa["name"], _a(fa["value"])])
+        rows.append(["Assets — Current", "Cash in Hand", _a(d["cash"])])
+        for ba in d.get("bank_accounts", []):
+            rows.append(["Assets — Current", f"Bank — {ba['name']}", _a(ba["balance"])])
+        rows.append(["Assets — Current", "Customers Receivable", _a(d["total_recv"])])
+        if d.get("total_loan_recv"):
+            rows.append(["Assets — Current", "Other Parties Receivable",
+                         _a(d["total_loan_recv"])])
+        rows.append(["Assets — Current", "Stock Valuation", _a(d["stock"])])
+        rows.append(["Assets", "TOTAL ASSETS", _a(d["total_assets"])])
+        rows.append(["Liabilities", "Suppliers Payable", _a(d["total_payables"])])
+        if d.get("total_loan_pay"):
+            rows.append(["Liabilities", "Other Parties Payable", _a(d["total_loan_pay"])])
+        if d.get("total_committees"):
+            rows.append(["Liabilities", "Committees", _a(d["total_committees"])])
+        rows.append(["Liabilities", "TOTAL LIABILITIES", _a(d["total_liabilities"])])
+        for ci in d["capital_items"]:
+            rows.append(["Capital", ci["name"], _a(ci["balance"])])
+        rows.append(["Capital", "TOTAL CAPITAL", _a(d["total_capital"])])
+        rows.append(["Equity", "Retained Profit/Loss",
+                     _a(d.get("retained_trading", d["retained"]))])
+        rows.append(["Equity", "Incentive Income (Other Income)",
+                     _a(d.get("incentives", 0))])
+        rows.append(["Equity", "Total Retained Profit",
+                     _a(d.get("retained_trading", d["retained"]) + d.get("incentives", 0))])
+        rows.append(["", "TOTAL LIABILITIES + CAPITAL + RETAINED", _a(d["check"])])
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                _csv.writer(f).writerows(rows)
+            QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", str(e))
 
     def _export_pdf(self):
         try:
@@ -653,10 +785,13 @@ class BalanceSheetPage(QWidget):
             story.append(Spacer(1, 6))
 
         story.append(_cat_row("Current Assets"))
-        story.append(_indent_row("Stock (at Cost)", d["stock"]))
-        story.append(_indent_row("Trade Receivables", d["total_recv"]))
         story.append(_indent_row("Cash in Hand", d["cash"]))
-        story.append(_indent_row("Bank Balance", d["bank"]))
+        for ba in d.get("bank_accounts", []):
+            story.append(_indent_row(f"Bank — {ba['name']}", ba["balance"]))
+        story.append(_indent_row("Customers Receivable", d["total_recv"]))
+        if d.get("total_loan_recv"):
+            story.append(_indent_row("Other Parties Receivable", d["total_loan_recv"]))
+        story.append(_indent_row("Stock Valuation", d["stock"]))
         story.append(_bold_bg_row("Total Current Assets", d["total_current"], "#e5f0f5"))
         story.append(Spacer(1, 6))
         story.append(_grand_row("TOTAL ASSETS", d["total_assets"], "#2c6e85"))
@@ -667,18 +802,11 @@ class BalanceSheetPage(QWidget):
 
         story.append(_section_row("LIABILITIES", "#8b3535"))
         story.append(Spacer(1, 4))
-        story.append(_cat_row("Trade Payables"))
-        for p in d["payables"]:
-            story.append(_indent_row(p["name"], p["balance"]))
-        story.append(_bold_bg_row("Total Trade Payables", d["total_payables"], "#f0e5e5"))
-
-        if d["committee_items"]:
-            story.append(Spacer(1, 6))
-            story.append(_cat_row("Committees"))
-            for ci in d["committee_items"]:
-                story.append(_indent_row(ci["name"], ci["remaining"]))
-            story.append(_bold_bg_row("Total Committees", d["total_committees"], "#f0e5e5"))
-
+        story.append(_indent_row("Suppliers Payable", d["total_payables"]))
+        if d.get("total_loan_pay"):
+            story.append(_indent_row("Other Parties Payable", d["total_loan_pay"]))
+        if d.get("total_committees"):
+            story.append(_indent_row("Committees", d["total_committees"]))
         story.append(Spacer(1, 6))
         story.append(_grand_row("TOTAL LIABILITIES", d["total_liabilities"], "#8b3535"))
 
@@ -696,7 +824,7 @@ class BalanceSheetPage(QWidget):
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#64748b")))
         story.append(Spacer(1, 10))
 
-        retained = d["retained"]
+        retained = d.get("retained_trading", d["retained"])
         if retained >= 0:
             ret_color = colors.HexColor("#2d7a4f")
             ret_label = "Retained Profit"
@@ -707,6 +835,23 @@ class BalanceSheetPage(QWidget):
         ret_ps_l = _ps("ret_l", bold=True, color=ret_color)
         ret_ps_r = _ps("ret_r", bold=True, color=ret_color, alignment=TA_RIGHT)
         story.append(_row(ret_label, retained, label_style=ret_ps_l, amount_style=ret_ps_r))
+
+        # Incentive Income (Other Income) — broken out of retained for visibility.
+        incentives = d.get("incentives", 0.0)
+        inc_color = colors.HexColor("#2d7a4f") if incentives >= 0 else colors.HexColor("#8b3535")
+        inc_ps_l = _ps("inc_l", bold=True, color=inc_color)
+        inc_ps_r = _ps("inc_r", bold=True, color=inc_color, alignment=TA_RIGHT)
+        story.append(_row("Incentive Income (Other Income)", incentives,
+                          label_style=inc_ps_l, amount_style=inc_ps_r))
+
+        # Subtotal: detail lines above summed into one clear total.
+        total_retained = retained + incentives
+        tr_color = colors.HexColor("#2d7a4f") if total_retained >= 0 else colors.HexColor("#8b3535")
+        tr_ps_l = _ps("tr_l", bold=True, color=tr_color)
+        tr_ps_r = _ps("tr_r", bold=True, color=tr_color, alignment=TA_RIGHT)
+        story.append(_row("Total Retained Profit", total_retained,
+                          label_style=tr_ps_l, amount_style=tr_ps_r,
+                          bg=colors.HexColor("#eef2ff")))
 
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#64748b")))
