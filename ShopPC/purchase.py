@@ -1116,11 +1116,11 @@ class PurchaseForm(QWidget):
         # Row 1 — eGadget reference number
         ref_row = QHBoxLayout()
         ref_row.setSpacing(10)
-        ref_lbl = QLabel("eGadget Ref # *")
+        ref_lbl = QLabel("eGadget Ref #")
         ref_lbl.setMinimumWidth(120)
         ref_row.addWidget(ref_lbl)
         self.egadget_ref_edit = QLineEdit()
-        self.egadget_ref_edit.setPlaceholderText("Mandatory — eGadget reference number")
+        self.egadget_ref_edit.setPlaceholderText("Optional — eGadget reference number")
         self.egadget_ref_edit.setMinimumWidth(240)
         ref_row.addWidget(self.egadget_ref_edit)
         ref_row.addStretch()
@@ -1527,11 +1527,6 @@ class PurchaseForm(QWidget):
         else:
             # ── Cash purchase ─────────────────────────────────────────────
             egadget_ref = self.egadget_ref_edit.text().strip()
-            if not egadget_ref:
-                QMessageBox.warning(self, "Missing",
-                    "eGadget Reference Number is required for cash purchases.")
-                self.egadget_ref_edit.setFocus()
-                return
 
             pm = self._pay_method
             if pm == "cash":
@@ -1588,9 +1583,10 @@ class PurchaseForm(QWidget):
             except Exception:
                 pass
 
+            ref_line = f"eGadget Ref: {egadget_ref}\n" if egadget_ref else ""
             QMessageBox.information(self, "Saved",
                 f"Cash Purchase {pv_number} saved.\n"
-                f"eGadget Ref: {egadget_ref}\n"
+                f"{ref_line}"
                 f"Total: PKR {fmt_pkr(total)}")
 
         self._on_save(pv_number)

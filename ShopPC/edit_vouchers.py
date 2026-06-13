@@ -640,6 +640,7 @@ class SaleEditDialog(QDialog):
             | Qt.WindowType.WindowMinimizeButtonHint
             | Qt.WindowType.WindowCloseButtonHint
         )
+        self._sv_id = sv_id
         sv, lines, cust = db_load_sale_for_edit(sv_id)
         self._sv = sv
 
@@ -1018,7 +1019,7 @@ class SaleEditDialog(QDialog):
 
             price_edit = QLineEdit(str(int(ln["final_price"])))
             price_edit.setFixedWidth(168)
-            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:12pt; font-weight:bold; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
             price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
             price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
@@ -1312,7 +1313,7 @@ class PurchaseEditDialog(QDialog):
 
             price_edit = QLineEdit(str(int(ln["purchase_price"])))
             price_edit.setFixedWidth(178)
-            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:10pt; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
+            price_edit.setStyleSheet("QLineEdit { padding:3px 6px; font-size:12pt; font-weight:bold; border:1px solid #cbd5e1; border-radius:4px; background:#ffffff; color:#1e293b; }")
             price_edit.setValidator(QDoubleValidator(0, 9_999_999, 0))
             price_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             price_edit.textChanged.connect(lambda text, idx=i: self._on_price_change(idx, text))
@@ -1381,7 +1382,14 @@ class PurchaseEditDialog(QDialog):
         self._rebuild_lines_table()
 
     def _save(self):
-        if self.supplier_combo.currentData() is None:
+        # Cash purchases have no real supplier (system supplier_id=0), so the
+        # supplier selection is only required for supplier/credit purchases.
+        # Prefer the loaded purchase_type; fall back to supplier_id when it's
+        # NULL/empty (legacy rows without a purchase_type).
+        ptype = (self._pv.get("purchase_type") or "").strip().lower()
+        is_cash_purchase = ptype == "cash" or not self._pv.get("supplier_id")
+
+        if not is_cash_purchase and self.supplier_combo.currentData() is None:
             QMessageBox.warning(self, "Missing", "Select a supplier.")
             return
         if not self._lines:
@@ -1389,7 +1397,12 @@ class PurchaseEditDialog(QDialog):
             return
 
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        supplier_id = self.supplier_combo.currentData()
+        # Keep the original supplier for cash purchases (system id=0); use the
+        # chosen supplier for supplier/credit purchases.
+        if is_cash_purchase:
+            supplier_id = self._pv.get("supplier_id")
+        else:
+            supplier_id = self.supplier_combo.currentData()
         notes = self.notes_edit.text().strip()
         db_lines = [(ln["model_id"], ln["imei"], ln["purchase_price"]) for ln in self._lines]
 

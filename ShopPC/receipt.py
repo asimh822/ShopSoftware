@@ -51,12 +51,31 @@ def fmt_pkr(val) -> str:
 
 # ── Build receipt text ────────────────────────────────────────────────────────
 
+def _credit_previous_balance(data: dict):
+    """Outstanding balance a credit customer owed BEFORE this sale.
+
+    The current outstanding (read from the customers ledger at print time)
+    already includes this invoice, so subtract the invoice total to get the
+    previous balance. Returns None for cash sales or when no customer is set.
+    """
+    if data.get("type") != "credit" or not data.get("customer_id"):
+        return None
+    from sales import db_customer_balance
+    outstanding_now = db_customer_balance(data["customer_id"])
+    return outstanding_now - (data.get("total_amount") or 0)
+
+
 def build_receipt_text(sv_number, date_str, customer_name, lines,
                        discount, total, note, shop_name, shop_address,
-                       shop_contact, footer_msg, salesman_name=None) -> str:
+                       shop_contact, footer_msg, salesman_name=None,
+                       sale_type=None, previous_balance=None) -> str:
     """
     lines = [(brand, model_name, imei, final_price), ...]
     Returns the full receipt as a plain-text string.
+
+    For credit sales, pass sale_type="credit" and previous_balance to print
+    the customer's running balance (Previous Balance / Invoice Total /
+    Total Outstanding) below the TOTAL line.
     """
     lines_out = []
 
@@ -86,6 +105,14 @@ def build_receipt_text(sv_number, date_str, customer_name, lines,
     if discount:
         lines_out.append(_right_align("Discount:", f"-{fmt_pkr(discount)}"))
     lines_out.append(_right_align("TOTAL:", f"PKR {fmt_pkr(total)}"))
+
+    # Credit sales: show the customer's running balance.
+    # Invoice Total is omitted here — it's already the TOTAL line above.
+    if sale_type == "credit" and previous_balance is not None:
+        total_outstanding = previous_balance + (total or 0)
+        lines_out.append(_right_align("Previous Balance:", f"Rs. {fmt_pkr(previous_balance)}"))
+        lines_out.append(_right_align("Total Outstanding:", f"Rs. {fmt_pkr(total_outstanding)}"))
+
     lines_out.append(_sep())
 
     if note:
@@ -146,14 +173,65 @@ def _send_raw_win32print(printer_name: str, raw: bytes) -> None:
         win32print.ClosePrinter(hPrinter)
 
 
+def _printer_mode() -> str:
+    """Connection mode: 'usb' (default) or 'network'. Read fresh on every print."""
+    return (get_setting("printer_mode") or "usb").strip().lower()
+
+
+def _print_target_ready(printer_name: str) -> bool:
+    """True if a print can be attempted: network mode (uses IP/port) needs no
+    Windows printer name; USB mode needs a printer name selected."""
+    if _printer_mode() == "network":
+        return True
+    return bool(printer_name)
+
+
+def _send_raw_network(raw: bytes) -> None:
+    """Send raw ESC/POS bytes to a network thermal printer over TCP (e.g. port
+    9100). Raises RuntimeError with a clear message on any failure."""
+    import socket
+
+    ip = (get_setting("printer_ip") or "").strip()
+    port_str = (get_setting("printer_port") or "9100").strip()
+    if not ip:
+        raise RuntimeError(
+            "Network printing is selected but no printer IP address is set.\n\n"
+            "Set the IP in Settings → Printer Connection, or switch back to USB mode."
+        )
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 9100
+
+    try:
+        with socket.create_connection((ip, port), timeout=5) as sock:
+            sock.sendall(raw)
+    except Exception as e:
+        raise RuntimeError(
+            f"Network print failed — could not reach printer at {ip}:{port}.\n"
+            f"({e})\n\n"
+            "Check that the IP/port in Settings → Printer Connection are correct, "
+            "the printer is powered on and on the same network, or switch back to "
+            "USB mode."
+        )
+
+
 def _print_raw(printer_name: str, text: str) -> None:
     """
-    Send receipt text to the thermal printer.
-    Primary:  win32print with ESC/POS bytes (works with any RAW-capable driver).
-    Fallback: python-escpos Win32Raw.
-    Raises an exception with a clear message if both fail.
+    Send receipt text to the thermal printer using the configured connection mode.
+    Network mode:  raw ESC/POS bytes over TCP/IP (IP + port from settings).
+    USB/Local mode:
+      Primary:  win32print with ESC/POS bytes (works with any RAW-capable driver).
+      Fallback: python-escpos Win32Raw.
+    Raises an exception with a clear message if printing fails.
     """
     raw = build_receipt_bytes(text)
+
+    # Routed fresh every call — switching mode in Settings needs no restart.
+    if _printer_mode() == "network":
+        _send_raw_network(raw)
+        return
+
     errors = []
 
     # ── Primary: win32print direct RAW ───────────────────────────────────────
@@ -188,7 +266,8 @@ def _print_raw(printer_name: str, text: str) -> None:
 def fetch_receipt_data(sv_id: int) -> dict | None:
     conn = get_connection()
     sv = conn.execute("""
-        SELECT sv.sv_number, sv.date, sv.type, sv.total_amount, sv.discount, sv.note,
+        SELECT sv.sv_number, sv.date, sv.type, sv.customer_id,
+               sv.total_amount, sv.discount, sv.note,
                COALESCE(c.name, sv.cash_customer_name) customer_name,
                sm.name salesman_name
         FROM sale_vouchers sv
@@ -211,6 +290,8 @@ def fetch_receipt_data(sv_id: int) -> dict | None:
     return {
         "sv_number":    sv["sv_number"],
         "date":         sv["date"],
+        "type":         sv["type"],
+        "customer_id":  sv["customer_id"],
         "customer_name": sv["customer_name"] or "Walk-in",
         "total_amount": sv["total_amount"],
         "discount":     sv["discount"],
@@ -241,11 +322,13 @@ def print_receipt(sv_id: int, parent=None) -> bool:
         shop_contact  = get_setting("shop_contact") or "",
         footer_msg    = get_setting("receipt_footer") or "Thank you for your purchase!",
         salesman_name = data.get("salesman_name"),
+        sale_type        = data.get("type"),
+        previous_balance = _credit_previous_balance(data),
     )
 
     printer_name = get_setting("thermal_printer") or ""
 
-    if printer_name:
+    if _print_target_ready(printer_name):
         try:
             _print_raw(printer_name, text)
             return True
@@ -259,6 +342,43 @@ def print_receipt(sv_id: int, parent=None) -> bool:
 
     _show_preview(text, data["sv_number"], parent)
     return False
+
+
+def print_receipt_headless(sv_id: int, printer_name: str | None = None) -> tuple[bool, str]:
+    """
+    Print a sale receipt without any Qt UI — safe to call from the Flask server
+    (no QApplication, no display). Returns (success, error_message).
+    """
+    data = fetch_receipt_data(sv_id)
+    if not data:
+        return False, "Sale not found"
+
+    printer_name = printer_name or get_setting("thermal_printer") or ""
+    if not _print_target_ready(printer_name):
+        return False, "No thermal_printer setting configured"
+
+    text = build_receipt_text(
+        sv_number     = data["sv_number"],
+        date_str      = data["date"],
+        customer_name = data["customer_name"],
+        lines         = data["lines"],
+        discount      = data["discount"],
+        total         = data["total_amount"],
+        note          = data["note"],
+        shop_name     = get_setting("shop_name") or "United Mobile",
+        shop_address  = get_setting("shop_address") or "",
+        shop_contact  = get_setting("shop_contact") or "",
+        footer_msg    = get_setting("receipt_footer") or "Thank you for your purchase!",
+        salesman_name = data.get("salesman_name"),
+        sale_type        = data.get("type"),
+        previous_balance = _credit_previous_balance(data),
+    )
+
+    try:
+        _print_raw(printer_name, text)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def _show_preview(text: str, voucher_number: str, parent=None):
@@ -333,7 +453,7 @@ def build_return_receipt_text(voucher_num, return_type, date_str, party_name,
 
 def _print_return_raw(text: str, printer_name: str, voucher_num: str, parent=None) -> bool:
     """Attempt physical printing; falls back to preview. Returns True if printed."""
-    if printer_name:
+    if _print_target_ready(printer_name):
         try:
             _print_raw(printer_name, text)
             return True
@@ -568,7 +688,7 @@ def print_cash_purchase_receipt(pv_number: str, parent=None) -> bool:
         footer_msg   = get_setting("receipt_footer") or "Thank you!",
     )
     printer_name = get_setting("thermal_printer") or ""
-    if printer_name:
+    if _print_target_ready(printer_name):
         try:
             _print_raw(printer_name, text)
             return True

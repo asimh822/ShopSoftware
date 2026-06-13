@@ -13,7 +13,6 @@ from database import (
     get_connection,
     db_salesmen, db_save_salesman, db_toggle_salesman, db_delete_salesman,
 )
-from widgets import SearchableComboBox
 
 
 def _setup_uppercase_edit(edit):
@@ -271,6 +270,39 @@ def db_delete_customer(customer_id):
     conn.close()
 
 
+def db_other_parties():
+    """Personal/loan accounts — neither suppliers nor customers."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, name, contact, opening_balance, notes FROM other_parties ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def db_save_other_party(name, contact, ob, notes, party_id=None):
+    conn = get_connection()
+    if party_id:
+        conn.execute(
+            "UPDATE other_parties SET name=?, contact=?, opening_balance=?, notes=? WHERE id=?",
+            (name, contact, ob, notes, party_id),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO other_parties (name, contact, opening_balance, notes) VALUES (?,?,?,?)",
+            (name, contact, ob, notes),
+        )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_other_party(party_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM other_parties WHERE id=?", (party_id,))
+    conn.commit()
+    conn.close()
+
+
 # ── Dialogs ───────────────────────────────────────────────────────────────────
 
 class BrandDialog(QDialog):
@@ -493,6 +525,78 @@ class CustomerDialog(QDialog):
         )
 
 
+class OtherPartyDialog(QDialog):
+    """Personal / loan account — friends, partners, cash-only parties."""
+
+    def __init__(self, parent=None, name="", contact="", ob=0.0, notes=""):
+        super().__init__(parent)
+        self.setWindowTitle("Other Party")
+        self.setFixedWidth(380)
+        self.setStyleSheet(FORM_INPUT_STYLE)
+        form = QFormLayout(self)
+        form.setSpacing(12)
+        form.setContentsMargins(20, 20, 20, 20)
+
+        self.name_edit = QLineEdit(name.title() if name else "")
+        self.name_edit.setPlaceholderText("Person / account name")
+        _setup_titlecase_edit(self.name_edit)
+        form.addRow("Name:", self.name_edit)
+
+        self.contact_edit = QLineEdit(contact)
+        self.contact_edit.setPlaceholderText("03XXXXXXXXX (11 digits)")
+        self.contact_edit.setMaxLength(11)
+        form.addRow("Contact:", self.contact_edit)
+
+        # Opening balance can be either direction for a loan account.
+        self.ob_spin = QDoubleSpinBox()
+        self.ob_spin.setRange(-99_999_999, 99_999_999)
+        self.ob_spin.setDecimals(0)
+        self.ob_spin.setSingleStep(1000)
+        self.ob_spin.setGroupSeparatorShown(True)
+        self.ob_spin.setValue(ob or 0)
+        self.ob_spin.setPrefix("PKR ")
+        form.addRow("Opening Balance:", self.ob_spin)
+
+        note = QLabel(
+            "Positive = you owe them (loan payable).  "
+            "Negative = they owe you (loan receivable)."
+        )
+        note.setStyleSheet("color:#64748b; font-size:9pt;")
+        note.setWordWrap(True)
+        form.addRow("", note)
+
+        self.notes_edit = QLineEdit(notes or "")
+        self.notes_edit.setPlaceholderText("Optional notes (purpose, terms, etc.)")
+        form.addRow("Notes:", self.notes_edit)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Validation", "Name is required.")
+            return
+        contact = self.contact_edit.text().strip()
+        if contact and not validate_phone(contact):
+            QMessageBox.warning(self, "Invalid Phone Number",
+                "Phone number must start with 03 and be exactly 11 digits.\n"
+                "Example: 03155344522")
+            return
+        self.accept()
+
+    def get_data(self):
+        return (
+            self.name_edit.text().strip(),
+            self.contact_edit.text().strip(),
+            self.ob_spin.value(),
+            self.notes_edit.text().strip(),
+        )
+
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
 class BrandsTab(QWidget):
@@ -589,7 +693,7 @@ class ModelsTab(QWidget):
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addWidget(QLabel("Brand:"))
-        self.brand_filter = SearchableComboBox()
+        self.brand_filter = QComboBox()
         self.brand_filter.setMinimumWidth(160)
         top.addWidget(self.brand_filter)
         top.addStretch()
@@ -897,6 +1001,112 @@ class CustomersTab(QWidget):
                 "Sale records exist for this customer. Cannot delete.")
 
 
+class OtherPartiesTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.btn_add = QPushButton("+ Add Other Party")
+        self.btn_add.setStyleSheet(BTN_PRIMARY)
+        self.btn_edit = QPushButton("Edit")
+        self.btn_edit.setStyleSheet(BTN_SECONDARY)
+        self.btn_edit.setEnabled(False)
+        self.btn_del = QPushButton("Delete")
+        self.btn_del.setStyleSheet(BTN_DANGER)
+        self.btn_del.setEnabled(False)
+        layout.addLayout(_toolbar(self.btn_add, self.btn_edit, self.btn_del))
+
+        note = QLabel(
+            "Personal / loan accounts — friends, partners and other cash-only "
+            "parties that are neither suppliers nor customers."
+        )
+        note.setStyleSheet("color:#64748b; font-size:9pt;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.table = make_table(["Name", "Contact", "Opening Balance (PKR)", "Notes"])
+        layout.addWidget(self.table)
+
+        self.btn_add.clicked.connect(self._add)
+        self.btn_edit.clicked.connect(self._edit)
+        self.btn_del.clicked.connect(self._delete)
+        self.table.itemSelectionChanged.connect(self._on_sel)
+        self.table.doubleClicked.connect(self._edit)
+
+        self.refresh()
+
+    def refresh(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        for r in db_other_parties():
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name_item = QTableWidgetItem(r["name"])
+            name_item.setData(Qt.ItemDataRole.UserRole, r["id"])
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, QTableWidgetItem(r["contact"] or ""))
+            ob = QTableWidgetItem(fmt_pkr(r["opening_balance"]))
+            ob.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 2, ob)
+            self.table.setItem(row, 3, QTableWidgetItem(r["notes"] or ""))
+        self.table.setSortingEnabled(True)
+        self._on_sel()
+
+    def _current_id(self):
+        row = self.table.currentRow()
+        if row < 0 or not self.table.selectedItems():
+            return None
+        return self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+
+    def _on_sel(self):
+        ok = bool(self.table.selectedItems())
+        self.btn_edit.setEnabled(ok)
+        self.btn_del.setEnabled(ok)
+
+    def _add(self):
+        dlg = OtherPartyDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            db_save_other_party(*dlg.get_data())
+            self.refresh()
+
+    def _edit(self):
+        pid = self._current_id()
+        if pid is None:
+            return
+        conn = get_connection()
+        r = conn.execute(
+            "SELECT name, contact, opening_balance, notes FROM other_parties WHERE id=?",
+            (pid,)
+        ).fetchone()
+        conn.close()
+        dlg = OtherPartyDialog(self, name=r["name"],
+                               contact=r["contact"] or "",
+                               ob=r["opening_balance"] or 0,
+                               notes=r["notes"] or "")
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            db_save_other_party(*dlg.get_data(), party_id=pid)
+            self.refresh()
+
+    def _delete(self):
+        pid = self._current_id()
+        if pid is None:
+            return
+        name = self.table.item(self.table.currentRow(), 0).text()
+        if QMessageBox.question(
+            self, "Delete Other Party", f"Delete other party '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            db_delete_other_party(pid)
+            self.refresh()
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Cannot Delete",
+                "Ledger records exist for this party. Cannot delete.")
+
+
 # ── Salesman Dialog ───────────────────────────────────────────────────────────
 
 class SalesmanDialog(QDialog):
@@ -1112,12 +1322,14 @@ class MastersPage(QWidget):
         self.models_tab    = ModelsTab()
         self.suppliers_tab = SuppliersTab()
         self.customers_tab = CustomersTab()
+        self.other_tab     = OtherPartiesTab()
         self.salesman_tab  = SalesmanTab()
 
         self.tabs.addTab(self.brands_tab,    "Brands")
         self.tabs.addTab(self.models_tab,    "Models")
         self.tabs.addTab(self.suppliers_tab, "Suppliers")
         self.tabs.addTab(self.customers_tab, "Credit Customers")
+        self.tabs.addTab(self.other_tab,     "Other Parties")
         self.tabs.addTab(self.salesman_tab,  "Salesmen")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
@@ -1128,4 +1340,6 @@ class MastersPage(QWidget):
         if index == 1:
             self.models_tab._reload_brand_filter()
         elif index == 4:
+            self.other_tab.refresh()
+        elif index == 5:
             self.salesman_tab.refresh()

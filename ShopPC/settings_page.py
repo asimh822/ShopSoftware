@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QScrollArea, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QDateEdit, QCheckBox,
-    QSizePolicy,
+    QSizePolicy, QComboBox,
 )
 from PyQt6.QtCore import Qt, QRegularExpression, QDate
 from PyQt6.QtGui import QFont, QRegularExpressionValidator
@@ -341,6 +341,15 @@ class SettingsPage(QWidget):
         rf.setSpacing(10)
         rf.setContentsMargins(16, 16, 16, 16)
 
+        # ── Connection mode: USB/Local vs Network ─────────────────────────────
+        self.printer_mode = QComboBox()
+        self.printer_mode.addItem("USB / Local (connected to this PC)", "usb")
+        self.printer_mode.addItem("Network (LAN / WiFi)", "network")
+        saved_mode = (get_setting("printer_mode") or "usb").strip().lower()
+        self.printer_mode.setCurrentIndex(1 if saved_mode == "network" else 0)
+        self.printer_mode.currentIndexChanged.connect(self._on_printer_mode_changed)
+        rf.addRow("Connection:", self.printer_mode)
+
         self.printer_name = QLineEdit(get_setting("thermal_printer") or "")
         self.printer_name.setStyleSheet(INPUT_STYLE)
         self.printer_name.setPlaceholderText(
@@ -356,7 +365,9 @@ class SettingsPage(QWidget):
         btn_pick.setFixedWidth(110)
         btn_pick.clicked.connect(self._pick_printer)
         printer_row.addWidget(btn_pick)
-        rf.addRow("Printer Name:", printer_row)
+        self._usb_row_label = QLabel("Printer Name:")
+        rf.addRow(self._usb_row_label, printer_row)
+        self._usb_row_widget = printer_row
 
         printer_note = QLabel(
             "Click 'Pick Printer' to see all installed Windows printers and select yours. "
@@ -364,7 +375,37 @@ class SettingsPage(QWidget):
         )
         printer_note.setStyleSheet("color:#64748b; font-size:9pt;")
         printer_note.setWordWrap(True)
+        self._usb_note = printer_note
         rf.addRow("", printer_note)
+
+        # ── Network printer fields (IP + port) — shown only in Network mode ────
+        net_row = QHBoxLayout()
+        net_row.setSpacing(8)
+        self.printer_ip = QLineEdit(get_setting("printer_ip") or "")
+        self.printer_ip.setStyleSheet(INPUT_STYLE)
+        self.printer_ip.setPlaceholderText("192.168.1.50")
+        net_row.addWidget(self.printer_ip, stretch=1)
+        net_row.addWidget(QLabel("Port:"))
+        self.printer_port = QLineEdit(get_setting("printer_port") or "9100")
+        self.printer_port.setStyleSheet(INPUT_STYLE)
+        self.printer_port.setPlaceholderText("9100")
+        self.printer_port.setFixedWidth(80)
+        net_row.addWidget(self.printer_port)
+        self._net_row_label = QLabel("Printer IP:")
+        rf.addRow(self._net_row_label, net_row)
+        self._net_row_widget = net_row
+
+        net_note = QLabel(
+            "Enter the thermal printer's IP address and port (most network "
+            "printers use 9100). The printer must be on the same network as this PC."
+        )
+        net_note.setStyleSheet("color:#64748b; font-size:9pt;")
+        net_note.setWordWrap(True)
+        self._net_note = net_note
+        rf.addRow("", net_note)
+
+        # Set initial visibility based on saved mode
+        self._on_printer_mode_changed()
 
         self.receipt_footer = QLineEdit(get_setting("receipt_footer") or "")
         self.receipt_footer.setStyleSheet(INPUT_STYLE)
@@ -717,6 +758,24 @@ class SettingsPage(QWidget):
 
         layout.addStretch()
 
+    def _on_printer_mode_changed(self):
+        """Show only the fields relevant to the selected connection mode."""
+        is_network = self.printer_mode.currentData() == "network"
+        # USB row (printer name + Pick) + its note
+        self._usb_row_label.setVisible(not is_network)
+        for i in range(self._usb_row_widget.count()):
+            w = self._usb_row_widget.itemAt(i).widget()
+            if w:
+                w.setVisible(not is_network)
+        self._usb_note.setVisible(not is_network)
+        # Network row (IP + port) + its note
+        self._net_row_label.setVisible(is_network)
+        for i in range(self._net_row_widget.count()):
+            w = self._net_row_widget.itemAt(i).widget()
+            if w:
+                w.setVisible(is_network)
+        self._net_note.setVisible(is_network)
+
     def _save(self):
         set_setting("shop_name",       self.shop_name.text().strip())
         set_setting("shop_address",    self.shop_address.text().strip())
@@ -724,6 +783,13 @@ class SettingsPage(QWidget):
         set_setting("thermal_printer", self.printer_name.text().strip())
         set_setting("receipt_footer",  self.receipt_footer.text().strip())
         set_setting("whatsapp_template", self.wa_template.toPlainText().strip())
+
+        # Printer connection mode
+        set_setting("printer_mode", self.printer_mode.currentData() or "usb")
+        set_setting("printer_ip",   self.printer_ip.text().strip())
+        port = self.printer_port.text().strip() or "9100"
+        set_setting("printer_port", port)
+
         QMessageBox.information(self, "Saved", "Settings saved successfully.")
 
     def _change_pin(self):
@@ -1066,7 +1132,16 @@ class SettingsPage(QWidget):
         dlg.exec()
 
     def _test_print(self):
-        from receipt import build_receipt_text, _print_raw, _show_preview
+        from receipt import (
+            build_receipt_text, _print_raw, _show_preview, _print_target_ready,
+        )
+        # Persist the current printer config first so the test uses exactly
+        # what's on screen (mode/IP/port/name), then print fresh.
+        set_setting("printer_mode", self.printer_mode.currentData() or "usb")
+        set_setting("printer_ip",   self.printer_ip.text().strip())
+        set_setting("printer_port", self.printer_port.text().strip() or "9100")
+        set_setting("thermal_printer", self.printer_name.text().strip())
+
         text = build_receipt_text(
             sv_number     = "SV-TEST",
             date_str      = "30/05/2026",
@@ -1081,14 +1156,14 @@ class SettingsPage(QWidget):
             footer_msg    = self.receipt_footer.text().strip() or "Thank you for your purchase!",
         )
         printer = self.printer_name.text().strip()
-        if printer:
+        if _print_target_ready(printer):
             try:
                 _print_raw(printer, text)
                 QMessageBox.information(self, "Test Print",
-                    f"Test receipt sent to '{printer}' successfully.")
+                    "Test receipt sent successfully.")
                 return
             except Exception as e:
                 QMessageBox.warning(self, "Test Print Failed", str(e))
                 return
-        # No printer configured — show preview
+        # Nothing configured — show preview
         _show_preview(text, "SV-TEST", self)

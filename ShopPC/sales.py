@@ -170,7 +170,7 @@ def db_imei_lookup(suffix):
     conn = get_connection()
     rows = conn.execute("""
         SELECT si.id, TRIM(si.imei) AS imei, b.name AS brand_name, m.name AS model_name,
-               m.reference_price, m.id AS model_id
+               m.reference_price, m.id AS model_id, si.purchase_price
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -186,7 +186,7 @@ def db_imei_browse_all():
     conn = get_connection()
     rows = conn.execute("""
         SELECT si.id, TRIM(si.imei) AS imei, b.name AS brand_name, m.name AS model_name,
-               m.reference_price, m.id AS model_id
+               m.reference_price, m.id AS model_id, si.purchase_price
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -714,8 +714,8 @@ class SaleForm(QWidget):
         super().__init__(parent)
         self._on_save = on_save
         self._on_cancel = on_cancel
-        self._lines = []      # (stock_item_id, model_id, brand, model, imei, ref_price, final_price)
-        self._staged = None   # (stock_item_id, model_id, brand, model, imei, ref_price)
+        self._lines = []      # (stock_item_id, model_id, brand, model, imei, ref_price, final_price, purchase_price)
+        self._staged = None   # (stock_item_id, model_id, brand, model, imei, ref_price, purchase_price)
 
         self.setStyleSheet(FORM_INPUT_STYLE)
 
@@ -926,7 +926,12 @@ class SaleForm(QWidget):
         self.price_spin.setMinimumWidth(130)
         self.price_spin.setVisible(False)
         self.price_spin.returnPressed = None
+        self.price_spin.valueChanged.connect(self._check_staged_price)
         result_row.addWidget(self.price_spin)
+
+        self.price_warn_lbl = QLabel("")
+        self.price_warn_lbl.setStyleSheet(STATUS_WARN)
+        result_row.addWidget(self.price_warn_lbl)
 
         self.btn_add_line = QPushButton("+ Add")
         self.btn_add_line.setStyleSheet(BTN_PRIMARY)
@@ -938,7 +943,7 @@ class SaleForm(QWidget):
 
         # ── Lines table ───────────────────────────────────────────────────────
         self.lines_table = _make_table(
-            ["#", "Brand", "Model", "IMEI", "Ref Price (PKR)", "Final Price (PKR)", "Disc", ""]
+            ["#", "Brand", "Model", "IMEI", "Ref Price (PKR)", "Final Price (PKR)", "Disc", "Warning", ""]
         )
         _lh = self.lines_table.horizontalHeader()
         _lh.setStretchLastSection(False)
@@ -949,12 +954,13 @@ class SaleForm(QWidget):
         _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Ref Price
         _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Final Price
         _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Disc
-        _lh.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        _lh.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)     # Warning
+        _lh.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)       # Remove btn
         self.lines_table.setColumnWidth(0, 35)
         self.lines_table.setColumnWidth(4, 130)
         self.lines_table.setColumnWidth(5, 140)
         self.lines_table.setColumnWidth(6, 90)
-        self.lines_table.setColumnWidth(7, 80)
+        self.lines_table.setColumnWidth(8, 80)
         self.lines_table.setMinimumHeight(360)
         self.lines_table.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked |
@@ -1289,7 +1295,8 @@ class SaleForm(QWidget):
             None,
         )
         self._staged = (r["id"], r["model_id"], r["brand_name"],
-                        r["model_name"], r["imei"], r["reference_price"])
+                        r["model_name"], r["imei"], r["reference_price"],
+                        r["purchase_price"])
         self.lookup_status.setText(
             f"Found: {r['brand_name']} {r['model_name']}  ·  IMEI: {r['imei']}  "
             f"·  Ref: PKR {fmt_pkr(r['reference_price'])}"
@@ -1300,6 +1307,7 @@ class SaleForm(QWidget):
         self.price_label.setVisible(True)
         self.price_spin.setVisible(True)
         self.btn_add_line.setVisible(True)
+        self._check_staged_price()
         self.price_spin.setFocus()
         self.price_spin.selectAll()
 
@@ -1309,14 +1317,29 @@ class SaleForm(QWidget):
         self.lookup_status.setStyleSheet(style)
         self.price_label.setVisible(False)
         self.price_spin.setVisible(False)
+        self.price_warn_lbl.setText("")
         self.btn_add_line.setVisible(False)
+
+    # ── Below-cost staging check ──────────────────────────────────────────────
+
+    def _check_staged_price(self):
+        if self._staged is None:
+            self.price_warn_lbl.setText("")
+            return
+        pp = self._staged[6]
+        if pp is not None and self.price_spin.value() < pp:
+            self.price_warn_lbl.setText(
+                f"⚠ Selling below cost — Purchase price: Rs. {fmt_pkr(pp)}"
+            )
+        else:
+            self.price_warn_lbl.setText("")
 
     # ── Line management ───────────────────────────────────────────────────────
 
     def _add_line(self):
         if self._staged is None:
             return
-        stock_id, model_id, brand, model, imei, ref_price = self._staged
+        stock_id, model_id, brand, model, imei, ref_price, purchase_price = self._staged
         final_price = self.price_spin.value()
 
         # Check not already in this sale
@@ -1324,13 +1347,13 @@ class SaleForm(QWidget):
             QMessageBox.warning(self, "Duplicate", f"IMEI {imei} already added to this sale.")
             return
 
-        self._lines.append((stock_id, model_id, brand, model, imei, ref_price, final_price))
+        self._lines.append((stock_id, model_id, brand, model, imei, ref_price, final_price, purchase_price))
 
         # Sync all existing lines of the same model to this price
         for i in range(len(self._lines)):
             if self._lines[i][1] == model_id:
-                sid, mid, b, m, im, ref, _ = self._lines[i]
-                self._lines[i] = (sid, mid, b, m, im, ref, final_price)
+                sid, mid, b, m, im, ref, _, pp = self._lines[i]
+                self._lines[i] = (sid, mid, b, m, im, ref, final_price, pp)
 
         self._refresh_lines_table()
         self._imei_dropdown.hide()
@@ -1341,7 +1364,7 @@ class SaleForm(QWidget):
     def _refresh_lines_table(self):
         self.lines_table.blockSignals(True)
         self.lines_table.setRowCount(0)
-        for idx, (sid, mid, brand, model, imei, ref, final) in enumerate(self._lines):
+        for idx, (sid, mid, brand, model, imei, ref, final, pp) in enumerate(self._lines):
             r = self.lines_table.rowCount()
             self.lines_table.insertRow(r)
 
@@ -1376,10 +1399,19 @@ class SaleForm(QWidget):
                 disc_item.setForeground(Qt.GlobalColor.red)
             self.lines_table.setItem(r, 6, disc_item)
 
+            # Warning column (col 7)
+            warn_item = QTableWidgetItem()
+            warn_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if pp is not None and final < pp:
+                warn_item.setText(f"⚠ Selling below cost — Purchase price: Rs. {fmt_pkr(pp)}")
+                warn_item.setForeground(QBrush(QColor("#d97706")))
+                warn_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            self.lines_table.setItem(r, 7, warn_item)
+
             del_btn = QPushButton("Remove")
             del_btn.setStyleSheet(BTN_DANGER_SMALL)
             del_btn.clicked.connect(lambda _, i=idx: self._remove_line(i))
-            self.lines_table.setCellWidget(r, 7, del_btn)
+            self.lines_table.setCellWidget(r, 8, del_btn)
 
         self.lines_table.blockSignals(False)
         self._update_total()
@@ -1404,8 +1436,8 @@ class SaleForm(QWidget):
         model_id = self._lines[row][1]
         for i in range(len(self._lines)):
             if self._lines[i][1] == model_id:
-                sid, mid, b, m, im, ref, _ = self._lines[i]
-                self._lines[i] = (sid, mid, b, m, im, ref, new_price)
+                sid, mid, b, m, im, ref, _, pp = self._lines[i]
+                self._lines[i] = (sid, mid, b, m, im, ref, new_price, pp)
         self._refresh_lines_table()
 
     def _remove_line(self, idx):
@@ -1468,7 +1500,24 @@ class SaleForm(QWidget):
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
         note = ""
         overall_discount = self.discount_spin.value()
-        db_lines = [(s, m, imei, ref, final) for s, m, _, _, imei, ref, final in self._lines]
+        db_lines = [(s, m, imei, ref, final) for s, m, _, _, imei, ref, final, _pp in self._lines]
+
+        # ── Below-cost confirmation ───────────────────────────────────────────
+        below_cost = any(pp is not None and final < pp
+                         for _, _, _, _, _, _, final, pp in self._lines)
+        if below_cost:
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Below Cost Warning")
+            dlg.setText(
+                "One or more items are being sold below purchase price.\n"
+                "Do you want to continue?"
+            )
+            dlg.setIcon(QMessageBox.Icon.Warning)
+            btn_continue = dlg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+            dlg.addButton("Go Back", QMessageBox.ButtonRole.RejectRole)
+            dlg.exec()
+            if dlg.clickedButton() != btn_continue:
+                return
 
         # ── Resolve payment method ────────────────────────────────────────────
         if self._sale_type == "credit":
