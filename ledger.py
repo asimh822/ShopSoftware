@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QMessageBox, QHeaderView, QAbstractItemView,
     QFrame, QButtonGroup, QRadioButton,
 )
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QDate, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QBrush
 
 from database import (
@@ -685,6 +685,25 @@ def _make_three_way_toggle(label_a, label_b, label_c):
     return row, btn_a, btn_b, btn_c
 
 
+class _AmountSpinBox(QDoubleSpinBox):
+    """
+    Amount spinbox with two-Enter UX:
+      1st Enter — commits the typed value (standard spinbox behaviour)
+      2nd Enter — emits new_row_requested so the dialog adds another line
+    """
+    new_row_requested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.lineEdit().isModified():
+                super().keyPressEvent(event)   # first Enter: commit value
+            else:
+                self.new_row_requested.emit()  # second Enter: new row
+        else:
+            super().keyPressEvent(event)
+
+
 class MultiLineCpCrDialog(QDialog):
     """
     Multi-line Cash Payment (CP) or Cash Receipt (CR) voucher.
@@ -845,13 +864,14 @@ class MultiLineCpCrDialog(QDialog):
         ref_edit = QLineEdit()
         ref_edit.setPlaceholderText("Optional")
 
-        amount_spin = QDoubleSpinBox()
+        amount_spin = _AmountSpinBox()
         amount_spin.setRange(0.01, 99_999_999)
         amount_spin.setDecimals(0)
         amount_spin.setSingleStep(1000)
         amount_spin.setGroupSeparatorShown(True)
         amount_spin.setValue(0)
         amount_spin.valueChanged.connect(self._update_total)
+        amount_spin.new_row_requested.connect(self._add_row)
 
         rem_btn = QPushButton("✕")
         rem_btn.setStyleSheet(
