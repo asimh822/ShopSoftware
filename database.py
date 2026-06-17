@@ -227,6 +227,10 @@ def _run_migrations(conn) -> None:
         8: _migrate_v8,
         9: _migrate_v9,
         10: _migrate_v10,
+        11: _migrate_v11,
+        12: _migrate_v12,
+        13: _migrate_v13,
+        14: _migrate_v14,
     }
 
     current = _get_db_version(conn)
@@ -732,6 +736,227 @@ def _migrate_v10(conn) -> None:
         pass  # Column already exists
 
 
+def _migrate_v14(conn) -> None:
+    """
+    Version 14 — Expense Categories + 'expense' party_type in payments/journal_entries.
+    1. Creates expense_categories table and seeds default categories.
+    2. Rebuilds payments to add 'expense' to party_type CHECK and add payment_method column.
+    3. Rebuilds journal_entries to add 'expense' to party_type CHECK.
+    All rebuilds are idempotent — skip if 'expense' is already in the constraint.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    # 1. Create and seed expense_categories
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS expense_categories (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL
+        )
+    """)
+    for cat in ["Rent", "Salaries", "Electricity", "Internet", "Travel", "Miscellaneous"]:
+        c.execute(
+            "INSERT INTO expense_categories (name) "
+            "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM expense_categories WHERE name=?)",
+            (cat, cat),
+        )
+
+    # 2. Rebuild payments: add 'expense' to CHECK + add payment_method column
+    pay = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'"
+    ).fetchone()
+    if pay and "'expense'" not in pay[0]:
+        c.execute("ALTER TABLE payments RENAME TO _payments_v14_old")
+        c.execute("""
+            CREATE TABLE payments (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                voucher_number TEXT NOT NULL,
+                party_type     TEXT CHECK(party_type IN ('supplier','customer','other','expense')),
+                party_id       INTEGER NOT NULL,
+                date           TEXT NOT NULL,
+                amount         REAL NOT NULL,
+                type           TEXT CHECK(type IN ('CP','CR')),
+                notes          TEXT,
+                reference      TEXT,
+                payment_method TEXT CHECK(payment_method IN ('cash','bank')) DEFAULT 'cash'
+            )
+        """)
+        c.execute("""
+            INSERT INTO payments
+                (id, voucher_number, party_type, party_id, date, amount, type, notes, reference)
+            SELECT id, voucher_number, party_type, party_id, date, amount, type, notes, reference
+            FROM _payments_v14_old
+        """)
+        c.execute("DROP TABLE _payments_v14_old")
+
+    # 3. Rebuild journal_entries: add 'expense' to party_type CHECK
+    je = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_entries'"
+    ).fetchone()
+    if je and "'expense'" not in je[0]:
+        c.execute("ALTER TABLE journal_entries RENAME TO _je_v14_old")
+        c.execute("""
+            CREATE TABLE journal_entries (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                jv_number  TEXT NOT NULL,
+                party_type TEXT CHECK(party_type IN ('supplier','customer','other','expense')),
+                party_id   INTEGER NOT NULL,
+                date       TEXT NOT NULL,
+                amount     REAL NOT NULL,
+                type       TEXT CHECK(type IN ('debit','credit')),
+                notes      TEXT
+            )
+        """)
+        c.execute("""
+            INSERT INTO journal_entries
+                (id, jv_number, party_type, party_id, date, amount, type, notes)
+            SELECT id, jv_number, party_type, party_id, date, amount, type, notes
+            FROM _je_v14_old
+        """)
+        c.execute("DROP TABLE _je_v14_old")
+
+
+_SUPABASE_SYNC_TABLES = [
+    "suppliers", "customers", "bank_accounts", "purchase_vouchers",
+    "sale_vouchers", "sale_lines", "stock_items", "models", "brands",
+    "payments", "journal_entries", "purchase_returns", "sale_returns",
+    "bank_transactions", "cash_journal_lines", "expenses",
+]
+
+
+def _migrate_v11(conn) -> None:
+    """
+    Version 11 — Supabase sync support.
+    Adds last_modified column to all sync-tracked tables and creates
+    INSERT/UPDATE triggers to keep it current automatically.
+    Also seeds the last_supabase_sync setting used by supabase_sync.py.
+
+    NOTE: Uses string literal default '2000-01-01 00:00:01' instead of
+    CURRENT_TIMESTAMP because SQLite < 3.37.0 rejects non-constant defaults
+    in ALTER TABLE ADD COLUMN. _migrate_v12 backfills existing rows.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    for table in _SUPABASE_SYNC_TABLES:
+        # String literal default works on all SQLite versions
+        try:
+            c.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                f"last_modified TEXT DEFAULT '2000-01-01 00:00:01'"
+            )
+        except Exception:
+            pass  # column already exists
+
+        # UPDATE trigger
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_update
+            AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+        # INSERT trigger
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_insert
+            AFTER INSERT ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+    # Seed the sync timestamp — ignored if already present
+    c.execute(
+        "INSERT OR IGNORE INTO settings (key, value) "
+        "VALUES ('last_supabase_sync', '2000-01-01 00:00:00')"
+    )
+
+
+def _migrate_v12(conn) -> None:
+    """
+    Version 12 — Backfill last_modified on existing rows.
+    On databases where v11 ran but the ADD COLUMN silently failed (SQLite < 3.37.0
+    rejects CURRENT_TIMESTAMP as a default in ALTER TABLE), the column is missing.
+    This migration adds it via a string literal (always works) then stamps all
+    existing rows with CURRENT_TIMESTAMP so the next Supabase sync picks them up.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    for table in _SUPABASE_SYNC_TABLES:
+        existing = [
+            r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        if 'last_modified' not in existing:
+            try:
+                c.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    f"last_modified TEXT DEFAULT '2000-01-01 00:00:01'"
+                )
+            except Exception as e:
+                print(f"[migrate_v12] Cannot add last_modified to {table}: {e}")
+                continue
+
+        # Stamp every row that still has the placeholder (or NULL) so the
+        # first Supabase sync sees them all as "changed since epoch".
+        c.execute(
+            f"UPDATE {table} SET last_modified = CURRENT_TIMESTAMP "
+            f"WHERE last_modified IS NULL "
+            f"   OR last_modified = '2000-01-01 00:00:01'"
+        )
+
+
+def _migrate_v13(conn) -> None:
+    """
+    Version 13 — Extend Supabase sync to bank_transactions, cash_journal_lines,
+    and expenses. Adds last_modified column and INSERT/UPDATE triggers so the
+    sync service picks up changes to these tables incrementally.
+    Also backfills existing rows so the next sync pushes them all to Supabase.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    for table in ["bank_transactions", "cash_journal_lines", "expenses"]:
+        # String literal default — works on all SQLite versions (< 3.37.0 safe)
+        try:
+            c.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                f"last_modified TEXT DEFAULT '2000-01-01 00:00:01'"
+            )
+        except Exception:
+            pass  # column already exists
+
+        # UPDATE trigger
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_update
+            AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+        # INSERT trigger
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_insert
+            AFTER INSERT ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+        # Backfill existing rows so the first sync picks them all up
+        c.execute(
+            f"UPDATE {table} SET last_modified = CURRENT_TIMESTAMP "
+            f"WHERE last_modified IS NULL "
+            f"   OR last_modified = '2000-01-01 00:00:01'"
+        )
+
+
 # ── Expense helpers ───────────────────────────────────────────────────────────
 
 EXPENSE_CATEGORIES = [
@@ -742,6 +967,116 @@ EXPENSE_CATEGORIES = [
     "Travel",
     "Miscellaneous",
 ]
+
+
+def db_expense_categories() -> list:
+    """Return all expense category rows [{id, name}, ...] from expense_categories table."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, name FROM expense_categories ORDER BY name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def db_all_expenses_combined(from_iso: str = '', to_iso: str = '',
+                              category: str = '') -> dict:
+    """
+    Combined expense data from both legacy 'expenses' table (EXP-XXXX) and
+    new payments/journal_entries rows where party_type='expense'.
+
+    Returns same structure as db_expenses_by_category():
+        {"rows": [{category, count, total}], "detail": [...], "grand_total", "grand_count"}
+    """
+    def _de(col):
+        return f"substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2)"
+
+    conn = get_connection()
+    conds_e, params_e = [], []
+    conds_p, params_p = ["p.party_type='expense'", "p.type='CP'"], []
+
+    if from_iso:
+        conds_e.append(f"{_de('e.date')} >= ?"); params_e.append(from_iso)
+        conds_p.append(f"{_de('p.date')} >= ?"); params_p.append(from_iso)
+    if to_iso:
+        conds_e.append(f"{_de('e.date')} <= ?"); params_e.append(to_iso)
+        conds_p.append(f"{_de('p.date')} <= ?"); params_p.append(to_iso)
+    if category:
+        conds_e.append("e.category = ?"); params_e.append(category)
+        conds_p.append("ec.name = ?");    params_p.append(category)
+
+    where_e = ("WHERE " + " AND ".join(conds_e)) if conds_e else ""
+    where_p = ("WHERE " + " AND ".join(conds_p)) if conds_p else ""
+
+    # Legacy rows
+    legacy = conn.execute(f"""
+        SELECT e.expense_number voucher_number, e.date,
+               e.category, COALESCE(e.description,'') description,
+               e.amount, COALESCE(e.payment_method,'cash') payment_method,
+               COALESCE(ba.name,'') bank_name
+        FROM expenses e
+        LEFT JOIN bank_accounts ba ON ba.id = e.bank_account_id
+        {where_e}
+        ORDER BY {_de('e.date')}, e.id
+    """, params_e).fetchall()
+
+    # New CP payments rows
+    new_cp = conn.execute(f"""
+        SELECT p.voucher_number, p.date,
+               COALESCE(ec.name, '?') category,
+               COALESCE(p.notes,'') description,
+               p.amount, COALESCE(p.payment_method,'cash') payment_method,
+               '' bank_name
+        FROM payments p
+        LEFT JOIN expense_categories ec ON ec.id = p.party_id
+        {where_p}
+        ORDER BY {_de('p.date')}, p.id
+    """, params_p).fetchall()
+
+    detail = []
+    for r in legacy:
+        detail.append({
+            "expense_number": r["voucher_number"], "date": r["date"],
+            "category": r["category"], "description": r["description"],
+            "amount": float(r["amount"] or 0), "payment_method": r["payment_method"],
+            "bank_name": r["bank_name"],
+        })
+    for r in new_cp:
+        detail.append({
+            "expense_number": r["voucher_number"], "date": r["date"],
+            "category": r["category"], "description": r["description"],
+            "amount": float(r["amount"] or 0), "payment_method": r["payment_method"],
+            "bank_name": r["bank_name"],
+        })
+
+    # Sort combined detail by ISO date
+    detail.sort(key=lambda d: (
+        d["date"][6:10] + "-" + d["date"][3:5] + "-" + d["date"][0:2]
+        if len(d["date"]) == 10 else d["date"]
+    ))
+
+    # Group by category
+    from collections import defaultdict
+    cat_map = defaultdict(lambda: {"count": 0, "total": 0.0})
+    for d in detail:
+        cat_map[d["category"]]["count"] += 1
+        cat_map[d["category"]]["total"] += d["amount"]
+
+    rows = sorted(
+        [{"category": k, "count": v["count"], "total": v["total"]}
+         for k, v in cat_map.items()],
+        key=lambda r: r["total"], reverse=True,
+    )
+    grand_total = sum(r["total"] for r in rows)
+    grand_count = sum(r["count"] for r in rows)
+
+    conn.close()
+    return {"rows": rows, "detail": detail,
+            "grand_total": grand_total, "grand_count": grand_count}
 
 
 def db_save_expense(date_str: str, category: str, description: str,
@@ -1120,6 +1455,17 @@ def _jv_side(c, jv_number: str, date_str: str, notes: str,
             "VALUES (?,?,?,?,?)",
             (jv_number, date_str, amount, direction, notes),
         )
+    elif acct_type == "expense":
+        # Dr Expense → expense incurred; Cr Expense → expense reversed/refunded.
+        # Stored in journal_entries so the Expense Report can pick it up.
+        # JV expenses are excluded from the Cash Book (as per system rules).
+        jt = "debit" if is_debit else "credit"
+        c.execute(
+            "INSERT INTO journal_entries "
+            "(jv_number, party_type, party_id, date, amount, type, notes) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (jv_number, "expense", acct_id, date_str, amount, jt, notes),
+        )
     elif acct_type == "income":
         # Cr Income → income earned (balance ↑); Dr Income → reversal (balance ↓).
         # Income has no dated ledger of its own — only a running balance.
@@ -1281,7 +1627,13 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='supplier' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
+        # Sales to this supplier reduce their balance (they owe us / we owe them less)
+        sac = conn.execute(
+            "SELECT COALESCE(SUM(total_amount), 0) FROM sale_vouchers "
+            "WHERE supplier_as_customer_id=?",
+            (party_id,)
+        ).fetchone()[0]
+        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) - float(sac)
 
     else:  # customer
         # Credit sales → DR (customer owes more)
@@ -1311,7 +1663,13 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='customer' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) - float(jv_cr)
+        # Purchases from this customer reduce their balance (we owe them / they owe us less)
+        cas = conn.execute(
+            "SELECT COALESCE(SUM(total_amount), 0) FROM purchase_vouchers "
+            "WHERE customer_as_supplier_id=?",
+            (party_id,)
+        ).fetchone()[0]
+        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) - float(jv_cr) - float(cas)
 
 
 def db_bank_account_closing_balance(account_id: int) -> float:

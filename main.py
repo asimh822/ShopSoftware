@@ -21,7 +21,6 @@ from masters import MastersPage
 from purchase import PurchasePage
 from sales import SalePage
 from ledger import LedgerPage
-from expenses import ExpensesPage
 from reports import ReportsPage
 from whatsapp_page import WhatsAppPage
 from settings_page import SettingsPage
@@ -110,7 +109,6 @@ NAV_ITEMS = [
     ("Vouchers",         "vouchers"),
     ("Ledger",           "ledger"),
     ("Capital",          "capital"),
-    ("Expenses",         "expenses"),
     ("Reports",          "reports"),
     ("Bal. Sheet",       "balance_sheet"),
     ("WhatsApp",         "whatsapp"),
@@ -1598,7 +1596,6 @@ class MainWindow(QMainWindow):
         self._register_page("vouchers", VouchersPage())
         self._register_page("ledger", LedgerPage())
         self._register_page("capital", CapitalPage())
-        self._register_page("expenses", ExpensesPage())
         self._register_page("reports", ReportsPage())
         self._register_page("balance_sheet", BalanceSheetPage())
         self._register_page("whatsapp", WhatsAppPage())

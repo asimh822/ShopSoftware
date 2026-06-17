@@ -18,6 +18,7 @@ from database import (
     get_connection, db_incentives_income_total, get_setting,
     db_cash_in_hand, db_bank_accounts, db_bank_account_closing_balance,
     _party_closing_balance, EXPENSE_CATEGORIES,
+    db_expense_categories, db_all_expenses_combined,
 )
 
 # ── Shared styles ─────────────────────────────────────────────────────────────
@@ -406,11 +407,13 @@ def db_sales_report(from_iso=None, to_iso=None, sale_type=None, salesman_id=None
     conn = get_connection()
     rows = conn.execute(f"""
         SELECT sv.date, sv.sv_number,
-               COALESCE(c.name, sv.cash_customer_name) customer,
+               COALESCE(c.name, sv.cash_customer_name,
+                        sup.name || ' (Supplier)', '—') customer,
                sv.type, COUNT(sl.id) items, sv.total_amount, sv.discount,
                COALESCE(sm.name, '—') salesman
         FROM sale_vouchers sv
         LEFT JOIN customers c ON c.id = sv.customer_id
+        LEFT JOIN suppliers sup ON sup.id = sv.supplier_as_customer_id
         LEFT JOIN sale_lines sl ON sl.sv_id = sv.id
         LEFT JOIN salesmen sm ON sm.id = sv.salesman_id
         {where}
@@ -442,12 +445,13 @@ def db_purchase_report(from_iso=None, to_iso=None, supplier_id=None,
     conn = get_connection()
     rows = conn.execute(f"""
         SELECT pv.date, pv.pv_number,
-               COALESCE(s.name, 'Cash Purchase') supplier,
+               COALESCE(s.name, c.name || ' (Customer)', 'Cash Purchase') supplier,
                COUNT(pl.id) items, pv.total_amount,
                COALESCE(pv.purchase_type, 'supplier') purchase_type,
                COALESCE(pv.egadget_ref, '') egadget_ref
         FROM purchase_vouchers pv
-        LEFT JOIN suppliers s ON s.id = pv.supplier_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id AND pv.supplier_id != 0
+        LEFT JOIN customers c ON c.id = pv.customer_as_supplier_id
         LEFT JOIN purchase_lines pl ON pl.pv_id = pv.id
         {where}
         GROUP BY pv.id
@@ -662,24 +666,38 @@ def db_cash_book(date_str: str) -> dict:
     # 2. Payments (CP = cash out, CR = cash in)
     payments = conn.execute(f"""
         SELECT p.date, p.voucher_number, p.type, p.amount, p.party_type,
-               COALESCE(s.name, c.name, '?') party_name
+               p.notes,
+               COALESCE(s.name, c.name, op.name, ec.name, '?') party_name
         FROM payments p
-        LEFT JOIN suppliers s ON p.party_type='supplier' AND s.id=p.party_id
-        LEFT JOIN customers c ON p.party_type='customer' AND c.id=p.party_id
+        LEFT JOIN suppliers s      ON p.party_type='supplier' AND s.id=p.party_id
+        LEFT JOIN customers c      ON p.party_type='customer' AND c.id=p.party_id
+        LEFT JOIN other_parties op ON p.party_type='other'    AND op.id=p.party_id
+        LEFT JOIN expense_categories ec ON p.party_type='expense' AND ec.id=p.party_id
         WHERE {de_p}=?
         ORDER BY p.voucher_number
     """, (iso,)).fetchall()
 
     for p in payments:
-        name = p["party_name"]
-        amt  = float(p["amount"] or 0)
+        name  = p["party_name"]
+        amt   = float(p["amount"] or 0)
+        ptype = p["party_type"]
         if p["type"] == "CP":
+            if ptype == "expense":
+                desc = f"Expense — {name}"
+                if p["notes"]:
+                    desc += f" ({p['notes']})"
+            else:
+                desc = f"Payment — {name}"
             rows.append({"date": p["date"], "voucher": p["voucher_number"],
-                         "description": f"Payment — {name}",
+                         "description": desc,
                          "cash_in": 0.0, "cash_out": amt})
         else:  # CR
+            if ptype == "expense":
+                desc = f"Expense Refund — {name}"
+            else:
+                desc = f"Receipt — {name}"
             rows.append({"date": p["date"], "voucher": p["voucher_number"],
-                         "description": f"Receipt — {name}",
+                         "description": desc,
                          "cash_in": amt, "cash_out": 0.0})
 
     # 3. Bank transfers (source='cash_transfer' only — JV-only entries excluded)
@@ -1527,14 +1545,22 @@ class ProfitReportTab(QWidget):
             self.daily_table.setItem(drow, 5, margin_item)
         self.daily_table.setSortingEnabled(True)
 
-        # ── Expenses for the same date range ──────────────────────────────
+        # ── Expenses for the same date range (legacy + new CP payments) ──────
         conn = get_connection()
         de_e = "substr(e.date,7,4)||'-'||substr(e.date,4,2)||'-'||substr(e.date,1,2)"
-        total_expenses = float(conn.execute(
+        de_p = "substr(p.date,7,4)||'-'||substr(p.date,4,2)||'-'||substr(p.date,1,2)"
+        legacy_exp = float(conn.execute(
             f"SELECT COALESCE(SUM(e.amount),0) FROM expenses e"
             f" WHERE {de_e} >= ? AND {de_e} <= ?",
             (from_iso, to_iso),
         ).fetchone()[0] or 0)
+        new_exp = float(conn.execute(
+            f"SELECT COALESCE(SUM(p.amount),0) FROM payments p"
+            f" WHERE p.party_type='expense' AND p.type='CP'"
+            f" AND {de_p} >= ? AND {de_p} <= ?",
+            (from_iso, to_iso),
+        ).fetchone()[0] or 0)
+        total_expenses = legacy_exp + new_exp
         conn.close()
 
         # ── Incentives income earned to date (running income account balance) ──
@@ -2411,6 +2437,9 @@ class ExpensesReportTab(QWidget):
         self.cat_combo.addItem("All Categories", "")
         for c in EXPENSE_CATEGORIES:
             self.cat_combo.addItem(c, c)
+        for ec in db_expense_categories():
+            if ec["name"] not in EXPENSE_CATEGORIES:
+                self.cat_combo.addItem(ec["name"], ec["name"])
         self.cat_combo.setMinimumWidth(140)
         fl.addWidget(self.cat_combo)
 
@@ -2472,7 +2501,7 @@ class ExpensesReportTab(QWidget):
         to_iso   = self.to_date.date().toString("yyyy-MM-dd")
         category = self.cat_combo.currentData()
 
-        data = db_expenses_by_category(from_iso, to_iso, category)
+        data = db_all_expenses_combined(from_iso, to_iso, category)
 
         # ── Populate summary table ────────────────────────────────────────
         self.summary_table.setSortingEnabled(False)
