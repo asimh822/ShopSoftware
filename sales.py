@@ -863,7 +863,7 @@ class SaleForm(QWidget):
         cash_row.addWidget(self.cash_contact)
 
         self.contact_status_lbl = QLabel("")
-        self.contact_status_lbl.setMinimumWidth(110)
+        self.contact_status_lbl.setMinimumWidth(24)
         cash_row.addWidget(self.contact_status_lbl)
 
         cash_row.addWidget(QLabel("Customer Name *:"))
@@ -1259,19 +1259,13 @@ class SaleForm(QWidget):
             return
 
         if not validate_phone(text):
-            remaining = 11 - len(text)
-            if len(text) < 11:
-                hint = f"Need {remaining} more digit(s)"
-            else:
-                hint = "Must be 11 digits starting with 03"
-            self.contact_status_lbl.setText(hint)
-            self.contact_status_lbl.setStyleSheet(STATUS_ERR)
+            self.contact_status_lbl.setText("")
             self.cash_name.setEnabled(False)
             self.cash_name.clear()
             return
 
         # Valid number
-        self.contact_status_lbl.setText("Valid ✓")
+        self.contact_status_lbl.setText("✓")
         self.contact_status_lbl.setStyleSheet(STATUS_OK)
         self.cash_name.setEnabled(True)
 
