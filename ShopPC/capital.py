@@ -610,12 +610,18 @@ class CapitalPage(QWidget):
         layout.addLayout(header_row)
 
         # ── Total Capital Summary ──
-        self.total_label = QLabel("Total Capital: Rs. 0")
+        total_row = QHBoxLayout()
+        total_lbl_heading = QLabel("Total Capital:")
+        total_lbl_heading.setStyleSheet("font-size:11px;color:#475569;font-weight:bold;")
+        self.total_label = QLabel("Rs. 0")
         self.total_label.setStyleSheet(
-            "background:#1a3a5c;color:white;padding:10px 16px;"
-            "border-radius:6px;font-size:14px;font-weight:bold;"
+            "background:#1a3a5c;color:white;padding:4px 14px;"
+            "border-radius:4px;font-size:13px;font-weight:bold;"
         )
-        layout.addWidget(self.total_label)
+        total_row.addWidget(total_lbl_heading)
+        total_row.addWidget(self.total_label)
+        total_row.addStretch()
+        layout.addLayout(total_row)
 
         # ── Splitter: investor list (left) | transactions (right) ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -785,7 +791,7 @@ class CapitalPage(QWidget):
             )
             self._adj_btn.setToolTip("One-time: zero out dummy Opening Stock supplier balance")
 
-        self.total_label.setText(f"Total Capital: {fmt(total)}")
+        self.total_label.setText(fmt(total))
 
     def _investor_selected(self):
         rows = self.investor_table.selectedItems()

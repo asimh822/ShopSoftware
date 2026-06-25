@@ -536,58 +536,36 @@ class PurchaseReturnForm(QWidget):
         layout.setSpacing(12)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
-        # ── Title bar ─────────────────────────────────────────────────────────
-        top = QHBoxLayout()
-        title = QLabel("New Purchase Return")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        top.addWidget(title)
-        top.addStretch()
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet(BTN_SECONDARY)
-        btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Return")
-        self.btn_save.setStyleSheet(BTN_PRIMARY)
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(self._save)
-        top.addWidget(btn_cancel)
-        top.addWidget(self.btn_save)
-        layout.addLayout(top)
-
         # ── Header card ───────────────────────────────────────────────────────
         header = QFrame()
         header.setStyleSheet(CARD_STYLE)
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(16, 12, 16, 12)
-        hl.setSpacing(16)
+        hl.setContentsMargins(12, 8, 12, 8)
+        hl.setSpacing(8)
 
-        dc = QVBoxLayout()
-        dc.addWidget(QLabel("Return Date"))
+        hl.addWidget(QLabel("Return Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setMinimumWidth(130)
-        dc.addWidget(self.date_edit)
-        hl.addLayout(dc)
+        hl.addWidget(self.date_edit)
 
-        sc = QVBoxLayout()
-        sc.addWidget(QLabel("Supplier *"))
+        hl.addSpacing(8)
+        hl.addWidget(QLabel("Supplier *:"))
         self.supplier_combo = SearchableComboBox()
         self.supplier_combo.setMinimumWidth(200)
         self.supplier_combo.addItem("— Select Supplier —", None)
         for s in db_suppliers_list():
             self.supplier_combo.addItem(s["name"], s["id"])
         self.supplier_combo.currentIndexChanged.connect(self._on_supplier_changed)
-        sc.addWidget(self.supplier_combo)
-        hl.addLayout(sc)
+        hl.addWidget(self.supplier_combo)
 
-        nc = QVBoxLayout()
-        nc.addWidget(QLabel("Notes (optional)"))
+        hl.addSpacing(8)
+        hl.addWidget(QLabel("Notes (optional):"))
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Reason for return")
         self.notes_edit.setMinimumWidth(220)
-        nc.addWidget(self.notes_edit)
-        hl.addLayout(nc)
+        hl.addWidget(self.notes_edit)
 
         hl.addStretch()
         layout.addWidget(header)
@@ -643,14 +621,24 @@ class PurchaseReturnForm(QWidget):
         self.lines_table.setColumnWidth(6, 80)
         layout.addWidget(self.lines_table, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
-        footer = QHBoxLayout()
-        footer.addStretch()
+        # ── Pinned footer strip ───────────────────────────────────────────────
+        footer_strip = QHBoxLayout()
+        footer_strip.setSpacing(8)
         self.total_label = QLabel("Return Total: PKR 0")
         self.total_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_label.setStyleSheet("color:#dc2626;")
-        footer.addWidget(self.total_label)
-        layout.addLayout(footer)
+        footer_strip.addWidget(self.total_label)
+        footer_strip.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(on_cancel)
+        self.btn_save = QPushButton("Save Return")
+        self.btn_save.setStyleSheet(BTN_PRIMARY)
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._save)
+        footer_strip.addWidget(btn_cancel)
+        footer_strip.addWidget(self.btn_save)
+        layout.addLayout(footer_strip)
 
     # ── Supplier / IMEI events ────────────────────────────────────────────────
 
@@ -848,6 +836,16 @@ class PurchaseReturnListView(QWidget):
         self.btn_edit_pr.setEnabled(False)
         self.btn_edit_pr.clicked.connect(self._edit_selected)
         top.addWidget(self.btn_edit_pr)
+        self.btn_delete_pr = QPushButton("🗑 Delete")
+        self.btn_delete_pr.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+            QPushButton:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; }
+        """)
+        self.btn_delete_pr.setEnabled(False)
+        self.btn_delete_pr.clicked.connect(self._delete_selected)
+        top.addWidget(self.btn_delete_pr)
         btn_new = QPushButton("+ New Return")
         btn_new.setStyleSheet(BTN_PRIMARY)
         btn_new.clicked.connect(on_new)
@@ -901,6 +899,9 @@ class PurchaseReturnListView(QWidget):
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit_pr.setEnabled(self.table.currentRow() >= 0)
         )
+        self.table.itemSelectionChanged.connect(
+            lambda: self.btn_delete_pr.setEnabled(self.table.currentRow() >= 0)
+        )
         layout.addWidget(self.table, stretch=1)
 
         self.refresh()
@@ -947,6 +948,18 @@ class PurchaseReturnListView(QWidget):
             "purchase_return", pr["id"], pr["pr_number"], pr["date"], pr["notes"], self
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        pr = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "purchase_return", pr["id"], pr["pr_number"], "Owner"
+        )
+        if deleted:
             self.refresh()
 
 
@@ -1014,9 +1027,26 @@ class PurchaseDetailDialog(QDialog):
             table.setItem(row, 3, p)
         layout.addWidget(table)
 
+        btn_delete = QPushButton("🗑 Delete Voucher")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 14px; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(lambda: self._delete_and_close(pv_row))
+        layout.addWidget(btn_delete)
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+    def _delete_and_close(self, pv_row):
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "purchase", pv_row["id"], pv_row["pv_number"], "Owner"
+        )
+        if deleted:
+            self.accept()
 
 
 # ── Purchase Form ─────────────────────────────────────────────────────────────
@@ -1037,24 +1067,14 @@ class PurchaseForm(QWidget):
         layout.setSpacing(12)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
-        # ── Title bar ────────────────────────────────────────────────────────
-        title_row = QHBoxLayout()
-        title = QLabel("New Purchase")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        title_row.addWidget(title)
-        title_row.addStretch()
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet(BTN_SECONDARY)
-        btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Purchase")
-        self.btn_save.setStyleSheet(BTN_PRIMARY)
-        self.btn_save.clicked.connect(self._save)
-        title_row.addWidget(btn_cancel)
-        title_row.addWidget(self.btn_save)
-        layout.addLayout(title_row)
+        # ── Header card ──────────────────────────────────────────────────────
+        header_card = QFrame()
+        header_card.setStyleSheet(CARD_STYLE)
+        header_layout = QHBoxLayout(header_card)
+        header_layout.setContentsMargins(12, 8, 12, 8)
+        header_layout.setSpacing(16)
 
-        # ── Purchase type toggle ──────────────────────────────────────────────
+        # Purchase type toggle (first item in header)
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(0)
         self._btn_supplier_type = QPushButton("Supplier Purchase")
@@ -1067,15 +1087,8 @@ class PurchaseForm(QWidget):
         self._btn_cash_type.clicked.connect(    lambda: self._set_purchase_type("cash"))
         toggle_row.addWidget(self._btn_supplier_type)
         toggle_row.addWidget(self._btn_cash_type)
-        toggle_row.addStretch()
-        layout.addLayout(toggle_row)
-
-        # ── Header card ──────────────────────────────────────────────────────
-        header_card = QFrame()
-        header_card.setStyleSheet(CARD_STYLE)
-        header_layout = QHBoxLayout(header_card)
-        header_layout.setContentsMargins(16, 12, 16, 12)
-        header_layout.setSpacing(16)
+        header_layout.addLayout(toggle_row)
+        header_layout.addSpacing(12)
 
         # Date
         date_col = QVBoxLayout()
@@ -1142,6 +1155,8 @@ class PurchaseForm(QWidget):
         self.egadget_ref_edit = QLineEdit()
         self.egadget_ref_edit.setPlaceholderText("Optional — eGadget reference number")
         self.egadget_ref_edit.setMinimumWidth(240)
+        self.egadget_ref_edit.returnPressed.connect(
+            lambda: self.egadget_ref_edit.focusNextChild())
         ref_row.addWidget(self.egadget_ref_edit)
         ref_row.addStretch()
         cpay_v.addLayout(ref_row)
@@ -1197,6 +1212,8 @@ class PurchaseForm(QWidget):
         self.pay_bank_ref_edit = QLineEdit()
         self.pay_bank_ref_edit.setPlaceholderText("Transfer reference number")
         self.pay_bank_ref_edit.setMinimumWidth(180)
+        self.pay_bank_ref_edit.returnPressed.connect(
+            lambda: self.pay_bank_ref_edit.focusNextChild())
         pg_bank_h.addWidget(self.pay_bank_ref_edit)
         pg_bank_h.addStretch()
         self._pay_stack.addWidget(pg_bank)
@@ -1213,6 +1230,8 @@ class PurchaseForm(QWidget):
         self.split_cash_spin.setSingleStep(1000)
         self.split_cash_spin.setGroupSeparatorShown(True)
         self.split_cash_spin.setMinimumWidth(110)
+        self.split_cash_spin.lineEdit().returnPressed.connect(
+            lambda: self.split_cash_spin.focusNextChild())
         pg_split_h.addWidget(self.split_cash_spin)
         pg_split_h.addWidget(QLabel("Bank:"))
         self.split_bank_spin = QDoubleSpinBox()
@@ -1221,6 +1240,8 @@ class PurchaseForm(QWidget):
         self.split_bank_spin.setSingleStep(1000)
         self.split_bank_spin.setGroupSeparatorShown(True)
         self.split_bank_spin.setMinimumWidth(110)
+        self.split_bank_spin.lineEdit().returnPressed.connect(
+            lambda: self.split_bank_spin.focusNextChild())
         pg_split_h.addWidget(self.split_bank_spin)
         pg_split_h.addWidget(QLabel("Account:"))
         self.split_bank_combo = QComboBox()
@@ -1231,6 +1252,8 @@ class PurchaseForm(QWidget):
         self.split_ref_edit = QLineEdit()
         self.split_ref_edit.setPlaceholderText("Bank ref (optional)")
         self.split_ref_edit.setMinimumWidth(130)
+        self.split_ref_edit.returnPressed.connect(
+            lambda: self.split_ref_edit.focusNextChild())
         pg_split_h.addWidget(self.split_ref_edit)
         pg_split_h.addStretch()
         self._pay_stack.addWidget(pg_split)
@@ -1273,6 +1296,8 @@ class PurchaseForm(QWidget):
         self.price_spin.setGroupSeparatorShown(True)
         self.price_spin.setMinimumWidth(110)
         self.price_spin.valueChanged.connect(self._on_ref_price_changed)
+        self.price_spin.lineEdit().returnPressed.connect(
+            lambda: self.price_spin.focusNextChild())
         row1.addWidget(self.price_spin)
 
         row1.addWidget(QLabel("Discount:"))
@@ -1283,6 +1308,8 @@ class PurchaseForm(QWidget):
         self.discount_spin.setGroupSeparatorShown(True)
         self.discount_spin.setMinimumWidth(100)
         self.discount_spin.valueChanged.connect(self._on_discount_changed)
+        self.discount_spin.lineEdit().returnPressed.connect(
+            lambda: self.discount_spin.focusNextChild())
         row1.addWidget(self.discount_spin)
 
         row1.addWidget(QLabel("Net Price:"))
@@ -1293,6 +1320,8 @@ class PurchaseForm(QWidget):
         self.net_price_spin.setGroupSeparatorShown(True)
         self.net_price_spin.setMinimumWidth(110)
         self.net_price_spin.valueChanged.connect(self._on_net_price_changed)
+        self.net_price_spin.lineEdit().returnPressed.connect(
+            lambda: self.net_price_spin.focusNextChild())
         row1.addWidget(self.net_price_spin)
 
         row1.addStretch()
@@ -1343,14 +1372,23 @@ class PurchaseForm(QWidget):
         self.lines_table.setColumnWidth(5, 80)
         layout.addWidget(self.lines_table, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
-        footer = QHBoxLayout()
-        footer.addStretch()
+        # ── Pinned footer strip ───────────────────────────────────────────────
+        footer_strip = QHBoxLayout()
+        footer_strip.setSpacing(8)
         self.total_label = QLabel("Total: PKR 0")
         self.total_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_label.setStyleSheet("color:#1d4ed8;")
-        footer.addWidget(self.total_label)
-        layout.addLayout(footer)
+        footer_strip.addWidget(self.total_label)
+        footer_strip.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(on_cancel)
+        self.btn_save = QPushButton("Save Purchase")
+        self.btn_save.setStyleSheet(BTN_PRIMARY)
+        self.btn_save.clicked.connect(self._save)
+        footer_strip.addWidget(btn_cancel)
+        footer_strip.addWidget(self.btn_save)
+        layout.addLayout(footer_strip)
 
     # ── Purchase type / payment method helpers ────────────────────────────────
 
@@ -1664,6 +1702,16 @@ class PurchaseListView(QWidget):
         self.btn_edit.setEnabled(False)
         self.btn_edit.clicked.connect(self._edit_selected)
         top.addWidget(self.btn_edit)
+        self.btn_delete_pv = QPushButton("🗑 Delete")
+        self.btn_delete_pv.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+            QPushButton:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; }
+        """)
+        self.btn_delete_pv.setEnabled(False)
+        self.btn_delete_pv.clicked.connect(self._delete_selected)
+        top.addWidget(self.btn_delete_pv)
         btn_new = QPushButton("+ New Purchase")
         btn_new.setStyleSheet(BTN_PRIMARY)
         btn_new.clicked.connect(on_new)
@@ -1743,6 +1791,9 @@ class PurchaseListView(QWidget):
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit.setEnabled(self.table.currentRow() >= 0)
+        )
+        self.table.itemSelectionChanged.connect(
+            lambda: self.btn_delete_pv.setEnabled(self.table.currentRow() >= 0)
         )
         layout.addWidget(self.table, stretch=1)
 
@@ -1841,6 +1892,18 @@ class PurchaseListView(QWidget):
         pv_row = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
         dlg = PurchaseDetailDialog(pv_row, self)
         dlg.exec()
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        pv_row = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "purchase", pv_row["id"], pv_row["pv_number"], "Owner"
+        )
+        if deleted:
+            self.refresh()
 
 
 # ── Purchase Page ─────────────────────────────────────────────────────────────

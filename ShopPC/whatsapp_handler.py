@@ -149,3 +149,75 @@ def get_pending_whatsapp_sales() -> list:
 
 def mark_sent_manual(sv_id: int):
     _mark_sent(sv_id)
+
+
+def send_digest_whatsapp(digest: dict) -> tuple[bool, str]:
+    """
+    Send the owner daily digest as a WhatsApp message to the number stored
+    in settings under key 'owner_whatsapp'.
+
+    digest — dict returned by build_daily_digest() from reports.py.
+    Returns (success, status_message).
+    """
+    raw_number = get_setting("owner_whatsapp") or ""
+    phone = _clean_phone(raw_number)
+    if not phone:
+        return False, "Owner WhatsApp number not set. Add it in Settings → WhatsApp."
+
+    shop_name = get_setting("shop_name") or "United Mobile"
+
+    def _pkr(val):
+        try:
+            return f"{float(val):,.0f}"
+        except Exception:
+            return "0"
+
+    lines = [
+        f"*{shop_name} — Daily Close*",
+        f"Date: {digest.get('date', '')}",
+        "",
+        f"Sales: {digest.get('sales_count', 0)} vouchers | Rs. {_pkr(digest.get('sales_total', 0))}",
+        f"Gross Profit: Rs. {_pkr(digest.get('gross_profit', 0))}",
+        f"Net Cash: Rs. {_pkr(digest.get('net_cash', 0))}",
+        f"Net Bank: Rs. {_pkr(digest.get('net_bank', 0))}",
+    ]
+
+    credit_given = digest.get("credit_given", 0)
+    credit_coll  = digest.get("credit_collected", 0)
+    if credit_given or credit_coll:
+        lines.append(
+            f"Credit Given: Rs. {_pkr(credit_given)}  |  Collected: Rs. {_pkr(credit_coll)}"
+        )
+
+    expenses = digest.get("expenses_cash", 0)
+    if expenses:
+        lines.append(f"Cash Expenses: Rs. {_pkr(expenses)}")
+
+    below = digest.get("below_cost_count", 0)
+    if below:
+        lines.append(f"⚠ {below} item(s) sold below cost")
+
+    big_disc = digest.get("biggest_discount", 0)
+    if big_disc:
+        lines.append(f"Biggest Discount: Rs. {_pkr(big_disc)}")
+
+    msg = "\n".join(lines)
+
+    try:
+        import pywhatkit
+        pywhatkit.sendwhatmsg_instantly(
+            phone_no=phone,
+            message=msg,
+            wait_time=12,
+            tab_close=True,
+            close_time=3,
+        )
+        return True, f"Daily digest sent to {phone}"
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    url = f"https://wa.me/{phone.lstrip('+')}?text={quote(msg)}"
+    webbrowser.open(url)
+    return False, f"Opened WhatsApp in browser for {phone}. Click Send."

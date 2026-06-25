@@ -322,14 +322,17 @@ class SettingsPage(QWidget):
 
         self.shop_name = QLineEdit(get_setting("shop_name") or "")
         self.shop_name.setStyleSheet(INPUT_STYLE)
+        self.shop_name.returnPressed.connect(lambda: self.shop_name.focusNextChild())
         sf.addRow("Shop Name:", self.shop_name)
 
         self.shop_address = QLineEdit(get_setting("shop_address") or "")
         self.shop_address.setStyleSheet(INPUT_STYLE)
+        self.shop_address.returnPressed.connect(lambda: self.shop_address.focusNextChild())
         sf.addRow("Address:", self.shop_address)
 
         self.shop_contact = QLineEdit(get_setting("shop_contact") or "")
         self.shop_contact.setStyleSheet(INPUT_STYLE)
+        self.shop_contact.returnPressed.connect(lambda: self.shop_contact.focusNextChild())
         sf.addRow("Contact:", self.shop_contact)
 
         layout.addWidget(shop_group)
@@ -355,6 +358,7 @@ class SettingsPage(QWidget):
         self.printer_name.setPlaceholderText(
             "e.g. Blackcopper BC-85AC — use Pick Printer to detect automatically"
         )
+        self.printer_name.returnPressed.connect(lambda: self.printer_name.focusNextChild())
 
         # Printer name field + Pick Printer button on the same row
         printer_row = QHBoxLayout()
@@ -384,12 +388,14 @@ class SettingsPage(QWidget):
         self.printer_ip = QLineEdit(get_setting("printer_ip") or "")
         self.printer_ip.setStyleSheet(INPUT_STYLE)
         self.printer_ip.setPlaceholderText("192.168.1.50")
+        self.printer_ip.returnPressed.connect(lambda: self.printer_ip.focusNextChild())
         net_row.addWidget(self.printer_ip, stretch=1)
         net_row.addWidget(QLabel("Port:"))
         self.printer_port = QLineEdit(get_setting("printer_port") or "9100")
         self.printer_port.setStyleSheet(INPUT_STYLE)
         self.printer_port.setPlaceholderText("9100")
         self.printer_port.setFixedWidth(80)
+        self.printer_port.returnPressed.connect(lambda: self.printer_port.focusNextChild())
         net_row.addWidget(self.printer_port)
         self._net_row_label = QLabel("Printer IP:")
         rf.addRow(self._net_row_label, net_row)
@@ -410,6 +416,7 @@ class SettingsPage(QWidget):
         self.receipt_footer = QLineEdit(get_setting("receipt_footer") or "")
         self.receipt_footer.setStyleSheet(INPUT_STYLE)
         self.receipt_footer.setPlaceholderText("Printed at the bottom of every receipt")
+        self.receipt_footer.returnPressed.connect(lambda: self.receipt_footer.focusNextChild())
         rf.addRow("Receipt Footer:", self.receipt_footer)
 
         btn_test_print = QPushButton("Test Print")
@@ -420,14 +427,26 @@ class SettingsPage(QWidget):
         layout.addWidget(receipt_group)
 
         # ── WhatsApp ──────────────────────────────────────────────────────────
-        wa_group = QGroupBox("WhatsApp Message Template")
+        wa_group = QGroupBox("WhatsApp")
         wa_group.setStyleSheet(GROUP_STYLE)
         wf = QVBoxLayout(wa_group)
         wf.setContentsMargins(16, 16, 16, 16)
         wf.setSpacing(8)
 
+        owner_row = QHBoxLayout()
+        owner_row.addWidget(QLabel("Owner Number:"))
+        self.owner_whatsapp = QLineEdit(get_setting("owner_whatsapp") or "")
+        self.owner_whatsapp.setStyleSheet(INPUT_STYLE)
+        self.owner_whatsapp.setPlaceholderText("03XXXXXXXXX  — receives daily digest")
+        self.owner_whatsapp.setMaxLength(11)
+        self.owner_whatsapp.returnPressed.connect(
+            lambda: self.owner_whatsapp.focusNextChild()
+        )
+        owner_row.addWidget(self.owner_whatsapp, stretch=1)
+        wf.addLayout(owner_row)
+
         var_note = QLabel(
-            "Available variables: {customer_name} {model_name} {imei} "
+            "Sale template variables: {customer_name} {model_name} {imei} "
             "{shop_name} {shop_contact} {date}"
         )
         var_note.setStyleSheet("color:#64748b; font-size:9pt;")
@@ -464,6 +483,7 @@ class SettingsPage(QWidget):
         self.pin_current.setMaxLength(6)
         self.pin_current.setValidator(digits_only)
         self.pin_current.setStyleSheet(INPUT_STYLE)
+        self.pin_current.returnPressed.connect(lambda: self.pin_current.focusNextChild())
         pf.addRow("Current PIN:", self.pin_current)
 
         self.pin_new = QLineEdit()
@@ -472,6 +492,7 @@ class SettingsPage(QWidget):
         self.pin_new.setMaxLength(6)
         self.pin_new.setValidator(digits_only)
         self.pin_new.setStyleSheet(INPUT_STYLE)
+        self.pin_new.returnPressed.connect(lambda: self.pin_new.focusNextChild())
         pf.addRow("New PIN:", self.pin_new)
 
         self.pin_confirm = QLineEdit()
@@ -480,6 +501,7 @@ class SettingsPage(QWidget):
         self.pin_confirm.setMaxLength(6)
         self.pin_confirm.setValidator(digits_only)
         self.pin_confirm.setStyleSheet(INPUT_STYLE)
+        self.pin_confirm.returnPressed.connect(lambda: self.pin_confirm.focusNextChild())
         pf.addRow("Confirm PIN:", self.pin_confirm)
 
         pin_note = QLabel("PIN must be 4–6 digits. Default PIN on first run is 0000.")
@@ -783,6 +805,7 @@ class SettingsPage(QWidget):
         set_setting("thermal_printer", self.printer_name.text().strip())
         set_setting("receipt_footer",  self.receipt_footer.text().strip())
         set_setting("whatsapp_template", self.wa_template.toPlainText().strip())
+        set_setting("owner_whatsapp",    self.owner_whatsapp.text().strip())
 
         # Printer connection mode
         set_setting("printer_mode", self.printer_mode.currentData() or "usb")
@@ -879,6 +902,7 @@ class SettingsPage(QWidget):
 
         name_edit = QLineEdit(name)
         name_edit.setPlaceholderText("e.g. MCB Current Account")
+        name_edit.returnPressed.connect(lambda: name_edit.focusNextChild())
         form.addRow("Account Name:", name_edit)
 
         bal_spin = QDoubleSpinBox()

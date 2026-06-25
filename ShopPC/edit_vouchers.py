@@ -678,6 +678,14 @@ class SaleEditDialog(QDialog):
         lbl.setStyleSheet("color:#1e293b;")
         top.addWidget(lbl)
         top.addStretch()
+        btn_delete = QPushButton("🗑 Delete")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(self._delete_and_close)
+        top.addWidget(btn_delete)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(self.reject)
@@ -1161,6 +1169,14 @@ class SaleEditDialog(QDialog):
         QMessageBox.information(self, "Saved", f"Sale {self._sv['sv_number']} updated.")
         self.accept()
 
+    def _delete_and_close(self):
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "sale", self._sv_id, self._sv["sv_number"], "Owner"
+        )
+        if deleted:
+            self.accept()
+
 
 # ── Purchase Edit Dialog ───────────────────────────────────────────────────────
 
@@ -1207,6 +1223,14 @@ class PurchaseEditDialog(QDialog):
         lbl.setStyleSheet("color:#1e293b;")
         top.addWidget(lbl)
         top.addStretch()
+        btn_delete = QPushButton("🗑 Delete")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(self._delete_and_close)
+        top.addWidget(btn_delete)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(self.reject)
@@ -1420,6 +1444,14 @@ class PurchaseEditDialog(QDialog):
             return
         QMessageBox.information(self, "Saved", f"Purchase {self._pv['pv_number']} updated.")
         self.accept()
+
+    def _delete_and_close(self):
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "purchase", self._pv_id, self._pv["pv_number"], "Owner"
+        )
+        if deleted:
+            self.accept()
 
 
 # ── Payment Edit Dialog (CR / CP) ─────────────────────────────────────────────
@@ -1788,6 +1820,7 @@ class SimpleReturnEditDialog(QDialog):
         super().__init__(parent)
         self._type = record_type
         self._id = record_id
+        self._number = number
         self.setWindowTitle(f"Edit {number}")
         self.setMinimumWidth(480)
         self.resize(500, 240)
@@ -1832,12 +1865,23 @@ class SimpleReturnEditDialog(QDialog):
         g2.addWidget(self.notes_edit)
         layout.addLayout(g2)
 
+        btn_row = QHBoxLayout()
+        btn_delete = QPushButton("🗑 Delete")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 14px; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(self._delete_and_close)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         btns.accepted.connect(self._save)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        btn_row.addWidget(btns)
+        layout.addLayout(btn_row)
 
     def _save(self):
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
@@ -1851,3 +1895,11 @@ class SimpleReturnEditDialog(QDialog):
             QMessageBox.critical(self, "Error", str(ex))
             return
         self.accept()
+
+    def _delete_and_close(self):
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, self._type, self._id, self._number, "Owner"
+        )
+        if deleted:
+            self.accept()

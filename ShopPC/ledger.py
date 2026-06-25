@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QMessageBox, QHeaderView, QAbstractItemView,
     QFrame, QButtonGroup, QRadioButton,
 )
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QDate, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QBrush
 
 from database import (
@@ -97,6 +97,13 @@ def db_parties_list(party_type: str):
         rows = conn.execute(
             "SELECT id, name FROM other_parties ORDER BY name"
         ).fetchall()
+    elif party_type == "expense":
+        try:
+            rows = conn.execute(
+                "SELECT id, name FROM expense_categories ORDER BY name"
+            ).fetchall()
+        except Exception:
+            rows = []
     else:
         rows = conn.execute(
             "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
@@ -181,6 +188,25 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
             raw.append({"date": r[1], "voucher": r[2], "desc": desc,
                         "dr": float(r[3] or 0), "cr": 0.0})
 
+        # Sales to this supplier — CREDIT (reduces balance / they owe us)
+        for r in conn.execute(
+            "SELECT sv.id, sv.date, sv.sv_number, sv.total_amount "
+            "FROM sale_vouchers sv WHERE sv.supplier_as_customer_id=?",
+            (party_id,),
+        ):
+            lines = conn.execute("""
+                SELECT m.name AS model, sl.final_price
+                FROM sale_lines sl
+                JOIN models m ON m.id = sl.model_id
+                WHERE sl.sv_id=?
+                ORDER BY sl.id
+            """, (r[0],)).fetchall()
+            counts = Counter((ln["model"], int(ln["final_price"])) for ln in lines)
+            parts = [f"{qty}x{model}@{price}" for (model, price), qty in counts.items()]
+            desc = "Sale: " + ", ".join(parts) if parts else "Sale to Supplier"
+            raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                        "dr": 0.0, "cr": float(r[3] or 0)})
+
         # Supplier payment directions — DO NOT CHANGE:
         #   CP (you pay supplier)          → CREDIT  (reduces what you owe them)
         #   CR (supplier pays / refunds you) → DEBIT  (increases the DR side of their account)
@@ -216,6 +242,16 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
             desc = ", ".join(parts) if parts else "Sale on Credit"
             raw.append({"date": r[1], "voucher": r[2], "desc": desc,
                         "dr": float(r[3] or 0), "cr": 0.0})
+
+        # Purchases from this customer — CREDIT (reduces balance / we owe them)
+        for r in conn.execute(
+            "SELECT pv.date, pv.pv_number, pv.total_amount "
+            "FROM purchase_vouchers pv WHERE pv.customer_as_supplier_id=?",
+            (party_id,),
+        ):
+            raw.append({"date": r[0], "voucher": r[1],
+                        "desc": "Purchase from Customer", "dr": 0.0,
+                        "cr": float(r[2] or 0)})
 
         # Customer payment directions — DO NOT CHANGE:
         #   CR (cash received FROM customer)  → CREDIT  (reduces what they owe you)
@@ -504,10 +540,13 @@ class PaymentDialog(QDialog):
         self.amount_spin.setSingleStep(1000)
         self.amount_spin.setGroupSeparatorShown(True)
         self.amount_spin.setPrefix("PKR ")
+        self.amount_spin.lineEdit().returnPressed.connect(
+            lambda: self.amount_spin.focusNextChild())
         form.addRow("Amount:", self.amount_spin)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         form.addRow("Notes:", self.notes_edit)
 
         if party_type == "other":
@@ -583,10 +622,13 @@ class JournalDialog(QDialog):
         self.amount_spin.setSingleStep(500)
         self.amount_spin.setGroupSeparatorShown(True)
         self.amount_spin.setPrefix("PKR ")
+        self.amount_spin.lineEdit().returnPressed.connect(
+            lambda: self.amount_spin.focusNextChild())
         form.addRow("Amount:", self.amount_spin)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Reason / description")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         form.addRow("Notes:", self.notes_edit)
 
         btns = QDialogButtonBox(
@@ -649,6 +691,25 @@ def _make_three_way_toggle(label_a, label_b, label_c):
     return row, btn_a, btn_b, btn_c
 
 
+class _AmountSpinBox(QDoubleSpinBox):
+    """
+    Amount spinbox with two-Enter UX:
+      1st Enter — commits the typed value (standard spinbox behaviour)
+      2nd Enter — emits new_row_requested so the dialog adds another line
+    """
+    new_row_requested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.lineEdit().isModified():
+                super().keyPressEvent(event)   # first Enter: commit value
+            else:
+                self.new_row_requested.emit()  # second Enter: new row
+        else:
+            super().keyPressEvent(event)
+
+
 class MultiLineCpCrDialog(QDialog):
     """
     Multi-line Cash Payment (CP) or Cash Receipt (CR) voucher.
@@ -663,6 +724,7 @@ class MultiLineCpCrDialog(QDialog):
         ("Supplier", "supplier"),
         ("Customer", "customer"),
         ("Other",    "other"),
+        ("Expense",  "expense"),
         ("Bank",     "bank"),
     ]
 
@@ -683,6 +745,7 @@ class MultiLineCpCrDialog(QDialog):
             "supplier": db_parties_list("supplier"),
             "customer": db_parties_list("customer"),
             "other":    db_parties_list("other"),
+            "expense":  db_parties_list("expense"),
             "bank":     [(a["id"], a["name"]) for a in db_bank_accounts()],
         }
 
@@ -806,14 +869,16 @@ class MultiLineCpCrDialog(QDialog):
 
         ref_edit = QLineEdit()
         ref_edit.setPlaceholderText("Optional")
+        ref_edit.returnPressed.connect(lambda re=ref_edit: re.focusNextChild())
 
-        amount_spin = QDoubleSpinBox()
+        amount_spin = _AmountSpinBox()
         amount_spin.setRange(0.01, 99_999_999)
         amount_spin.setDecimals(0)
         amount_spin.setSingleStep(1000)
         amount_spin.setGroupSeparatorShown(True)
         amount_spin.setValue(0)
         amount_spin.valueChanged.connect(self._update_total)
+        amount_spin.new_row_requested.connect(self._add_row)
 
         rem_btn = QPushButton("✕")
         rem_btn.setStyleSheet(
@@ -850,6 +915,14 @@ class MultiLineCpCrDialog(QDialog):
                     name_combo.addItem(pname, pid)
             else:
                 name_combo.addItem("— No accounts (add in Settings) —", None)
+        elif ptype == "expense":
+            lbl = "Category"
+            if parties:
+                name_combo.addItem("— Select Category —", None)
+                for p in parties:
+                    name_combo.addItem(p["name"], p["id"])
+            else:
+                name_combo.addItem("— No categories found —", None)
         else:
             lbl = {"supplier": "Supplier", "customer": "Customer", "other": "Party"}[ptype]
             if parties:
@@ -944,6 +1017,12 @@ def _build_accounts_combo(combo: QComboBox):
     customers = conn.execute(
         "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
     ).fetchall()
+    try:
+        categories = conn.execute(
+            "SELECT id, name FROM expense_categories ORDER BY name"
+        ).fetchall()
+    except Exception:
+        categories = []
     conn.close()
     if suppliers:
         idx = combo.count()
@@ -957,6 +1036,12 @@ def _build_accounts_combo(combo: QComboBox):
         combo.model().item(idx).setEnabled(False)
         for r in customers:
             combo.addItem(r["name"], {"type": "customer", "id": r["id"]})
+    if categories:
+        idx = combo.count()
+        combo.addItem("── Expenses ──", None)
+        combo.model().item(idx).setEnabled(False)
+        for r in categories:
+            combo.addItem(r["name"], {"type": "expense", "id": r["id"]})
 
 
 class DoubleEntryJournalDialog(QDialog):
@@ -993,6 +1078,7 @@ class DoubleEntryJournalDialog(QDialog):
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Description / reason (required)")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         top.addRow("Description:", self.notes_edit)
 
         layout.addLayout(top)
@@ -1026,6 +1112,8 @@ class DoubleEntryJournalDialog(QDialog):
         self.dr_spin.setGroupSeparatorShown(True)
         self.dr_spin.setPrefix("PKR ")
         self.dr_spin.valueChanged.connect(self._update_balance_lbl)
+        self.dr_spin.lineEdit().returnPressed.connect(
+            lambda: self.dr_spin.focusNextChild())
         dr_col.addWidget(self.dr_spin)
         grid.addLayout(dr_col)
 
@@ -1059,6 +1147,8 @@ class DoubleEntryJournalDialog(QDialog):
         self.cr_spin.setGroupSeparatorShown(True)
         self.cr_spin.setPrefix("PKR ")
         self.cr_spin.valueChanged.connect(self._update_balance_lbl)
+        self.cr_spin.lineEdit().returnPressed.connect(
+            lambda: self.cr_spin.focusNextChild())
         cr_col.addWidget(self.cr_spin)
         grid.addLayout(cr_col)
 
@@ -1069,7 +1159,8 @@ class DoubleEntryJournalDialog(QDialog):
             "Examples:  Bank transfer to supplier → Dr Supplier / Cr Bank\n"
             "           Customer pays via bank   → Dr Bank / Cr Customer\n"
             "           Supplier rebate (cash)   → Dr Cash / Cr Supplier\n"
-            "           Supplier incentive       → Dr Supplier / Cr Incentives Income"
+            "           Supplier incentive       → Dr Supplier / Cr Incentives Income\n"
+            "           Expense paid from bank   → Dr Rent / Cr Bank"
         )
         eg.setStyleSheet("color:#64748b; font-size:9pt;")
         layout.addWidget(eg)
