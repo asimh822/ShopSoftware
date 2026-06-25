@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QPoint, QEvent, pyqtSignal
-from PyQt6.QtGui import QFont, QBrush, QColor
+from PyQt6.QtGui import QFont, QBrush, QColor, QPainter, QPixmap
 
 from database import get_connection, db_bank_accounts, db_active_salesmen
 from widgets import SearchableComboBox
@@ -878,9 +878,25 @@ class SaleForm(QWidget):
         _setup_titlecase_edit(self.cash_name)
         cash_row.addWidget(self.cash_name)
 
-        self.chk_whatsapp = QCheckBox("WhatsApp ✓")
+        # WhatsApp icon — green circle with phone glyph, no external file needed
+        _wa_px = QPixmap(22, 22)
+        _wa_px.fill(Qt.GlobalColor.transparent)
+        _wa_p = QPainter(_wa_px)
+        _wa_p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _wa_p.setBrush(QBrush(QColor("#25D366")))
+        _wa_p.setPen(Qt.PenStyle.NoPen)
+        _wa_p.drawEllipse(0, 0, 21, 21)
+        _wa_p.setPen(QColor("white"))
+        _wa_p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        _wa_p.drawText(_wa_px.rect(), Qt.AlignmentFlag.AlignCenter, "✆")
+        _wa_p.end()
+        _wa_lbl = QLabel()
+        _wa_lbl.setPixmap(_wa_px)
+        _wa_lbl.setToolTip("Send WhatsApp on save")
+        cash_row.addWidget(_wa_lbl)
+        self.chk_whatsapp = QCheckBox()
         self.chk_whatsapp.setChecked(False)
-        self.chk_whatsapp.setStyleSheet("font-size:10pt; color:#1e293b; padding-left:8px;")
+        self.chk_whatsapp.setToolTip("Send WhatsApp on save")
         cash_row.addWidget(self.chk_whatsapp)
 
         cash_row.addStretch()
