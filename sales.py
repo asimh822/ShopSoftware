@@ -832,7 +832,8 @@ class SaleForm(QWidget):
         sal_lbl.setStyleSheet("color:#dc2626; font-weight:bold;")
         hl.addWidget(sal_lbl)
         self.salesman_combo = SearchableComboBox()
-        self.salesman_combo.setMinimumWidth(200)
+        self.salesman_combo.setMinimumWidth(100)
+        self.salesman_combo.setMaximumWidth(130)
         self.salesman_combo.addItem("— Select Salesman —", None)
         for sm in db_active_salesmen():
             self.salesman_combo.addItem(sm["name"], sm["id"])
@@ -862,7 +863,7 @@ class SaleForm(QWidget):
         cash_row.addWidget(self.cash_contact)
 
         self.contact_status_lbl = QLabel("")
-        self.contact_status_lbl.setMinimumWidth(175)
+        self.contact_status_lbl.setMinimumWidth(110)
         cash_row.addWidget(self.contact_status_lbl)
 
         cash_row.addWidget(QLabel("Customer Name *:"))
