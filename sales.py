@@ -853,7 +853,6 @@ class SaleForm(QWidget):
         cash_row.setContentsMargins(0, 0, 0, 0)
         cash_row.setSpacing(12)
 
-        cash_row.addWidget(QLabel("Contact *:"))
         self.cash_contact = ContactLineEdit()
         self.cash_contact.setPlaceholderText("03XXXXXXXXX")
         self.cash_contact.setMaxLength(11)
@@ -875,7 +874,7 @@ class SaleForm(QWidget):
         _setup_titlecase_edit(self.cash_name)
         cash_row.addWidget(self.cash_name)
 
-        self.chk_whatsapp = QCheckBox("Send WhatsApp")
+        self.chk_whatsapp = QCheckBox("WhatsApp ✓")
         self.chk_whatsapp.setChecked(False)
         self.chk_whatsapp.setStyleSheet("font-size:10pt; color:#1e293b; padding-left:8px;")
         cash_row.addWidget(self.chk_whatsapp)
@@ -939,20 +938,20 @@ class SaleForm(QWidget):
         self._imei_dropdown.imei_chosen.connect(self._on_dropdown_select)
         self.imei_input.installEventFilter(self)
 
-        btn_browse = QPushButton("Browse All Stock")
-        btn_browse.setStyleSheet(BTN_SECONDARY)
-        btn_browse.setToolTip("Pick any in-stock phone manually")
-        btn_browse.clicked.connect(self._imei_browse)
-        search_row.addWidget(btn_browse)
-
         ll.addLayout(search_row)
 
         # Staged result row
         result_row = QHBoxLayout()
         result_row.setSpacing(12)
-        self.lookup_status = QLabel("Enter IMEI prefix to find an in-stock phone")
+        self.lookup_status = QLabel("")
         self.lookup_status.setStyleSheet(STATUS_INFO)
         result_row.addWidget(self.lookup_status)
+
+        btn_browse = QPushButton("Browse All Stock")
+        btn_browse.setStyleSheet(BTN_SECONDARY)
+        btn_browse.setToolTip("Pick any in-stock phone manually")
+        btn_browse.clicked.connect(self._imei_browse)
+        result_row.addWidget(btn_browse)
         result_row.addStretch()
 
         self.price_label = QLabel("Final Price (PKR):")
@@ -988,16 +987,18 @@ class SaleForm(QWidget):
         )
         _lh = self.lines_table.horizontalHeader()
         _lh.setStretchLastSection(False)
-        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)       # #
-        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)     # Brand
-        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)     # Model
-        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IMEI
-        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)       # Ref Price
-        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Final Price
-        _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Disc
-        _lh.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)     # Warning
-        _lh.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)       # Remove btn
+        _lh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)            # #
+        _lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)            # Brand
+        _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)          # Model
+        _lh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)            # IMEI
+        _lh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)            # Ref Price
+        _lh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)            # Final Price
+        _lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)            # Disc
+        _lh.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents) # Warning
+        _lh.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)            # Remove btn
         self.lines_table.setColumnWidth(0, 35)
+        self.lines_table.setColumnWidth(1, 110)
+        self.lines_table.setColumnWidth(3, 155)
         self.lines_table.setColumnWidth(4, 130)
         self.lines_table.setColumnWidth(5, 140)
         self.lines_table.setColumnWidth(6, 90)
@@ -1009,13 +1010,17 @@ class SaleForm(QWidget):
         self.lines_table.cellChanged.connect(self._on_price_cell_changed)
         layout.addWidget(self.lines_table, stretch=1)
 
-        # ── Pinned footer strip ───────────────────────────────────────────────
+        # ── Pinned footer ─────────────────────────────────────────────────────
         self._payment_mode = "cash"
 
-        footer_frame = QFrame()
-        footer_frame.setStyleSheet(CARD_STYLE)
-        footer_strip = QHBoxLayout(footer_frame)
-        footer_strip.setContentsMargins(12, 8, 12, 8)
+        self.payment_card = QFrame()
+        self.payment_card.setStyleSheet(CARD_STYLE)
+        footer_vbox = QVBoxLayout(self.payment_card)
+        footer_vbox.setContentsMargins(12, 8, 12, 8)
+        footer_vbox.setSpacing(4)
+
+        # Row 1: always-visible bar
+        footer_strip = QHBoxLayout()
         footer_strip.setSpacing(8)
 
         footer_strip.addWidget(QLabel("Overall Discount (PKR):"))
@@ -1030,13 +1035,12 @@ class SaleForm(QWidget):
             lambda: self.discount_spin.focusNextChild())
         footer_strip.addWidget(self.discount_spin)
 
-        self.total_label = QLabel("Total: PKR 0")
+        self.total_label = QLabel("TOTAL: Rs. 0")
         self.total_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_label.setStyleSheet("color:#1d4ed8;")
         footer_strip.addWidget(self.total_label)
 
         footer_strip.addSpacing(16)
-        footer_strip.addWidget(QLabel("Payment:"))
 
         pm_toggle = QHBoxLayout()
         pm_toggle.setSpacing(0)
@@ -1063,18 +1067,30 @@ class SaleForm(QWidget):
         pm_toggle.addWidget(self.btn_pay_split)
         footer_strip.addLayout(pm_toggle)
 
+        footer_strip.addStretch()
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(on_cancel)
+        self.btn_save = QPushButton("Save Sale")
+        self.btn_save.setStyleSheet(BTN_PRIMARY)
+        self.btn_save.clicked.connect(self._save)
+        footer_strip.addWidget(btn_cancel)
+        footer_strip.addWidget(self.btn_save)
+
+        footer_vbox.addLayout(footer_strip)
+
+        # Row 2: payment method details — shown only for Bank / Split
+        self._pm_detail = QFrame()
+        pm_detail_row = QHBoxLayout(self._pm_detail)
+        pm_detail_row.setContentsMargins(0, 2, 0, 0)
+        pm_detail_row.setSpacing(8)
+
         self._pm_stack = QStackedWidget()
         self._pm_stack.setFixedHeight(36)
 
-        # Page 0 — Cash
-        cash_pm_widget = QWidget()
-        cash_pm_row = QHBoxLayout(cash_pm_widget)
-        cash_pm_row.setContentsMargins(0, 0, 0, 0)
-        self._cash_pm_lbl = QLabel("Full amount collected in cash")
-        self._cash_pm_lbl.setStyleSheet("color:#16a34a; font-size:9pt;")
-        cash_pm_row.addWidget(self._cash_pm_lbl)
-        cash_pm_row.addStretch()
-        self._pm_stack.addWidget(cash_pm_widget)
+        # Page 0 — Cash (detail row hidden, this page never shown)
+        self._pm_stack.addWidget(QWidget())
 
         # Page 1 — Bank Transfer
         bank_pm_widget = QWidget()
@@ -1129,19 +1145,12 @@ class SaleForm(QWidget):
         split_pm_row.addStretch()
         self._pm_stack.addWidget(split_pm_widget)
 
-        footer_strip.addWidget(self._pm_stack)
-        footer_strip.addStretch()
+        pm_detail_row.addWidget(self._pm_stack)
+        pm_detail_row.addStretch()
+        self._pm_detail.setVisible(False)
+        footer_vbox.addWidget(self._pm_detail)
 
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet(BTN_SECONDARY)
-        btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Sale")
-        self.btn_save.setStyleSheet(BTN_PRIMARY)
-        self.btn_save.clicked.connect(self._save)
-        footer_strip.addWidget(btn_cancel)
-        footer_strip.addWidget(self.btn_save)
-
-        layout.addWidget(footer_frame)
+        layout.addWidget(self.payment_card)
 
     # ── Bank account combo helper ─────────────────────────────────────────────
 
@@ -1222,10 +1231,13 @@ class SaleForm(QWidget):
         )
         if mode == "cash":
             self._pm_stack.setCurrentIndex(0)
+            self._pm_detail.setVisible(False)
         elif mode == "bank":
             self._pm_stack.setCurrentIndex(1)
+            self._pm_detail.setVisible(True)
         else:
             self._pm_stack.setCurrentIndex(2)
+            self._pm_detail.setVisible(True)
             self._update_split_bank_lbl()
 
     def _update_split_bank_lbl(self):
@@ -1512,8 +1524,7 @@ class SaleForm(QWidget):
 
     def _update_total(self):
         total = self._get_total()
-        self.total_label.setText(f"Total: PKR {fmt_pkr(total)}")
-        self._cash_pm_lbl.setText(f"Full amount collected in cash  ·  PKR {fmt_pkr(total)}")
+        self.total_label.setText(f"TOTAL: Rs. {fmt_pkr(total)}")
         if self._payment_mode == "split":
             self._update_split_bank_lbl()
 
