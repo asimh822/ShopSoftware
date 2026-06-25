@@ -803,7 +803,7 @@ class SaleForm(QWidget):
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
-        self.date_edit.setMinimumWidth(130)
+        self.date_edit.setFixedWidth(108)
         hl.addWidget(self.date_edit)
 
         hl.addSpacing(8)
