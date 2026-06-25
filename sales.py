@@ -834,10 +834,13 @@ class SaleForm(QWidget):
         self.salesman_combo = SearchableComboBox()
         self.salesman_combo.setMinimumWidth(100)
         self.salesman_combo.setMaximumWidth(130)
-        self.salesman_combo.addItem("— Select Salesman —", None)
-        for sm in db_active_salesmen():
-            self.salesman_combo.addItem(sm["name"], sm["id"])
-        if self.salesman_combo.count() <= 1:
+        _salesmen = db_active_salesmen()
+        if _salesmen:
+            for sm in _salesmen:
+                self.salesman_combo.addItem(sm["name"], sm["id"])
+            self.salesman_combo.setCurrentIndex(0)
+        else:
+            self.salesman_combo.addItem("— No salesmen —", None)
             self.salesman_combo.setToolTip(
                 "No active salesmen — add one in Masters → Salesmen first."
             )
@@ -857,7 +860,7 @@ class SaleForm(QWidget):
         self.cash_contact = ContactLineEdit()
         self.cash_contact.setPlaceholderText("03XXXXXXXXX")
         self.cash_contact.setMaxLength(11)
-        self.cash_contact.setMinimumWidth(150)
+        self.cash_contact.setFixedWidth(105)
         self.cash_contact.textChanged.connect(self._on_cash_contact_changed)
         self.cash_contact.returnPressed.connect(lambda: self.cash_contact.focusNextChild())
         cash_row.addWidget(self.cash_contact)
@@ -866,7 +869,7 @@ class SaleForm(QWidget):
         self.contact_status_lbl.setMinimumWidth(24)
         cash_row.addWidget(self.contact_status_lbl)
 
-        cash_row.addWidget(QLabel("Customer Name *:"))
+        cash_row.addWidget(QLabel("Name *:"))
         self.cash_name = QLineEdit()
         self.cash_name.setPlaceholderText("Auto-filled or enter name")
         self.cash_name.setMinimumWidth(180)
