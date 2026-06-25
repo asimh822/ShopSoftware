@@ -1058,7 +1058,9 @@ class SaleForm(QWidget):
 
         footer_strip.addSpacing(16)
 
-        pm_toggle = QHBoxLayout()
+        self._pay_method_widget = QWidget()
+        pm_toggle = QHBoxLayout(self._pay_method_widget)
+        pm_toggle.setContentsMargins(0, 0, 0, 0)
         pm_toggle.setSpacing(0)
         self.btn_pay_cash = QPushButton("Cash")
         self.btn_pay_cash.setFixedHeight(28)
@@ -1081,7 +1083,7 @@ class SaleForm(QWidget):
         pm_toggle.addWidget(self.btn_pay_cash)
         pm_toggle.addWidget(self.btn_pay_bank)
         pm_toggle.addWidget(self.btn_pay_split)
-        footer_strip.addLayout(pm_toggle)
+        footer_strip.addWidget(self._pay_method_widget)
 
         footer_strip.addStretch()
 
@@ -1216,7 +1218,8 @@ class SaleForm(QWidget):
                 BTN_TOGGLE_OFF + "QPushButton { border-radius: 0 5px 5px 0; border-left: none; }"
             )
             self.customer_stack.setCurrentIndex(0)
-            self.payment_card.setVisible(True)
+            self._pay_method_widget.setVisible(True)
+            self._pm_detail.setVisible(self._payment_mode != "cash")
         else:
             self.btn_credit.setStyleSheet(
                 BTN_TOGGLE_ON + "QPushButton { border-radius: 0 5px 5px 0; border-left: none; }"
@@ -1225,7 +1228,8 @@ class SaleForm(QWidget):
                 BTN_TOGGLE_OFF + "QPushButton { border-radius: 5px 0 0 5px; }"
             )
             self.customer_stack.setCurrentIndex(1)
-            self.payment_card.setVisible(False)
+            self._pay_method_widget.setVisible(False)
+            self._pm_detail.setVisible(False)
 
     # ── Payment mode toggle ───────────────────────────────────────────────────
 
