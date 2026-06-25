@@ -944,61 +944,57 @@ class SaleForm(QWidget):
         ll.setContentsMargins(16, 12, 16, 12)
         ll.setSpacing(8)
 
-        search_row = QHBoxLayout()
-        search_row.setSpacing(10)
+        imei_row = QHBoxLayout()
+        imei_row.setSpacing(8)
         self.imei_input = QLineEdit()
-        self.imei_input.setPlaceholderText("Type last 5 digits of IMEI to search stock…")
-        self.imei_input.setMinimumWidth(260)
+        self.imei_input.setPlaceholderText("Type 5+ digits to search…")
+        self.imei_input.setFixedWidth(148)
         self.imei_input.setProperty("enterKeepDefault", True)
         self.imei_input.textChanged.connect(self._on_imei_changed)
         self.imei_input.returnPressed.connect(self._imei_enter)
-        search_row.addWidget(self.imei_input, stretch=1)
+        imei_row.addWidget(self.imei_input)
 
         self._imei_dropdown = ImeiDropdown(self)
         self._imei_dropdown.imei_chosen.connect(self._on_dropdown_select)
         self.imei_input.installEventFilter(self)
 
-        ll.addLayout(search_row)
-
-        # Staged result row
-        result_row = QHBoxLayout()
-        result_row.setSpacing(12)
-        self.lookup_status = QLabel("")
-        self.lookup_status.setStyleSheet(STATUS_INFO)
-        result_row.addWidget(self.lookup_status)
-
         btn_browse = QPushButton("Browse All Stock")
         btn_browse.setStyleSheet(BTN_SECONDARY)
         btn_browse.setToolTip("Pick any in-stock phone manually")
         btn_browse.clicked.connect(self._imei_browse)
-        result_row.addWidget(btn_browse)
-        result_row.addStretch()
+        imei_row.addWidget(btn_browse)
 
-        self.price_label = QLabel("Final Price (PKR):")
+        self.lookup_status = QLabel("")
+        self.lookup_status.setStyleSheet(STATUS_INFO)
+        imei_row.addWidget(self.lookup_status)
+
+        self.price_label = QLabel("Price (PKR):")
         self.price_label.setVisible(False)
-        result_row.addWidget(self.price_label)
+        imei_row.addWidget(self.price_label)
 
         self.price_spin = QDoubleSpinBox()
         self.price_spin.setRange(0, 9_999_999)
         self.price_spin.setDecimals(0)
         self.price_spin.setSingleStep(500)
         self.price_spin.setGroupSeparatorShown(True)
-        self.price_spin.setMinimumWidth(130)
+        self.price_spin.setFixedWidth(120)
         self.price_spin.setVisible(False)
         self.price_spin.returnPressed = None
         self.price_spin.valueChanged.connect(self._check_staged_price)
-        result_row.addWidget(self.price_spin)
+        imei_row.addWidget(self.price_spin)
 
         self.price_warn_lbl = QLabel("")
         self.price_warn_lbl.setStyleSheet(STATUS_WARN)
-        result_row.addWidget(self.price_warn_lbl)
+        imei_row.addWidget(self.price_warn_lbl)
 
         self.btn_add_line = QPushButton("+ Add")
         self.btn_add_line.setStyleSheet(BTN_PRIMARY)
         self.btn_add_line.setVisible(False)
         self.btn_add_line.clicked.connect(self._add_line)
-        result_row.addWidget(self.btn_add_line)
-        ll.addLayout(result_row)
+        imei_row.addWidget(self.btn_add_line)
+
+        imei_row.addStretch()
+        ll.addLayout(imei_row)
         layout.addWidget(lookup_card)
 
         # ── Lines table ───────────────────────────────────────────────────────
