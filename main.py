@@ -26,6 +26,7 @@ from whatsapp_page import WhatsAppPage
 from settings_page import SettingsPage
 from capital import CapitalPage
 from balance_sheet import BalanceSheetPage
+from supabase_sync import run_sync
 
 # ── API Server subprocess management ─────────────────────────────────────────
 
@@ -471,8 +472,8 @@ class DashboardPage(QWidget):
                 SELECT
                     COALESCE((SELECT SUM(opening_balance) FROM customers WHERE type='credit'), 0) +
                     COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.type='credit'), 0) -
-                    COALESCE((SELECT SUM(amount) FROM payments WHERE party_type='customer' AND type='CR'), 0) -
-                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='debit'), 0) +
+                    COALESCE((SELECT SUM(amount) FROM payments WHERE party_type='customer' AND type='CR'), 0) +
+                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='debit'), 0) -
                     COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='credit'), 0)
             """).fetchone()[0]
 
@@ -1798,6 +1799,20 @@ def _auto_register_startup() -> None:
 def main():
     init_db()
     _start_api_server()
+
+    def _sync_loop():
+        import time
+        run_sync()          # run immediately on startup
+        while True:
+            time.sleep(3600)
+            try:
+                run_sync()
+            except Exception as e:
+                print(f"[Supabase Sync] Thread error: {e}")
+
+    sync_thread = threading.Thread(target=_sync_loop, daemon=True)
+    sync_thread.start()
+
     _auto_register_startup()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

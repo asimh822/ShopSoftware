@@ -540,10 +540,13 @@ class PaymentDialog(QDialog):
         self.amount_spin.setSingleStep(1000)
         self.amount_spin.setGroupSeparatorShown(True)
         self.amount_spin.setPrefix("PKR ")
+        self.amount_spin.lineEdit().returnPressed.connect(
+            lambda: self.amount_spin.focusNextChild())
         form.addRow("Amount:", self.amount_spin)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         form.addRow("Notes:", self.notes_edit)
 
         if party_type == "other":
@@ -619,10 +622,13 @@ class JournalDialog(QDialog):
         self.amount_spin.setSingleStep(500)
         self.amount_spin.setGroupSeparatorShown(True)
         self.amount_spin.setPrefix("PKR ")
+        self.amount_spin.lineEdit().returnPressed.connect(
+            lambda: self.amount_spin.focusNextChild())
         form.addRow("Amount:", self.amount_spin)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Reason / description")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         form.addRow("Notes:", self.notes_edit)
 
         btns = QDialogButtonBox(
@@ -863,6 +869,7 @@ class MultiLineCpCrDialog(QDialog):
 
         ref_edit = QLineEdit()
         ref_edit.setPlaceholderText("Optional")
+        ref_edit.returnPressed.connect(lambda re=ref_edit: re.focusNextChild())
 
         amount_spin = _AmountSpinBox()
         amount_spin.setRange(0.01, 99_999_999)
@@ -1071,6 +1078,7 @@ class DoubleEntryJournalDialog(QDialog):
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Description / reason (required)")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         top.addRow("Description:", self.notes_edit)
 
         layout.addLayout(top)
@@ -1104,6 +1112,8 @@ class DoubleEntryJournalDialog(QDialog):
         self.dr_spin.setGroupSeparatorShown(True)
         self.dr_spin.setPrefix("PKR ")
         self.dr_spin.valueChanged.connect(self._update_balance_lbl)
+        self.dr_spin.lineEdit().returnPressed.connect(
+            lambda: self.dr_spin.focusNextChild())
         dr_col.addWidget(self.dr_spin)
         grid.addLayout(dr_col)
 
@@ -1137,6 +1147,8 @@ class DoubleEntryJournalDialog(QDialog):
         self.cr_spin.setGroupSeparatorShown(True)
         self.cr_spin.setPrefix("PKR ")
         self.cr_spin.valueChanged.connect(self._update_balance_lbl)
+        self.cr_spin.lineEdit().returnPressed.connect(
+            lambda: self.cr_spin.focusNextChild())
         cr_col.addWidget(self.cr_spin)
         grid.addLayout(cr_col)
 

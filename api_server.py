@@ -7,6 +7,9 @@ Default port: 5000
 
 import os
 import sqlite3
+import threading
+import time
+import traceback
 import uuid
 from datetime import date as _date, timedelta
 from functools import wraps
@@ -14,18 +17,31 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+try:
+    from supabase_sync import run_sync as _run_supabase_sync
+    _SUPABASE_AVAILABLE = True
+except ImportError:
+    _SUPABASE_AVAILABLE = False
+
 # ── Database path — same resolution as main.py / database.py ─────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     return conn
 
 
-# ── Bootstrap: create sessions table if it doesn't exist ─────────────────────
+# ── Bootstrap: run all DB migrations, then ensure sessions table exists ──────
+from database import init_db as _init_db
+_init_db()
+
+
 def _init_sessions():
     conn = get_conn()
     conn.execute("""
@@ -272,8 +288,8 @@ def api_customers_search():
                 COALESCE(c.opening_balance, 0)
                 + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
                 - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-                - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-                + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
+                + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
+                - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
                 AS balance
             FROM customers c WHERE c.id=?
         """, (customer["id"],)).fetchone()
@@ -389,8 +405,8 @@ def api_customers_list():
                COALESCE(c.opening_balance, 0)
                + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
                - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
+               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
+               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
                AS balance
         FROM customers c
         WHERE c.type = 'credit'
@@ -456,7 +472,7 @@ def api_sale():
     salesman_id           = data.get("salesman_id")
     sale_type             = data.get("type", "cash")
     customer_id           = data.get("customer_id")
-    cash_customer_name    = (data.get("cash_customer_name") or "").strip()
+    cash_customer_name    = (data.get("cash_customer_name") or "").strip().title()
     cash_customer_contact = (data.get("cash_customer_contact") or "").strip()
     date_str              = (data.get("date") or _date.today().strftime("%d/%m/%Y")).strip()
     note                  = (data.get("note") or "").strip()
@@ -471,6 +487,22 @@ def api_sale():
 
     if not lines:
         return jsonify({"success": False, "error": "At least one item is required"}), 400
+
+    # Rule 1: validate IMEI format
+    bad_imeis = [str(l.get("imei", "")).strip() for l in lines
+                 if not (len(str(l.get("imei", "")).strip()) == 15
+                         and str(l.get("imei", "")).strip().isdigit())]
+    if bad_imeis:
+        return jsonify({"success": False,
+                        "error": f"IMEI must be exactly 15 digits: {', '.join(bad_imeis)}"}), 400
+
+    # Rule 2: validate phone for cash sales
+    if sale_type == "cash" and cash_customer_contact:
+        if not (len(cash_customer_contact) == 11
+                and cash_customer_contact.startswith("03")
+                and cash_customer_contact.isdigit()):
+            return jsonify({"success": False,
+                            "error": "cash_customer_contact must be 11 digits starting with 03"}), 400
 
     conn = get_conn()
     try:
@@ -590,6 +622,14 @@ def api_purchase():
 
     if not lines:
         return jsonify({"success": False, "error": "At least one item is required"}), 400
+
+    # Rule 1: validate IMEI format
+    bad_imeis = [str(l.get("imei", "")).strip() for l in lines
+                 if not (len(str(l.get("imei", "")).strip()) == 15
+                         and str(l.get("imei", "")).strip().isdigit())]
+    if bad_imeis:
+        return jsonify({"success": False,
+                        "error": f"IMEI must be exactly 15 digits: {', '.join(bad_imeis)}"}), 400
 
     # ── Validate by purchase type ─────────────────────────────────────────────
     if purchase_type == "supplier":
@@ -848,8 +888,347 @@ def api_bank_account():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# OWNER HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _verify_owner_pin() -> bool:
+    """Return True if X-Owner-Pin header matches the stored owner_pin setting."""
+    pin = request.headers.get("X-Owner-Pin", "").strip()
+    if not pin:
+        return False
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key='owner_pin'").fetchone()
+    conn.close()
+    return bool(row and row["value"] == pin)
+
+
+def _calc_cash_in_hand(conn) -> float:
+    """Compute running cash in hand — mirrors database.py db_cash_in_hand()."""
+    ob_row = conn.execute(
+        "SELECT value FROM settings WHERE key='cash_opening_balance'"
+    ).fetchone()
+    cash_ob = float(ob_row[0]) if ob_row and ob_row[0] else 0.0
+
+    def _q(sql):
+        return float(conn.execute(sql).fetchone()[0] or 0)
+
+    return (
+        cash_ob
+        + _q("SELECT COALESCE(SUM(cash_paid),0) FROM sale_vouchers WHERE cash_paid>0")
+        + _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CR'")
+        - _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CP'")
+        - _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CP' AND source='cash_transfer'")
+        + _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CR' AND source='cash_transfer'")
+        + _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='in'")
+        - _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='out'")
+        - _q("SELECT COALESCE(SUM(cash_amount),0) FROM purchase_vouchers WHERE purchase_type='cash' AND cash_amount>0")
+        - _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE payment_method='cash'")
+    )
+
+
+def _calc_bank_account_balance(conn, account_id: int) -> float:
+    """Compute current balance for one bank account.
+
+    Formula:
+      opening_balance
+      + sale_vouchers.bank_amount  (bank/split sales paid into this account)
+      + payments CP (party=bank)   (cash deposited to bank via ledger)
+      - payments CR (party=bank)   (cash withdrawn from bank via ledger)
+      + journal_entries debit      (bank DR in JV = bank receives)
+      - journal_entries credit     (bank CR in JV = bank pays)
+    """
+    ba = conn.execute(
+        "SELECT opening_balance FROM bank_accounts WHERE id=?", (account_id,)
+    ).fetchone()
+    ob = float(ba["opening_balance"] or 0) if ba else 0.0
+
+    sales = float(conn.execute(
+        "SELECT COALESCE(SUM(bank_amount),0) FROM sale_vouchers "
+        "WHERE bank_account_id=? AND bank_amount>0",
+        (account_id,)
+    ).fetchone()[0] or 0)
+
+    cp = float(conn.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM payments "
+        "WHERE party_type='bank' AND party_id=? AND type='CP'",
+        (account_id,)
+    ).fetchone()[0] or 0)
+
+    cr = float(conn.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM payments "
+        "WHERE party_type='bank' AND party_id=? AND type='CR'",
+        (account_id,)
+    ).fetchone()[0] or 0)
+
+    jv_dr = float(conn.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
+        "WHERE party_type='bank' AND party_id=? AND type='debit'",
+        (account_id,)
+    ).fetchone()[0] or 0)
+
+    jv_cr = float(conn.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
+        "WHERE party_type='bank' AND party_id=? AND type='credit'",
+        (account_id,)
+    ).fetchone()[0] or 0)
+
+    return ob + sales + cp - cr + jv_dr - jv_cr
+
+
+def _date_iso_to_dmy(iso_date):
+    """Convert 'YYYY-MM-DD' → 'DD/MM/YYYY'. Returns None for falsy input."""
+    if not iso_date:
+        return None
+    return f"{iso_date[8:10]}/{iso_date[5:7]}/{iso_date[:4]}"
+
+
+# SQL expression: convert DD/MM/YYYY column to ISO YYYY-MM-DD for MAX() ordering
+_DATE_TO_ISO = "substr(date,7,4)||'-'||substr(date,4,2)||'-'||substr(date,1,2)"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OWNER ENDPOINTS — X-Owner-Pin header required (no salesman token needed)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/owner/dashboard", methods=["GET"])
+def api_owner_dashboard():
+    if not _verify_owner_pin():
+        return jsonify({"error": "Invalid PIN"}), 401
+
+    today = _date.today().strftime("%d/%m/%Y")
+    conn = get_conn()
+    try:
+        today_sales = float(conn.execute(
+            "SELECT COALESCE(SUM(total_amount),0) FROM sale_vouchers WHERE date=?",
+            (today,)
+        ).fetchone()[0] or 0)
+
+        today_purchases = float(conn.execute(
+            "SELECT COALESCE(SUM(total_amount),0) FROM purchase_vouchers WHERE date=?",
+            (today,)
+        ).fetchone()[0] or 0)
+
+        cash_in_hand = _calc_cash_in_hand(conn)
+
+        bank_rows = conn.execute("SELECT id FROM bank_accounts").fetchall()
+        bank_total = sum(_calc_bank_account_balance(conn, r["id"]) for r in bank_rows)
+
+        today_profit = float(conn.execute("""
+            SELECT COALESCE(SUM(sl.final_price - si.purchase_price), 0)
+            FROM sale_lines sl
+            JOIN sale_vouchers sv ON sv.id = sl.sv_id
+            JOIN stock_items si ON si.id = sl.stock_item_id
+            WHERE sv.date = ?
+        """, (today,)).fetchone()[0] or 0)
+
+        return jsonify({
+            "today_sales_total":     round(today_sales, 2),
+            "today_purchases_total": round(today_purchases, 2),
+            "cash_in_hand":          round(cash_in_hand, 2),
+            "bank_total":            round(bank_total, 2),
+            "today_profit":          round(today_profit, 2),
+        })
+    finally:
+        conn.close()
+
+
+@app.route("/api/owner/today-sales", methods=["GET"])
+def api_owner_today_sales():
+    if not _verify_owner_pin():
+        return jsonify({"error": "Invalid PIN"}), 401
+
+    today = _date.today().strftime("%d/%m/%Y")
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT b.name brand, m.name model,
+                   COUNT(*) quantity, COALESCE(SUM(sl.final_price), 0) revenue
+            FROM sale_lines sl
+            JOIN sale_vouchers sv ON sv.id = sl.sv_id
+            JOIN models m ON m.id = sl.model_id
+            JOIN brands b ON b.id = m.brand_id
+            WHERE sv.date = ?
+            GROUP BY b.name, m.name
+            ORDER BY b.name, m.name
+        """, (today,)).fetchall()
+
+        brands_map = {}
+        for r in rows:
+            brand = r["brand"]
+            if brand not in brands_map:
+                brands_map[brand] = {
+                    "brand": brand,
+                    "models": [],
+                    "brand_total_qty": 0,
+                    "brand_total_revenue": 0.0,
+                }
+            rev = round(float(r["revenue"]), 2)
+            brands_map[brand]["models"].append({
+                "model": r["model"],
+                "quantity": r["quantity"],
+                "revenue": rev,
+            })
+            brands_map[brand]["brand_total_qty"] += r["quantity"]
+            brands_map[brand]["brand_total_revenue"] = round(
+                brands_map[brand]["brand_total_revenue"] + rev, 2
+            )
+
+        brands_list = list(brands_map.values())
+        grand_qty     = sum(b["brand_total_qty"] for b in brands_list)
+        grand_revenue = round(sum(b["brand_total_revenue"] for b in brands_list), 2)
+
+        return jsonify({
+            "brands": brands_list,
+            "grand_total_qty": grand_qty,
+            "grand_total_revenue": grand_revenue,
+        })
+    finally:
+        conn.close()
+
+
+@app.route("/api/owner/balances", methods=["GET"])
+def api_owner_balances():
+    if not _verify_owner_pin():
+        return jsonify({"error": "Invalid PIN"}), 401
+
+    conn = get_conn()
+    try:
+        # ── Suppliers (we owe them) ───────────────────────────────────────────
+        sup_rows = conn.execute(
+            "SELECT id, name, opening_balance FROM suppliers WHERE id != 0 ORDER BY name"
+        ).fetchall()
+        suppliers = []
+        for s in sup_rows:
+            ob = float(s["opening_balance"] or 0)
+            pv = float(conn.execute(
+                "SELECT COALESCE(SUM(total_amount),0) FROM purchase_vouchers WHERE supplier_id=?",
+                (s["id"],)
+            ).fetchone()[0] or 0)
+            pr = float(conn.execute(
+                "SELECT COALESCE(SUM(prl.return_price),0) "
+                "FROM purchase_return_lines prl "
+                "JOIN purchase_returns pr ON pr.id=prl.pr_id "
+                "WHERE pr.supplier_id=?",
+                (s["id"],)
+            ).fetchone()[0] or 0)
+            cp = float(conn.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM payments "
+                "WHERE party_type='supplier' AND party_id=? AND type='CP'",
+                (s["id"],)
+            ).fetchone()[0] or 0)
+            balance = ob + pv - pr - cp
+            if abs(balance) < 0.01:
+                continue
+            last_iso = conn.execute(f"""
+                SELECT MAX({_DATE_TO_ISO}) FROM (
+                    SELECT date FROM purchase_vouchers WHERE supplier_id=?
+                    UNION ALL SELECT date FROM purchase_returns WHERE supplier_id=?
+                    UNION ALL SELECT date FROM payments
+                              WHERE party_type='supplier' AND party_id=?
+                )
+            """, (s["id"], s["id"], s["id"])).fetchone()[0]
+            suppliers.append({
+                "id": s["id"],
+                "name": s["name"],
+                "balance": round(balance, 2),
+                "last_transaction": _date_iso_to_dmy(last_iso),
+            })
+
+        # ── Customers (they owe us) ───────────────────────────────────────────
+        cust_rows = conn.execute(
+            "SELECT id, name, opening_balance FROM customers WHERE type='credit' ORDER BY name"
+        ).fetchall()
+        customers = []
+        for c in cust_rows:
+            ob = float(c["opening_balance"] or 0)
+            sv = float(conn.execute(
+                "SELECT COALESCE(SUM(total_amount),0) FROM sale_vouchers "
+                "WHERE customer_id=? AND type='credit'",
+                (c["id"],)
+            ).fetchone()[0] or 0)
+            sr = float(conn.execute(
+                "SELECT COALESCE(SUM(srl.return_price),0) "
+                "FROM sale_return_lines srl "
+                "JOIN sale_returns sr ON sr.id=srl.sr_id "
+                "WHERE sr.customer_id=?",
+                (c["id"],)
+            ).fetchone()[0] or 0)
+            cr = float(conn.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM payments "
+                "WHERE party_type='customer' AND party_id=? AND type='CR'",
+                (c["id"],)
+            ).fetchone()[0] or 0)
+            balance = ob + sv - sr - cr
+            if abs(balance) < 0.01:
+                continue
+            last_iso = conn.execute(f"""
+                SELECT MAX({_DATE_TO_ISO}) FROM (
+                    SELECT date FROM sale_vouchers WHERE customer_id=?
+                    UNION ALL SELECT date FROM sale_returns WHERE customer_id=?
+                    UNION ALL SELECT date FROM payments
+                              WHERE party_type='customer' AND party_id=?
+                )
+            """, (c["id"], c["id"], c["id"])).fetchone()[0]
+            customers.append({
+                "id": c["id"],
+                "name": c["name"],
+                "balance": round(balance, 2),
+                "last_transaction": _date_iso_to_dmy(last_iso),
+            })
+
+        # ── Bank accounts (ALL) ───────────────────────────────────────────────
+        bank_rows = conn.execute(
+            "SELECT id, name FROM bank_accounts ORDER BY name"
+        ).fetchall()
+        bank_accounts_list = []
+        for ba in bank_rows:
+            balance = _calc_bank_account_balance(conn, ba["id"])
+            # Last transaction: payments + direct bank sales + journal entries
+            last_iso = conn.execute(f"""
+                SELECT MAX({_DATE_TO_ISO}) FROM (
+                    SELECT date FROM payments WHERE party_type='bank' AND party_id=?
+                    UNION ALL SELECT date FROM sale_vouchers
+                              WHERE bank_account_id=? AND bank_amount > 0
+                    UNION ALL SELECT date FROM journal_entries
+                              WHERE party_type='bank' AND party_id=?
+                )
+            """, (ba["id"], ba["id"], ba["id"])).fetchone()[0]
+            bank_accounts_list.append({
+                "id": ba["id"],
+                "name": ba["name"],
+                "balance": round(balance, 2),
+                "last_transaction": _date_iso_to_dmy(last_iso),
+            })
+
+        cash_in_hand = _calc_cash_in_hand(conn)
+
+        return jsonify({
+            "suppliers":     suppliers,
+            "customers":     customers,
+            "bank_accounts": bank_accounts_list,
+            "cash_in_hand":  round(cash_in_hand, 2),
+        })
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+    finally:
+        conn.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Run
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _sync_loop():
+    """Background thread: sync to Supabase 30 s after startup, then every hour."""
+    time.sleep(30)
+    _run_supabase_sync()
+    while True:
+        time.sleep(3600)
+        _run_supabase_sync()
+
 
 if __name__ == "__main__":
     print("=" * 54)
@@ -857,4 +1236,12 @@ if __name__ == "__main__":
     print(f"  Database : {DB_PATH}")
     print("  Listening: http://0.0.0.0:5000")
     print("=" * 54)
+
+    if _SUPABASE_AVAILABLE:
+        _t = threading.Thread(target=_sync_loop, daemon=True)
+        _t.start()
+        print("  Supabase : sync thread started (first run in 30 s)")
+    else:
+        print("  Supabase : supabase_sync.py not found — sync disabled")
+
     app.run(host="0.0.0.0", port=5000, debug=False)

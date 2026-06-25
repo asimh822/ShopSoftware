@@ -319,6 +319,7 @@ class BrandDialog(QDialog):
         self.name_edit = QLineEdit(name.upper() if name else "")
         self.name_edit.setPlaceholderText("e.g. SAMSUNG")
         _setup_uppercase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Brand Name:", self.name_edit)
 
         btns = QDialogButtonBox(
@@ -371,6 +372,7 @@ class ModelDialog(QDialog):
         self.name_edit = QLineEdit(name.upper() if name else "")
         self.name_edit.setPlaceholderText("e.g. A17 8+256")
         _setup_uppercase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Model Name:", self.name_edit)
 
         self.price_spin = QDoubleSpinBox()
@@ -380,6 +382,7 @@ class ModelDialog(QDialog):
         self.price_spin.setGroupSeparatorShown(True)
         self.price_spin.setValue(ref_price or 0)
         self.price_spin.setPrefix("PKR ")
+        self.price_spin.lineEdit().returnPressed.connect(lambda: self.price_spin.focusNextChild())
         form.addRow("Reference Price:", self.price_spin)
 
         btns = QDialogButtonBox(
@@ -442,11 +445,13 @@ class SupplierDialog(QDialog):
         self.name_edit = QLineEdit(name.title() if name else "")
         self.name_edit.setPlaceholderText("Supplier / distributor name")
         _setup_titlecase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Name:", self.name_edit)
 
         self.contact_edit = QLineEdit(contact)
         self.contact_edit.setPlaceholderText("03XXXXXXXXX (11 digits)")
         self.contact_edit.setMaxLength(11)
+        self.contact_edit.returnPressed.connect(lambda: self.contact_edit.focusNextChild())
         form.addRow("Contact:", self.contact_edit)
 
         self.ob_spin = QDoubleSpinBox()
@@ -456,6 +461,7 @@ class SupplierDialog(QDialog):
         self.ob_spin.setGroupSeparatorShown(True)
         self.ob_spin.setValue(ob or 0)
         self.ob_spin.setPrefix("PKR ")
+        self.ob_spin.lineEdit().returnPressed.connect(lambda: self.ob_spin.focusNextChild())
         form.addRow("Opening Balance:", self.ob_spin)
 
         note = QLabel("Amount already owed to this supplier before using this system")
@@ -495,7 +501,7 @@ class SupplierDialog(QDialog):
 
     def get_data(self):
         return (
-            self.name_edit.text().strip(),
+            self.name_edit.text().strip().title(),
             self.contact_edit.text().strip(),
             self.ob_spin.value(),
         )
@@ -515,11 +521,13 @@ class CustomerDialog(QDialog):
         self.name_edit = QLineEdit(name.title() if name else "")
         self.name_edit.setPlaceholderText("Customer / dealer name")
         _setup_titlecase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Name:", self.name_edit)
 
         self.contact_edit = QLineEdit(contact)
         self.contact_edit.setPlaceholderText("03XXXXXXXXX (11 digits)")
         self.contact_edit.setMaxLength(11)
+        self.contact_edit.returnPressed.connect(lambda: self.contact_edit.focusNextChild())
         form.addRow("Contact:", self.contact_edit)
 
         self.ob_spin = QDoubleSpinBox()
@@ -529,6 +537,7 @@ class CustomerDialog(QDialog):
         self.ob_spin.setGroupSeparatorShown(True)
         self.ob_spin.setValue(ob or 0)
         self.ob_spin.setPrefix("PKR ")
+        self.ob_spin.lineEdit().returnPressed.connect(lambda: self.ob_spin.focusNextChild())
         form.addRow("Opening Balance:", self.ob_spin)
 
         note = QLabel("Amount this customer already owes before using this system")
@@ -568,7 +577,7 @@ class CustomerDialog(QDialog):
 
     def get_data(self):
         return (
-            self.name_edit.text().strip(),
+            self.name_edit.text().strip().title(),
             self.contact_edit.text().strip(),
             self.ob_spin.value(),
         )
@@ -590,11 +599,13 @@ class OtherPartyDialog(QDialog):
         self.name_edit = QLineEdit(name.title() if name else "")
         self.name_edit.setPlaceholderText("Person / account name")
         _setup_titlecase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Name:", self.name_edit)
 
         self.contact_edit = QLineEdit(contact)
         self.contact_edit.setPlaceholderText("03XXXXXXXXX (11 digits)")
         self.contact_edit.setMaxLength(11)
+        self.contact_edit.returnPressed.connect(lambda: self.contact_edit.focusNextChild())
         form.addRow("Contact:", self.contact_edit)
 
         # Opening balance can be either direction for a loan account.
@@ -605,6 +616,7 @@ class OtherPartyDialog(QDialog):
         self.ob_spin.setGroupSeparatorShown(True)
         self.ob_spin.setValue(ob or 0)
         self.ob_spin.setPrefix("PKR ")
+        self.ob_spin.lineEdit().returnPressed.connect(lambda: self.ob_spin.focusNextChild())
         form.addRow("Opening Balance:", self.ob_spin)
 
         note = QLabel(
@@ -617,6 +629,7 @@ class OtherPartyDialog(QDialog):
 
         self.notes_edit = QLineEdit(notes or "")
         self.notes_edit.setPlaceholderText("Optional notes (purpose, terms, etc.)")
+        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
         form.addRow("Notes:", self.notes_edit)
 
         btns = QDialogButtonBox(
@@ -651,7 +664,7 @@ class OtherPartyDialog(QDialog):
 
     def get_data(self):
         return (
-            self.name_edit.text().strip(),
+            self.name_edit.text().strip().title(),
             self.contact_edit.text().strip(),
             self.ob_spin.value(),
             self.notes_edit.text().strip(),
@@ -1186,18 +1199,21 @@ class SalesmanDialog(QDialog):
         self.name_edit = QLineEdit(name.title() if name else "")
         self.name_edit.setPlaceholderText("e.g. Ahmed Khan")
         _setup_titlecase_edit(self.name_edit)
+        self.name_edit.returnPressed.connect(lambda: self.name_edit.focusNextChild())
         form.addRow("Name:", self.name_edit)
 
         self.pin_edit = QLineEdit(pin)
         self.pin_edit.setPlaceholderText("4 digits, e.g. 1234")
         self.pin_edit.setMaxLength(4)
         self.pin_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pin_edit.returnPressed.connect(lambda: self.pin_edit.focusNextChild())
         form.addRow("PIN (4 digits):", self.pin_edit)
 
         self.pin_confirm = QLineEdit()
         self.pin_confirm.setPlaceholderText("Re-enter PIN")
         self.pin_confirm.setMaxLength(4)
         self.pin_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pin_confirm.returnPressed.connect(lambda: self.pin_confirm.focusNextChild())
         form.addRow("Confirm PIN:", self.pin_confirm)
 
         hint = QLabel("PIN is used for mobile app login. Must be exactly 4 numeric digits.")
@@ -1229,7 +1245,7 @@ class SalesmanDialog(QDialog):
 
     def get_data(self):
         return (
-            self.name_edit.text().strip(),
+            self.name_edit.text().strip().title(),
             self.pin_edit.text().strip(),
         )
 

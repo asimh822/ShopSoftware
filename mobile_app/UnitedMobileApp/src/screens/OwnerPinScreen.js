@@ -1,7 +1,9 @@
 /**
- * LoginScreen — 4-digit PIN keypad for salesman login.
- * Auto-submits when 4 digits entered.
- * Shake animation on wrong PIN.
+ * OwnerPinScreen — 4-digit PIN gate for owner-only features.
+ *
+ * Two verification paths based on destination:
+ *   'OwnerHome'    → verify against Supabase settings (standalone, no Flask)
+ *   anything else  → verify against Flask /api/owner/dashboard (salesman-flow)
  */
 
 import React, {useState, useRef} from 'react';
@@ -12,22 +14,26 @@ import {
   StyleSheet,
   ActivityIndicator,
   Animated,
-  Alert,
   StatusBar,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import {apiLogin, saveSession} from '../config/api';
+import {apiOwnerGet} from '../config/api';
+import {setOwnerPin} from '../ownerSession';
+import {SUPABASE_URL, SUPABASE_KEY} from '../supabaseConfig';
+
+const SB_HEADERS = {
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+  'Content-Type': 'application/json',
+};
 
 const COLORS = {
-  primary: '#1565C0',
-  primaryDark: '#0D47A1',
-  danger: '#C62828',
-  bg: '#1565C0',
+  bg: '#263238',
   keyBg: '#FFFFFF',
   keyText: '#212121',
   keySpecial: 'rgba(255,255,255,0.15)',
   dot: '#FFFFFF',
   dotEmpty: 'rgba(255,255,255,0.35)',
+  error: '#EF9A9A',
 };
 
 const KEYS = [
@@ -37,9 +43,11 @@ const KEYS = [
   ['', '0', 'DEL'],
 ];
 
-export default function LoginScreen({navigation}) {
+export default function OwnerPinScreen({navigation, route}) {
+  const {destination} = route.params || {};
   const [pin, setPin] = useState('');
   const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
   const shakeAnim = useRef(new Animated.Value(0)).current;
 
   const shake = () => {
@@ -52,71 +60,74 @@ export default function LoginScreen({navigation}) {
     ]).start();
   };
 
-  const handleKey = async (key) => {
+  const handleKey = async key => {
     if (loading) return;
-
     if (key === 'DEL') {
       setPin(p => p.slice(0, -1));
+      setErrorMsg('');
       return;
     }
-    if (key === '') return; // blank placeholder key
+    if (key === '') return;
 
     const newPin = pin + key;
     setPin(newPin);
-
     if (newPin.length === 4) {
-      await doLogin(newPin);
+      await doVerify(newPin);
     }
   };
 
-  const doLogin = async (p) => {
+  const doVerify = async p => {
     setLoading(true);
+    setErrorMsg('');
     try {
-      const data = await apiLogin(p);
-      if (data.success) {
-        await saveSession(data.token, data.salesman.id, data.salesman.name);
-        navigation.replace('Home');
+      if (destination === 'OwnerHome') {
+        // Standalone owner flow — verify against Supabase (no Flask/WiFi needed)
+        const res = await fetch(
+          `${SUPABASE_URL}/rest/v1/settings?key=eq.owner_pin&select=value`,
+          {headers: SB_HEADERS},
+        );
+        const data = await res.json();
+        if (!Array.isArray(data)) {
+          // 404 = settings table not created in Supabase yet
+          throw new Error(data?.code === '42P01' ? 'TABLE_MISSING' : 'CONNECTION_ERROR');
+        }
+        const storedPin = data[0]?.value;
+        if (!storedPin) throw new Error('PIN_NOT_CONFIGURED');
+        if (p !== storedPin) throw new Error('OWNER_AUTH_FAILED');
+        setOwnerPin(p);
+        navigation.reset({index: 0, routes: [{name: 'OwnerHome'}]});
       } else {
-        shake();
-        setPin('');
+        // Salesman-accessed owner flow — verify against Flask
+        await apiOwnerGet('/api/owner/dashboard', p);
+        setOwnerPin(p);
+        navigation.replace(destination || 'OwnerDashboard');
       }
     } catch (err) {
       shake();
       setPin('');
-      if (err.message !== 'SESSION_EXPIRED') {
-        // Show network errors, not auth failures (those are handled by shake)
-        if (err.response?.status !== 401) {
-          Alert.alert('Error', err.message || 'Connection failed.');
-        }
+      if (err.message === 'OWNER_AUTH_FAILED') {
+        setErrorMsg('Incorrect PIN');
+      } else if (err.message === 'PIN_NOT_CONFIGURED') {
+        setErrorMsg('PIN not set — run Supabase SQL');
+      } else if (err.message === 'TABLE_MISSING') {
+        setErrorMsg('Run settings SQL in Supabase first');
+      } else {
+        setErrorMsg(
+          destination === 'OwnerHome' ? 'No internet connection' : 'Connection error',
+        );
       }
     } finally {
       setLoading(false);
     }
   };
 
-  const handleChangeServer = async () => {
-    Alert.alert(
-      'Change Server',
-      'This will take you back to Server Setup.',
-      [
-        {text: 'Cancel', style: 'cancel'},
-        {
-          text: 'Continue',
-          // Keep server_url so SetupScreen can pre-fill it for editing
-          onPress: () => navigation.replace('Setup'),
-        },
-      ],
-    );
-  };
-
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
 
-      <Text style={styles.shopName}>United Mobile</Text>
-      <Text style={styles.shopSub}>Salesman Login</Text>
+      <Text style={styles.title}>Owner Access</Text>
+      <Text style={styles.subtitle}>Enter your 4-digit PIN</Text>
 
-      {/* PIN dots */}
       <Animated.View
         style={[styles.dotsRow, {transform: [{translateX: shakeAnim}]}]}>
         {[0, 1, 2, 3].map(i => (
@@ -130,9 +141,12 @@ export default function LoginScreen({navigation}) {
         ))}
       </Animated.View>
 
-      <Text style={styles.pinHint}>Enter your 4-digit PIN</Text>
+      {errorMsg ? (
+        <Text style={styles.errorText}>{errorMsg}</Text>
+      ) : (
+        <View style={styles.errorPlaceholder} />
+      )}
 
-      {/* Keypad */}
       {loading ? (
         <View style={styles.loadingArea}>
           <ActivityIndicator size="large" color="#fff" />
@@ -164,16 +178,6 @@ export default function LoginScreen({navigation}) {
           ))}
         </View>
       )}
-
-      <TouchableOpacity
-        style={styles.ownerAccess}
-        onPress={() => navigation.navigate('OwnerPin', {destination: 'OwnerHome'})}>
-        <Text style={styles.ownerAccessText}>Owner Access</Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity style={styles.changeServer} onPress={handleChangeServer}>
-        <Text style={styles.changeServerText}>Change Server</Text>
-      </TouchableOpacity>
     </View>
   );
 }
@@ -186,16 +190,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingBottom: 30,
   },
-  shopName: {
-    fontSize: 28,
+  title: {
+    fontSize: 26,
     fontWeight: 'bold',
     color: '#fff',
     marginBottom: 4,
   },
-  shopSub: {
+  subtitle: {
     fontSize: 14,
-    color: 'rgba(255,255,255,0.7)',
-    marginBottom: 40,
+    color: 'rgba(255,255,255,0.6)',
+    marginBottom: 36,
   },
   dotsRow: {
     flexDirection: 'row',
@@ -209,10 +213,14 @@ const styles = StyleSheet.create({
   },
   dotFilled: {backgroundColor: COLORS.dot},
   dotEmpty: {backgroundColor: COLORS.dotEmpty},
-  pinHint: {
+  errorText: {
     fontSize: 13,
-    color: 'rgba(255,255,255,0.6)',
-    marginBottom: 36,
+    color: COLORS.error,
+    marginBottom: 24,
+    fontWeight: '600',
+  },
+  errorPlaceholder: {
+    height: 13 + 24,
   },
   loadingArea: {
     height: 240,
@@ -262,27 +270,5 @@ const styles = StyleSheet.create({
   keyDelText: {
     color: '#fff',
     fontSize: 22,
-  },
-  ownerAccess: {
-    marginTop: 28,
-    paddingVertical: 9,
-    paddingHorizontal: 32,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.35)',
-  },
-  ownerAccessText: {
-    color: 'rgba(255,255,255,0.75)',
-    fontSize: 13,
-    letterSpacing: 0.5,
-  },
-  changeServer: {
-    marginTop: 16,
-    padding: 10,
-  },
-  changeServerText: {
-    color: 'rgba(255,255,255,0.55)',
-    fontSize: 13,
-    textDecorationLine: 'underline',
   },
 });

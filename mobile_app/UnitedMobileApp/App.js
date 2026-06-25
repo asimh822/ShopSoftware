@@ -17,6 +17,12 @@ import NewSaleScreen from './src/screens/NewSaleScreen';
 import NewPurchaseScreen from './src/screens/NewPurchaseScreen';
 import StockCheckScreen from './src/screens/StockCheckScreen';
 import MyTodayScreen from './src/screens/MyTodayScreen';
+import OwnerPinScreen from './src/screens/OwnerPinScreen';
+import OwnerHomeScreen from './src/screens/OwnerHomeScreen';
+import OwnerDashboardScreen from './src/screens/OwnerDashboardScreen';
+import OwnerTodaySalesScreen from './src/screens/OwnerTodaySalesScreen';
+import OwnerBalancesScreen from './src/screens/OwnerBalancesScreen';
+import OwnerTodayDigestScreen from './src/screens/OwnerTodayDigestScreen';
 
 const Stack = createStackNavigator();
 
@@ -104,6 +110,36 @@ export default function App() {
             name="MyToday"
             component={MyTodayScreen}
             options={{title: "Today's Summary"}}
+          />
+          <Stack.Screen
+            name="OwnerPin"
+            component={OwnerPinScreen}
+            options={{title: 'Owner Access'}}
+          />
+          <Stack.Screen
+            name="OwnerHome"
+            component={OwnerHomeScreen}
+            options={{title: 'Owner Panel', headerLeft: () => null}}
+          />
+          <Stack.Screen
+            name="OwnerDashboard"
+            component={OwnerDashboardScreen}
+            options={{title: 'Owner Dashboard'}}
+          />
+          <Stack.Screen
+            name="OwnerTodaySales"
+            component={OwnerTodaySalesScreen}
+            options={{title: "Today's Sales"}}
+          />
+          <Stack.Screen
+            name="OwnerBalances"
+            component={OwnerBalancesScreen}
+            options={{title: 'Balances'}}
+          />
+          <Stack.Screen
+            name="OwnerTodayDigest"
+            component={OwnerTodayDigestScreen}
+            options={{title: "Today's Digest"}}
           />
         </Stack.Navigator>
       </NavigationContainer>

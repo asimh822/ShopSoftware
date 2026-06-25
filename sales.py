@@ -148,8 +148,8 @@ def db_customer_balance(customer_id):
         SELECT COALESCE(c.opening_balance, 0)
                + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
                - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
+               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
+               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
                AS balance
         FROM customers c WHERE c.id=?
     """, (customer_id,)).fetchone()
@@ -584,25 +584,47 @@ class ImeiDropdown(QWidget):
 class ImeiSelectDialog(QDialog):
     def __init__(self, results, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select IMEI")
-        self.setMinimumWidth(560)
+        self.setWindowTitle("Browse Stock")
+        self.setMinimumWidth(620)
+        self.resize(680, 480)
         self._selected = None
+        self._all_results = [dict(r) for r in results]
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        layout.addWidget(QLabel(f"{len(results)} items match. Select one:"))
+        # Search bar
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Type brand, model or IMEI…")
+        self._search.setStyleSheet(
+            "border:1px solid #cbd5e1; border-radius:5px; padding:5px 10px; font-size:10pt;"
+        )
+        self._search.textChanged.connect(self._filter_table)
+        search_row.addWidget(self._search)
+        layout.addLayout(search_row)
+
+        self._count_lbl = QLabel(f"{len(results)} items in stock")
+        self._count_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
+        layout.addWidget(self._count_lbl)
 
         self.table = _make_table(["IMEI", "Brand", "Model", "Ref Price (PKR)"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setFixedHeight(220)
-        for r in results:
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 155)
+        self.table.setColumnWidth(1, 110)
+        self.table.setColumnWidth(3, 140)
+        for r in self._all_results:
             row = self.table.rowCount()
             self.table.insertRow(row)
             item = QTableWidgetItem(r["imei"])
-            item.setData(Qt.ItemDataRole.UserRole, dict(r))
+            item.setData(Qt.ItemDataRole.UserRole, r)
             self.table.setItem(row, 0, item)
             self.table.setItem(row, 1, QTableWidgetItem(r["brand_name"]))
             self.table.setItem(row, 2, QTableWidgetItem(r["model_name"]))
@@ -619,9 +641,28 @@ class ImeiSelectDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+        self._search.setFocus()
+
+    def _filter_table(self, text):
+        needle = text.strip().lower()
+        visible = 0
+        for row in range(self.table.rowCount()):
+            if needle == "":
+                self.table.setRowHidden(row, False)
+                visible += 1
+            else:
+                imei  = (self.table.item(row, 0).text() or "").lower()
+                brand = (self.table.item(row, 1).text() or "").lower()
+                model = (self.table.item(row, 2).text() or "").lower()
+                match = needle in imei or needle in brand or needle in model
+                self.table.setRowHidden(row, not match)
+                if match:
+                    visible += 1
+        self._count_lbl.setText(f"{visible} item(s) shown")
+
     def _pick(self):
         row = self.table.currentRow()
-        if row < 0:
+        if row < 0 or self.table.isRowHidden(row):
             QMessageBox.warning(self, "Select", "Select a row first.")
             return
         self._selected = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
@@ -701,9 +742,26 @@ class SaleDetailDialog(QDialog):
             note_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
             layout.addWidget(note_lbl)
 
+        btn_delete = QPushButton("🗑 Delete Voucher")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 14px; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(lambda: self._delete_and_close(sv_row))
+        layout.addWidget(btn_delete)
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+    def _delete_and_close(self, sv_row):
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "sale", sv_row["id"], sv_row["sv_number"], "Owner"
+        )
+        if deleted:
+            self.accept()
 
 
 # ── Contact field that blocks focus-out when the number is partially entered ──
@@ -730,61 +788,26 @@ class SaleForm(QWidget):
 
         self.setStyleSheet(FORM_INPUT_STYLE)
 
-        # Outer layout holds only the scroll area
-        _outer = QVBoxLayout(self)
-        _outer.setContentsMargins(0, 0, 0, 0)
-        _outer.setSpacing(0)
-
-        _scroll = QScrollArea()
-        _scroll.setWidgetResizable(True)
-        _scroll.setFrameShape(QFrame.Shape.NoFrame)
-        _outer.addWidget(_scroll)
-
-        _container = QWidget()
-        _container.setStyleSheet("background:#f1f5f9;")
-        _scroll.setWidget(_container)
-
-        layout = QVBoxLayout(_container)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
-
-        # ── Title bar ────────────────────────────────────────────────────────
-        top = QHBoxLayout()
-        title = QLabel("New Sale")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        top.addWidget(title)
-        top.addStretch()
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet(BTN_SECONDARY)
-        btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Sale")
-        self.btn_save.setStyleSheet(BTN_PRIMARY)
-        self.btn_save.clicked.connect(self._save)
-        top.addWidget(btn_cancel)
-        top.addWidget(self.btn_save)
-        layout.addLayout(top)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
 
         # ── Header card ──────────────────────────────────────────────────────
         header = QFrame()
         header.setStyleSheet(CARD_STYLE)
-        hl = QVBoxLayout(header)
-        hl.setContentsMargins(16, 12, 16, 12)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(12, 8, 12, 8)
         hl.setSpacing(8)
 
-        # ── Date | Sale Type | Salesman — single inline row ──────────────────
-        row1 = QHBoxLayout()
-        row1.setSpacing(10)
-
-        row1.addWidget(QLabel("Date:"))
+        hl.addWidget(QLabel("Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setMinimumWidth(130)
-        row1.addWidget(self.date_edit)
+        hl.addWidget(self.date_edit)
 
-        row1.addSpacing(12)
-        row1.addWidget(QLabel("Sale Type:"))
+        hl.addSpacing(8)
+        hl.addWidget(QLabel("Sale Type:"))
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(0)
         self.btn_cash = QPushButton("Cash")
@@ -802,12 +825,12 @@ class SaleForm(QWidget):
         self.btn_credit.clicked.connect(lambda: self._set_type("credit"))
         toggle_row.addWidget(self.btn_cash)
         toggle_row.addWidget(self.btn_credit)
-        row1.addLayout(toggle_row)
+        hl.addLayout(toggle_row)
 
-        row1.addSpacing(12)
+        hl.addSpacing(8)
         sal_lbl = QLabel("Salesman *:")
         sal_lbl.setStyleSheet("color:#dc2626; font-weight:bold;")
-        row1.addWidget(sal_lbl)
+        hl.addWidget(sal_lbl)
         self.salesman_combo = SearchableComboBox()
         self.salesman_combo.setMinimumWidth(200)
         self.salesman_combo.addItem("— Select Salesman —", None)
@@ -817,14 +840,12 @@ class SaleForm(QWidget):
             self.salesman_combo.setToolTip(
                 "No active salesmen — add one in Masters → Salesmen first."
             )
-        row1.addWidget(self.salesman_combo)
-        row1.addStretch()
-        hl.addLayout(row1)
+        hl.addWidget(self.salesman_combo)
 
+        hl.addSpacing(8)
         # Customer section — stacked (cash / credit)
         self._sale_type = "cash"
         self.customer_stack = QStackedWidget()
-        self.customer_stack.setFixedHeight(52)
 
         # Cash page — contact number first, name second
         cash_widget = QWidget()
@@ -838,6 +859,7 @@ class SaleForm(QWidget):
         self.cash_contact.setMaxLength(11)
         self.cash_contact.setMinimumWidth(150)
         self.cash_contact.textChanged.connect(self._on_cash_contact_changed)
+        self.cash_contact.returnPressed.connect(lambda: self.cash_contact.focusNextChild())
         cash_row.addWidget(self.cash_contact)
 
         self.contact_status_lbl = QLabel("")
@@ -893,6 +915,7 @@ class SaleForm(QWidget):
             self.btn_credit.setToolTip("No credit customers — add one in Masters first.")
 
         hl.addWidget(self.customer_stack)
+        hl.addStretch()
         layout.addWidget(header)
 
         # ── IMEI lookup card ──────────────────────────────────────────────────
@@ -979,19 +1002,23 @@ class SaleForm(QWidget):
         self.lines_table.setColumnWidth(5, 140)
         self.lines_table.setColumnWidth(6, 90)
         self.lines_table.setColumnWidth(8, 80)
-        self.lines_table.setMinimumHeight(360)
         self.lines_table.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked |
             QAbstractItemView.EditTrigger.AnyKeyPressed
         )
         self.lines_table.cellChanged.connect(self._on_price_cell_changed)
-        layout.addWidget(self.lines_table)
+        layout.addWidget(self.lines_table, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
-        footer = QHBoxLayout()
-        footer.setSpacing(16)
-        footer.addStretch()
-        footer.addWidget(QLabel("Overall Discount (PKR):"))
+        # ── Pinned footer strip ───────────────────────────────────────────────
+        self._payment_mode = "cash"
+
+        footer_frame = QFrame()
+        footer_frame.setStyleSheet(CARD_STYLE)
+        footer_strip = QHBoxLayout(footer_frame)
+        footer_strip.setContentsMargins(12, 8, 12, 8)
+        footer_strip.setSpacing(8)
+
+        footer_strip.addWidget(QLabel("Overall Discount (PKR):"))
         self.discount_spin = QDoubleSpinBox()
         self.discount_spin.setRange(0, 9_999_999)
         self.discount_spin.setDecimals(0)
@@ -999,27 +1026,17 @@ class SaleForm(QWidget):
         self.discount_spin.setGroupSeparatorShown(True)
         self.discount_spin.setMinimumWidth(120)
         self.discount_spin.valueChanged.connect(self._update_total)
-        footer.addWidget(self.discount_spin)
+        self.discount_spin.lineEdit().returnPressed.connect(
+            lambda: self.discount_spin.focusNextChild())
+        footer_strip.addWidget(self.discount_spin)
+
         self.total_label = QLabel("Total: PKR 0")
         self.total_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_label.setStyleSheet("color:#1d4ed8;")
-        footer.addWidget(self.total_label)
-        layout.addLayout(footer)
+        footer_strip.addWidget(self.total_label)
 
-        # ── Payment method card ───────────────────────────────────────────────
-        self._payment_mode = "cash"
-        self.payment_card = QFrame()
-        self.payment_card.setStyleSheet(CARD_STYLE)
-        pm_layout = QVBoxLayout(self.payment_card)
-        pm_layout.setContentsMargins(16, 12, 16, 12)
-        pm_layout.setSpacing(8)
-
-        pm_top = QHBoxLayout()
-        pm_label = QLabel("Payment Method")
-        pm_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        pm_label.setStyleSheet("color:#1e293b;")
-        pm_top.addWidget(pm_label)
-        pm_top.addStretch()
+        footer_strip.addSpacing(16)
+        footer_strip.addWidget(QLabel("Payment:"))
 
         pm_toggle = QHBoxLayout()
         pm_toggle.setSpacing(0)
@@ -1044,8 +1061,7 @@ class SaleForm(QWidget):
         pm_toggle.addWidget(self.btn_pay_cash)
         pm_toggle.addWidget(self.btn_pay_bank)
         pm_toggle.addWidget(self.btn_pay_split)
-        pm_top.addLayout(pm_toggle)
-        pm_layout.addLayout(pm_top)
+        footer_strip.addLayout(pm_toggle)
 
         self._pm_stack = QStackedWidget()
         self._pm_stack.setFixedHeight(36)
@@ -1074,6 +1090,7 @@ class SaleForm(QWidget):
         self.pay_bank_ref = QLineEdit()
         self.pay_bank_ref.setPlaceholderText("Optional")
         self.pay_bank_ref.setMinimumWidth(140)
+        self.pay_bank_ref.returnPressed.connect(lambda: self.pay_bank_ref.focusNextChild())
         bank_pm_row.addWidget(self.pay_bank_ref)
         bank_pm_row.addStretch()
         self._pm_stack.addWidget(bank_pm_widget)
@@ -1091,6 +1108,8 @@ class SaleForm(QWidget):
         self.pay_split_cash_spin.setGroupSeparatorShown(True)
         self.pay_split_cash_spin.setMinimumWidth(120)
         self.pay_split_cash_spin.valueChanged.connect(self._update_split_bank_lbl)
+        self.pay_split_cash_spin.lineEdit().returnPressed.connect(
+            lambda: self.pay_split_cash_spin.focusNextChild())
         split_pm_row.addWidget(self.pay_split_cash_spin)
         split_pm_row.addWidget(QLabel("Bank:"))
         self.pay_split_bank_combo = QComboBox()
@@ -1101,6 +1120,8 @@ class SaleForm(QWidget):
         self.pay_split_bank_ref = QLineEdit()
         self.pay_split_bank_ref.setPlaceholderText("Optional")
         self.pay_split_bank_ref.setMinimumWidth(100)
+        self.pay_split_bank_ref.returnPressed.connect(
+            lambda: self.pay_split_bank_ref.focusNextChild())
         split_pm_row.addWidget(self.pay_split_bank_ref)
         self.pay_split_bank_lbl = QLabel("Bank: PKR 0")
         self.pay_split_bank_lbl.setStyleSheet("color:#1d4ed8; font-size:9pt; font-weight:bold;")
@@ -1108,8 +1129,19 @@ class SaleForm(QWidget):
         split_pm_row.addStretch()
         self._pm_stack.addWidget(split_pm_widget)
 
-        pm_layout.addWidget(self._pm_stack)
-        layout.addWidget(self.payment_card)
+        footer_strip.addWidget(self._pm_stack)
+        footer_strip.addStretch()
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(BTN_SECONDARY)
+        btn_cancel.clicked.connect(on_cancel)
+        self.btn_save = QPushButton("Save Sale")
+        self.btn_save.setStyleSheet(BTN_PRIMARY)
+        self.btn_save.clicked.connect(self._save)
+        footer_strip.addWidget(btn_cancel)
+        footer_strip.addWidget(self.btn_save)
+
+        layout.addWidget(footer_frame)
 
     # ── Bank account combo helper ─────────────────────────────────────────────
 
@@ -1514,7 +1546,7 @@ class SaleForm(QWidget):
             cash_name = cash_contact = None
         else:
             cash_contact = self.cash_contact.text().strip()
-            cash_name = self.cash_name.text().strip()
+            cash_name = self.cash_name.text().strip().title()
             if not cash_contact:
                 QMessageBox.warning(self, "Missing",
                     "Contact number is required for cash sales.")
@@ -1684,6 +1716,16 @@ class SaleListView(QWidget):
         self.btn_edit.setEnabled(False)
         self.btn_edit.clicked.connect(self._edit_selected)
         top.addWidget(self.btn_edit)
+        self.btn_delete_sv = QPushButton("🗑 Delete")
+        self.btn_delete_sv.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+            QPushButton:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; }
+        """)
+        self.btn_delete_sv.setEnabled(False)
+        self.btn_delete_sv.clicked.connect(self._delete_selected)
+        top.addWidget(self.btn_delete_sv)
         btn_new = QPushButton("+ New Sale")
         btn_new.setStyleSheet(BTN_PRIMARY)
         btn_new.clicked.connect(on_new)
@@ -1754,6 +1796,9 @@ class SaleListView(QWidget):
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit.setEnabled(self.table.currentRow() >= 0)
+        )
+        self.table.itemSelectionChanged.connect(
+            lambda: self.btn_delete_sv.setEnabled(self.table.currentRow() >= 0)
         )
         layout.addWidget(self.table, stretch=1)
 
@@ -1872,6 +1917,18 @@ class SaleListView(QWidget):
             return
         sv_row = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
         SaleDetailDialog(sv_row, self).exec()
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        sv = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "sale", sv["id"], sv["sv_number"], "Owner"
+        )
+        if deleted:
+            self.refresh()
 
 
 # ── Sold IMEI Dropdown ────────────────────────────────────────────────────────
@@ -2278,6 +2335,16 @@ class SaleReturnListView(QWidget):
         self.btn_edit_sr.setEnabled(False)
         self.btn_edit_sr.clicked.connect(self._edit_selected)
         top.addWidget(self.btn_edit_sr)
+        self.btn_delete_sr = QPushButton("🗑 Delete")
+        self.btn_delete_sr.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 16px; font-size:10pt; }
+            QPushButton:hover { background:#fecaca; }
+            QPushButton:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; }
+        """)
+        self.btn_delete_sr.setEnabled(False)
+        self.btn_delete_sr.clicked.connect(self._delete_selected)
+        top.addWidget(self.btn_delete_sr)
         btn_new = QPushButton("+ New Return")
         btn_new.setStyleSheet(BTN_PRIMARY)
         btn_new.clicked.connect(on_new)
@@ -2331,6 +2398,9 @@ class SaleReturnListView(QWidget):
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit_sr.setEnabled(self.table.currentRow() >= 0)
         )
+        self.table.itemSelectionChanged.connect(
+            lambda: self.btn_delete_sr.setEnabled(self.table.currentRow() >= 0)
+        )
         layout.addWidget(self.table, stretch=1)
 
         self.refresh()
@@ -2377,6 +2447,18 @@ class SaleReturnListView(QWidget):
             "sale_return", sr["id"], sr["sr_number"], sr["date"], sr["notes"], self
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        sr = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        from database import prompt_and_delete_voucher
+        deleted = prompt_and_delete_voucher(
+            self, "sale_return", sr["id"], sr["sr_number"], "Owner"
+        )
+        if deleted:
             self.refresh()
 
 

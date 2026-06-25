@@ -352,6 +352,36 @@ def db_stock_valuation(brand_id=None):
     return rows
 
 
+def db_dead_stock() -> list:
+    """
+    All in-stock items with their purchase date and supplier, oldest first.
+    Items with no purchase voucher (data gap) sort to the end.
+    Returns list of dicts: model, imei, supplier, purchase_price, purchase_date (DD/MM/YYYY).
+    """
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT b.name || ' ' || m.name AS model,
+               TRIM(si.imei) AS imei,
+               CASE WHEN s.id IS NULL OR s.id = 0 THEN '—' ELSE s.name END AS supplier,
+               si.purchase_price,
+               COALESCE(pv.date, '') AS purchase_date
+        FROM stock_items si
+        JOIN models m ON m.id = si.model_id
+        JOIN brands b ON b.id = m.brand_id
+        LEFT JOIN purchase_lines pl ON pl.id = si.purchase_line_id
+        LEFT JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id
+        WHERE si.status = 'in_stock'
+        ORDER BY
+            CASE WHEN pv.date IS NULL OR pv.date = '' THEN 1 ELSE 0 END,
+            substr(COALESCE(pv.date,'9999/99/99'),7,4)
+            ||'-'||substr(COALESCE(pv.date,'9999/99/99'),4,2)
+            ||'-'||substr(COALESCE(pv.date,'9999/99/99'),1,2)
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def db_stock_imei_report(search_text=None):
     """Individual in-stock IMEIs with purchase info and supplier, for the IMEI Stock report tab."""
     conds, params = ["si.status='in_stock'"], []
@@ -824,6 +854,105 @@ def db_cash_book(date_str: str) -> dict:
     }
 
 
+def build_daily_digest(date_str: str) -> dict:
+    """
+    Owner daily digest for a given date (DD/MM/YYYY).
+    Reuses db_cash_book() for all cash/bank figures so logic stays in one place.
+
+    Returns:
+        date            — the requested date
+        sales_count     — total number of sale vouchers
+        sales_total     — combined value of all sales (cash + credit)
+        gross_profit    — sum of (final_price - purchase_price) for every item sold
+        net_cash        — cash gained / lost today (total_cash_in - total_cash_out)
+        net_bank        — bank gained / lost today (total_bank_in - total_bank_out)
+        below_cost_count— number of individual sale lines sold below purchase price
+        biggest_discount— largest single-voucher discount amount
+        credit_given    — total amount of new credit sales today
+        credit_collected— total cash received from credit customers today (CR payments)
+        expenses_cash   — total cash expenses paid today
+    """
+    cb = db_cash_book(date_str)
+    net_cash = cb["total_cash_in"] - cb["total_cash_out"]
+    net_bank = cb["total_bank_in"] - cb["total_bank_out"]
+
+    dd, mm, yyyy = date_str.split("/")
+    iso = f"{yyyy}-{mm}-{dd}"
+
+    conn = get_connection()
+
+    def _de(col):
+        return f"substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2)"
+
+    def _q(sql, params=()):
+        return float(conn.execute(sql, params).fetchone()[0] or 0)
+
+    de_sv = _de("sv.date")
+    de_p  = _de("p.date")
+    de_e  = _de("e.date")
+
+    sales_count = int(_q(
+        f"SELECT COUNT(*) FROM sale_vouchers sv WHERE {de_sv}=?", (iso,)
+    ))
+    sales_total = _q(
+        f"SELECT COALESCE(SUM(sv.total_amount),0) FROM sale_vouchers sv WHERE {de_sv}=?",
+        (iso,),
+    )
+
+    gross_profit = _q(f"""
+        SELECT COALESCE(SUM(sl.final_price - si.purchase_price), 0)
+        FROM sale_lines sl
+        JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        JOIN stock_items si   ON si.id = sl.stock_item_id
+        WHERE {de_sv}=?
+    """, (iso,))
+
+    below_cost_count = int(_q(f"""
+        SELECT COUNT(*)
+        FROM sale_lines sl
+        JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        JOIN stock_items si   ON si.id = sl.stock_item_id
+        WHERE {de_sv}=? AND sl.final_price < si.purchase_price
+    """, (iso,)))
+
+    biggest_discount = _q(
+        f"SELECT COALESCE(MAX(sv.discount),0) FROM sale_vouchers sv WHERE {de_sv}=?",
+        (iso,),
+    )
+
+    credit_given = _q(
+        f"SELECT COALESCE(SUM(sv.total_amount),0) FROM sale_vouchers sv"
+        f" WHERE {de_sv}=? AND sv.type='credit'",
+        (iso,),
+    )
+    credit_collected = _q(
+        f"SELECT COALESCE(SUM(p.amount),0) FROM payments p"
+        f" WHERE {de_p}=? AND p.type='CR' AND p.party_type='customer'",
+        (iso,),
+    )
+
+    expenses_cash = _q(
+        f"SELECT COALESCE(SUM(e.amount),0) FROM expenses e"
+        f" WHERE {de_e}=? AND LOWER(COALESCE(e.payment_method,'cash'))='cash'",
+        (iso,),
+    )
+
+    conn.close()
+    return {
+        "date":             date_str,
+        "sales_count":      sales_count,
+        "sales_total":      sales_total,
+        "gross_profit":     gross_profit,
+        "net_cash":         net_cash,
+        "net_bank":         net_bank,
+        "below_cost_count": below_cost_count,
+        "biggest_discount": biggest_discount,
+        "credit_given":     credit_given,
+        "credit_collected": credit_collected,
+        "expenses_cash":    expenses_cash,
+    }
+
+
 # ── Tab 1: Stock Report ───────────────────────────────────────────────────────
 
 class StockReportTab(QWidget):
@@ -1113,6 +1242,145 @@ class StockValuationTab(QWidget):
                 for r in rows]
         return ("Stock_Valuation", "Stock Valuation",
                 ["Brand", "Model", "Units", "Value (PKR)"], data, {2, 3})
+
+
+# ── Tab: Aging / Dead Stock ──────────────────────────────────────────────────
+
+_BUCKET_CONFIGS = [
+    ("0-30",  "0–30 days",  "#f0fdf4", "#16a34a"),
+    ("31-60", "31–60 days", "#fefce8", "#92400e"),
+    ("61-90", "61–90 days", "#fff7ed", "#c2410c"),
+    ("90+",   "90+ days",   "#fef2f2", "#dc2626"),
+]
+
+
+class AgingStockTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setStyleSheet(BTN_SECONDARY)
+        btn_refresh.clicked.connect(self.refresh)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        layout.addWidget(_filter_card(btn_refresh, None, btn_pdf, btn_csv))
+
+        self.table = _make_table(
+            ["Model", "IMEI", "Supplier", "Purchase Price (Rs.)", "Days Held"]
+        )
+        self.table.setSortingEnabled(False)
+        layout.addWidget(self.table, stretch=1)
+
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        rows = db_dead_stock()
+        today = datetime.date.today()
+
+        # Bucket rows by days held; compute days in Python (dates are DD/MM/YYYY)
+        buckets = {k: [] for k, *_ in _BUCKET_CONFIGS}
+        for r in rows:
+            ds = r["purchase_date"]
+            try:
+                days = (today - datetime.datetime.strptime(ds, "%d/%m/%Y").date()).days
+            except (ValueError, TypeError):
+                days = None
+            r["days_held"] = days
+            if days is None or days <= 30:
+                buckets["0-30"].append(r)
+            elif days <= 60:
+                buckets["31-60"].append(r)
+            elif days <= 90:
+                buckets["61-90"].append(r)
+            else:
+                buckets["90+"].append(r)
+
+        self.table.setRowCount(0)
+        total_units = 0
+        total_value = 0.0
+
+        for bucket_key, bucket_label, hdr_bg, hdr_fg in _BUCKET_CONFIGS:
+            items = buckets[bucket_key]
+            if not items:
+                continue
+
+            # Bucket header row (spans all 5 columns)
+            b_units = len(items)
+            b_value = sum(float(r["purchase_price"] or 0) for r in items)
+            hdr_text = (
+                f"{bucket_label}: {b_units} unit{'s' if b_units != 1 else ''}"
+                f",  Rs. {fmt_pkr(b_value)} tied up"
+            )
+            hrow = self.table.rowCount()
+            self.table.insertRow(hrow)
+            hitem = QTableWidgetItem(hdr_text)
+            hitem.setBackground(QBrush(QColor(hdr_bg)))
+            hitem.setForeground(QBrush(QColor(hdr_fg)))
+            hitem.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            hitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(hrow, 0, hitem)
+            self.table.setSpan(hrow, 0, 1, 5)
+
+            is_red = bucket_key == "90+"
+            fg_brush = QBrush(QColor("#dc2626")) if is_red else None
+            bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+
+            for r in items:
+                drow = self.table.rowCount()
+                self.table.insertRow(drow)
+
+                for col, val in enumerate([r["model"], r["imei"], r["supplier"]]):
+                    item = QTableWidgetItem(val or "—")
+                    if is_red:
+                        item.setForeground(fg_brush)
+                    self.table.setItem(drow, col, item)
+
+                price_item = QTableWidgetItem(fmt_pkr(r["purchase_price"]))
+                price_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                if is_red:
+                    price_item.setForeground(fg_brush)
+                self.table.setItem(drow, 3, price_item)
+
+                days_val = r["days_held"]
+                days_item = QTableWidgetItem(
+                    str(days_val) if days_val is not None else "—"
+                )
+                days_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                if is_red:
+                    days_item.setForeground(fg_brush)
+                    days_item.setFont(bold_font)
+                self.table.setItem(drow, 4, days_item)
+
+                total_units += 1
+                total_value += float(r["purchase_price"] or 0)
+
+        in_90plus = len(buckets["90+"])
+        self.footer.setText(
+            f"Total in stock: {total_units} units    |    "
+            f"Total capital tied up: Rs. {fmt_pkr(total_value)}"
+            + (f"    |    <span style='color:#dc2626;font-weight:bold;'>"
+               f"{in_90plus} unit{'s' if in_90plus != 1 else ''} aged 90+ days</span>"
+               if in_90plus else "")
+        )
+        self.footer.setTextFormat(Qt.TextFormat.RichText)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        return ("Aging_Stock", "Aging / Dead Stock Report", headers, rows, {3, 4})
 
 
 # ── Tab 3: Sales Report ───────────────────────────────────────────────────────
@@ -2592,6 +2860,822 @@ class ExpensesReportTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(ex))
 
 
+# ── Aging Receivables / Payables ─────────────────────────────────────────────
+
+def db_aging_receivables_payables() -> dict:
+    """
+    Stage A aging report.
+    For each credit customer or supplier with a non-zero balance returns:
+        name, balance, last_payment (DD/MM/YYYY or '—'), days_since (int or None).
+
+    'Last payment' means the most recent cash receipt from a customer (CR)
+    or cash payment to a supplier (CP) recorded in the payments table.
+    Parties with no payment ever get days_since=None (sorted last / highlighted
+    as the most overdue).
+
+    Both lists are sorted longest-overdue first (None treated as ∞).
+    """
+    conn = get_connection()
+    today = datetime.date.today()
+    de = "substr(date,7,4)||'-'||substr(date,4,2)||'-'||substr(date,1,2)"
+
+    def _last_payment(party_type: str, party_id: int, pay_type: str):
+        row = conn.execute(
+            f"SELECT MAX({de}) AS iso FROM payments "
+            f"WHERE party_type=? AND party_id=? AND type=?",
+            (party_type, party_id, pay_type),
+        ).fetchone()
+        iso = row["iso"] if row else None
+        if iso:
+            y, m, d = iso.split("-")
+            dmy = f"{d}/{m}/{y}"
+            days = (today - datetime.date(int(y), int(m), int(d))).days
+            return dmy, days
+        return "—", None
+
+    # ── Receivables: credit customers with non-zero balance ───────────────────
+    customers = conn.execute(
+        "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    receivables = []
+    for c in customers:
+        bal = _party_closing_balance(conn, "customer", c["id"])
+        if abs(bal) < 0.01:
+            continue
+        last_pay, days_since = _last_payment("customer", c["id"], "CR")
+        receivables.append({
+            "name": c["name"], "balance": bal,
+            "last_payment": last_pay, "days_since": days_since,
+        })
+    receivables.sort(
+        key=lambda r: r["days_since"] if r["days_since"] is not None else 999999,
+        reverse=True,
+    )
+
+    # ── Payables: suppliers with non-zero balance ─────────────────────────────
+    suppliers = conn.execute(
+        "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
+    payables = []
+    for s in suppliers:
+        if "OPENING STOCK" in s["name"].upper():
+            continue
+        bal = _party_closing_balance(conn, "supplier", s["id"])
+        if abs(bal) < 0.01:
+            continue
+        last_pay, days_since = _last_payment("supplier", s["id"], "CP")
+        payables.append({
+            "name": s["name"], "balance": bal,
+            "last_payment": last_pay, "days_since": days_since,
+        })
+    payables.sort(
+        key=lambda r: r["days_since"] if r["days_since"] is not None else 999999,
+        reverse=True,
+    )
+
+    conn.close()
+    return {"receivables": receivables, "payables": payables}
+
+
+# ── FIFO Aging (Stage B) ──────────────────────────────────────────────────────
+
+def db_fifo_aging() -> dict:
+    """
+    Stage B FIFO aging.
+    For each credit customer / supplier with a non-zero balance, builds the full
+    transaction stream (same sources as _party_closing_balance), allocates credits
+    against oldest debits first (FIFO), then buckets remaining unallocated debits
+    by age from today.
+
+    Returns:
+        {
+          "receivables": [{"name", "balance", "b0_30", "b31_60", "b61_90", "b90plus"}, ...],
+          "payables":    [{"name", "balance", "b0_30", "b31_60", "b61_90", "b90plus"}, ...],
+        }
+    """
+    conn = get_connection()
+    today = datetime.date.today()
+
+    fy_row = conn.execute(
+        "SELECT value FROM settings WHERE key='financial_year_start'"
+    ).fetchone()
+    fy_start = today
+    if fy_row and fy_row[0]:
+        try:
+            _d, _m, _y = fy_row[0].split("/")
+            fy_start = datetime.date(int(_y), int(_m), int(_d))
+        except Exception:
+            pass
+
+    def _to_date(s: str) -> datetime.date:
+        try:
+            return datetime.datetime.strptime(s, "%d/%m/%Y").date()
+        except Exception:
+            return today
+
+    def _build_stream(party_type: str, party_id: int, ob: float) -> list:
+        stream = []
+
+        # Opening balance uses financial_year_start so pre-system debt ages into 90+
+        if ob > 0.001:
+            stream.append([fy_start, ob, 0.0])
+        elif ob < -0.001:
+            stream.append([fy_start, 0.0, abs(ob)])
+
+        if party_type == "supplier":
+            for r in conn.execute(
+                "SELECT date, total_amount FROM purchase_vouchers WHERE supplier_id=?",
+                (party_id,),
+            ):
+                stream.append([_to_date(r[0]), float(r[1] or 0), 0.0])
+
+            for r in conn.execute(
+                "SELECT date, total_amount FROM sale_vouchers "
+                "WHERE supplier_as_customer_id=?", (party_id,),
+            ):
+                stream.append([_to_date(r[0]), 0.0, float(r[1] or 0)])
+
+            for r in conn.execute(
+                "SELECT date, amount, type FROM payments "
+                "WHERE party_type='supplier' AND party_id=?", (party_id,),
+            ):
+                amt = float(r[1] or 0)
+                if r[2] == "CR":
+                    stream.append([_to_date(r[0]), amt, 0.0])
+                else:
+                    stream.append([_to_date(r[0]), 0.0, amt])
+
+        else:  # customer
+            for r in conn.execute(
+                "SELECT date, total_amount FROM sale_vouchers "
+                "WHERE customer_id=? AND type='credit'", (party_id,),
+            ):
+                stream.append([_to_date(r[0]), float(r[1] or 0), 0.0])
+
+            for r in conn.execute(
+                "SELECT date, total_amount FROM purchase_vouchers "
+                "WHERE customer_as_supplier_id=?", (party_id,),
+            ):
+                stream.append([_to_date(r[0]), 0.0, float(r[1] or 0)])
+
+            for r in conn.execute(
+                "SELECT date, amount, type FROM payments "
+                "WHERE party_type='customer' AND party_id=?", (party_id,),
+            ):
+                amt = float(r[1] or 0)
+                if r[2] == "CP":
+                    stream.append([_to_date(r[0]), amt, 0.0])
+                else:
+                    stream.append([_to_date(r[0]), 0.0, amt])
+
+        for r in conn.execute(
+            "SELECT date, amount, type FROM journal_entries "
+            "WHERE party_type=? AND party_id=?", (party_type, party_id),
+        ):
+            amt = float(r[1] or 0)
+            if r[2] == "debit":
+                stream.append([_to_date(r[0]), amt, 0.0])
+            else:
+                stream.append([_to_date(r[0]), 0.0, amt])
+
+        stream.sort(key=lambda x: x[0])
+        return stream
+
+    def _fifo_buckets(stream: list):
+        open_debits: list = []
+        for date, dr, cr in stream:
+            if dr > 0.001:
+                open_debits.append([date, dr])
+            if cr > 0.001:
+                pay = cr
+                while pay > 0.001 and open_debits:
+                    applied = min(pay, open_debits[0][1])
+                    open_debits[0][1] -= applied
+                    pay -= applied
+                    if open_debits[0][1] < 0.001:
+                        open_debits.pop(0)
+
+        b0_30 = b31_60 = b61_90 = b90plus = 0.0
+        for d0, amt in open_debits:
+            age = (today - d0).days
+            if age <= 30:
+                b0_30 += amt
+            elif age <= 60:
+                b31_60 += amt
+            elif age <= 90:
+                b61_90 += amt
+            else:
+                b90plus += amt
+        return b0_30, b31_60, b61_90, b90plus
+
+    customers = conn.execute(
+        "SELECT id, name, opening_balance FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    receivables = []
+    for c in customers:
+        ob = float(c["opening_balance"] or 0)
+        bal = _party_closing_balance(conn, "customer", c["id"])
+        if abs(bal) < 0.01:
+            continue
+        b0_30, b31_60, b61_90, b90plus = _fifo_buckets(
+            _build_stream("customer", c["id"], ob)
+        )
+        receivables.append({
+            "name": c["name"], "balance": bal,
+            "b0_30": b0_30, "b31_60": b31_60,
+            "b61_90": b61_90, "b90plus": b90plus,
+        })
+
+    suppliers = conn.execute(
+        "SELECT id, name, opening_balance FROM suppliers WHERE id != 0 ORDER BY name"
+    ).fetchall()
+    payables = []
+    for s in suppliers:
+        if "OPENING STOCK" in s["name"].upper():
+            continue
+        ob = float(s["opening_balance"] or 0)
+        bal = _party_closing_balance(conn, "supplier", s["id"])
+        if abs(bal) < 0.01:
+            continue
+        b0_30, b31_60, b61_90, b90plus = _fifo_buckets(
+            _build_stream("supplier", s["id"], ob)
+        )
+        payables.append({
+            "name": s["name"], "balance": bal,
+            "b0_30": b0_30, "b31_60": b31_60,
+            "b61_90": b61_90, "b90plus": b90plus,
+        })
+
+    conn.close()
+    return {"receivables": receivables, "payables": payables}
+
+
+def _aging_row_style(days_since):
+    """
+    Returns (fg_hex, bold) based on how overdue a party is.
+      None / 90+  → red,    bold
+      60–89       → orange, normal
+      < 60        → None,   False  (default colour)
+    """
+    if days_since is None or days_since >= 90:
+        return "#dc2626", True
+    if days_since >= 60:
+        return "#c2410c", False
+    return None, False
+
+
+class AgingReceivablesTab(QWidget):
+    """
+    Stage A — simple aging.
+    Shows every credit customer / supplier with a non-zero balance,
+    their current balance, date of last payment, and days overdue.
+    Rows with 60+ days since last payment are highlighted (orange / red).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._as_at_lbl = QLabel("")
+        self._as_at_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold;"
+        )
+        header.addWidget(self._as_at_lbl)
+        header.addStretch()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setStyleSheet(BTN_SECONDARY)
+        btn_refresh.clicked.connect(self.refresh)
+        header.addWidget(btn_refresh)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        header.addWidget(btn_pdf)
+        header.addWidget(btn_csv)
+        layout.addLayout(header)
+
+        self.table = _make_table(
+            ["Name", "Balance (Rs.)", "Last Payment", "Days Since Payment"]
+        )
+        self.table.setSortingEnabled(False)
+        layout.addWidget(self.table, stretch=1)
+
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        today = datetime.date.today()
+        self._as_at_lbl.setText(
+            f"Aging Receivables / Payables — as at {today.strftime('%d/%m/%Y')}"
+        )
+
+        d = db_aging_receivables_payables()
+        self.table.setRowCount(0)
+
+        alert_count = 0
+        total_receivable = 0.0
+        total_payable = 0.0
+
+        def _section_header(label: str, bg: str):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            item = QTableWidgetItem(label)
+            item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            item.setBackground(QBrush(QColor(bg)))
+            item.setForeground(QBrush(QColor("#1e293b")))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(row, 0, item)
+            self.table.setSpan(row, 0, 1, 4)
+
+        def _add_row(name: str, balance: float, last_pay: str, days_since):
+            nonlocal alert_count
+            fg_hex, bold = _aging_row_style(days_since)
+            if fg_hex:
+                alert_count += 1
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            name_item = QTableWidgetItem(name)
+            bal_item = QTableWidgetItem(fmt_pkr(balance))
+            bal_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            pay_item = QTableWidgetItem(last_pay)
+            days_text = str(days_since) if days_since is not None else "Never"
+            days_item = QTableWidgetItem(days_text)
+            days_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            if fg_hex:
+                # Aging overdue colour takes precedence over balance sign colour
+                brush = QBrush(QColor(fg_hex))
+                for it in (name_item, bal_item, pay_item, days_item):
+                    it.setForeground(brush)
+            else:
+                # Colour balance by sign: positive normal, negative means overpaid/credit
+                bal_item.setForeground(
+                    QBrush(QColor("#16a34a") if balance >= 0 else QColor("#dc2626"))
+                )
+            if bold:
+                bf = QFont("Segoe UI", 10, QFont.Weight.Bold)
+                for it in (name_item, bal_item, pay_item, days_item):
+                    it.setFont(bf)
+
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, bal_item)
+            self.table.setItem(row, 2, pay_item)
+            self.table.setItem(row, 3, days_item)
+
+        # ── Receivables section ───────────────────────────────────────────────
+        _section_header(
+            f"RECEIVABLES — Credit Customers  ({len(d['receivables'])} with balance)",
+            "#dbeafe",
+        )
+        for r in d["receivables"]:
+            _add_row(r["name"], r["balance"], r["last_payment"], r["days_since"])
+            total_receivable += r["balance"]
+
+        # ── Subtotal row ──────────────────────────────────────────────────────
+        if d["receivables"]:
+            srow = self.table.rowCount()
+            self.table.insertRow(srow)
+            sub_name = QTableWidgetItem("Total Receivables")
+            sub_name.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            sub_name.setBackground(QBrush(QColor("#f1f5f9")))
+            sub_bal = QTableWidgetItem(fmt_pkr(total_receivable))
+            sub_bal.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            sub_bal.setBackground(QBrush(QColor("#f1f5f9")))
+            sub_bal.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(srow, 0, sub_name)
+            self.table.setItem(srow, 1, sub_bal)
+
+        # ── Payables section ──────────────────────────────────────────────────
+        _section_header(
+            f"PAYABLES — Suppliers  ({len(d['payables'])} with balance)",
+            "#fef9c3",
+        )
+        for p in d["payables"]:
+            _add_row(p["name"], p["balance"], p["last_payment"], p["days_since"])
+            total_payable += p["balance"]
+
+        if d["payables"]:
+            srow = self.table.rowCount()
+            self.table.insertRow(srow)
+            sub_name = QTableWidgetItem("Total Payables")
+            sub_name.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            sub_name.setBackground(QBrush(QColor("#f1f5f9")))
+            sub_bal = QTableWidgetItem(fmt_pkr(total_payable))
+            sub_bal.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            sub_bal.setBackground(QBrush(QColor("#f1f5f9")))
+            sub_bal.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(srow, 0, sub_name)
+            self.table.setItem(srow, 1, sub_bal)
+
+        footer_parts = [
+            f"Total Receivable: Rs. {fmt_pkr(total_receivable)}",
+            f"Total Payable: Rs. {fmt_pkr(total_payable)}",
+        ]
+        if alert_count:
+            footer_parts.append(
+                f"<span style='color:#dc2626;font-weight:bold;'>"
+                f"{alert_count} part{'ies' if alert_count != 1 else 'y'} "
+                f"overdue 60+ days</span>"
+            )
+        self.footer.setText("    |    ".join(footer_parts))
+        self.footer.setTextFormat(Qt.TextFormat.RichText)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        today = datetime.date.today().strftime("%d/%m/%Y")
+        return (
+            "Aging_Receivables",
+            f"Aging Receivables / Payables — as at {today}",
+            headers, rows, {1, 3},
+        )
+
+
+class AgingFifoTab(QWidget):
+    """
+    Stage B — FIFO true aging.
+    Allocates credits against oldest debits first, then shows remaining
+    unallocated debt bucketed by age: 0-30 | 31-60 | 61-90 | 90+ days.
+    """
+
+    _NCOLS = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._as_at_lbl = QLabel("")
+        self._as_at_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold;"
+        )
+        header.addWidget(self._as_at_lbl)
+        header.addStretch()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setStyleSheet(BTN_SECONDARY)
+        btn_refresh.clicked.connect(self.refresh)
+        header.addWidget(btn_refresh)
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        header.addWidget(btn_pdf)
+        header.addWidget(btn_csv)
+        layout.addLayout(header)
+
+        self.table = _make_table(
+            ["Name", "Balance (Rs.)", "0-30 Days", "31-60 Days", "61-90 Days", "90+ Days"]
+        )
+        self.table.setSortingEnabled(False)
+        layout.addWidget(self.table, stretch=1)
+
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        today = datetime.date.today()
+        self._as_at_lbl.setText(
+            f"FIFO Aging — as at {today.strftime('%d/%m/%Y')}"
+        )
+
+        d = db_fifo_aging()
+        self.table.setRowCount(0)
+
+        total_rec = total_pay = 0.0
+        alert_90plus = 0
+
+        def _section_header(label: str, bg: str):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            item = QTableWidgetItem(label)
+            item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            item.setBackground(QBrush(QColor(bg)))
+            item.setForeground(QBrush(QColor("#1e293b")))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(row, 0, item)
+            self.table.setSpan(row, 0, 1, self._NCOLS)
+
+        def _ri(text, right=False):
+            it = QTableWidgetItem(text)
+            if right:
+                it.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+            return it
+
+        def _add_party(entry: dict):
+            nonlocal alert_90plus
+            balance = entry["balance"]
+            b0_30   = entry["b0_30"]
+            b31_60  = entry["b31_60"]
+            b61_90  = entry["b61_90"]
+            b90plus = entry["b90plus"]
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            name_item  = _ri(entry["name"])
+            bal_item   = _ri(fmt_pkr(balance), right=True)
+            b030_item  = _ri(fmt_pkr(b0_30)  if b0_30  > 0.01 else "—", right=True)
+            b3160_item = _ri(fmt_pkr(b31_60) if b31_60 > 0.01 else "—", right=True)
+            b6190_item = _ri(fmt_pkr(b61_90) if b61_90 > 0.01 else "—", right=True)
+            b90p_item  = _ri(fmt_pkr(b90plus) if b90plus > 0.01 else "—", right=True)
+
+            if balance < 0:
+                bal_item.setForeground(QBrush(QColor("#16a34a")))
+
+            if b31_60 > 0.01:
+                b3160_item.setForeground(QBrush(QColor("#c2410c")))
+            if b61_90 > 0.01:
+                b6190_item.setForeground(QBrush(QColor("#c2410c")))
+                b6190_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            if b90plus > 0.01:
+                b90p_item.setForeground(QBrush(QColor("#dc2626")))
+                b90p_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+                alert_90plus += 1
+
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, bal_item)
+            self.table.setItem(row, 2, b030_item)
+            self.table.setItem(row, 3, b3160_item)
+            self.table.setItem(row, 4, b6190_item)
+            self.table.setItem(row, 5, b90p_item)
+
+        def _subtotal_row(label: str, bal: float, b0_30: float,
+                          b31_60: float, b61_90: float, b90plus: float):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            bg   = QBrush(QColor("#f1f5f9"))
+            bold = QFont("Segoe UI", 10, QFont.Weight.Bold)
+
+            def _si(text, right=False):
+                it = QTableWidgetItem(text)
+                it.setBackground(bg)
+                it.setFont(bold)
+                if right:
+                    it.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                return it
+
+            self.table.setItem(row, 0, _si(label))
+            self.table.setItem(row, 1, _si(fmt_pkr(bal), right=True))
+            self.table.setItem(row, 2, _si(fmt_pkr(b0_30)  if b0_30  > 0.01 else "—", right=True))
+            self.table.setItem(row, 3, _si(fmt_pkr(b31_60) if b31_60 > 0.01 else "—", right=True))
+            self.table.setItem(row, 4, _si(fmt_pkr(b61_90) if b61_90 > 0.01 else "—", right=True))
+            self.table.setItem(row, 5, _si(fmt_pkr(b90plus) if b90plus > 0.01 else "—", right=True))
+
+        # ── Receivables ───────────────────────────────────────────────────────
+        _section_header(
+            f"RECEIVABLES — Credit Customers  ({len(d['receivables'])} with balance)",
+            "#dbeafe",
+        )
+        s_bal = s_030 = s_3160 = s_6190 = s_90p = 0.0
+        for r in d["receivables"]:
+            _add_party(r)
+            total_rec += r["balance"]
+            s_bal  += r["balance"]
+            s_030  += r["b0_30"]
+            s_3160 += r["b31_60"]
+            s_6190 += r["b61_90"]
+            s_90p  += r["b90plus"]
+        if d["receivables"]:
+            _subtotal_row("Total Receivables", s_bal, s_030, s_3160, s_6190, s_90p)
+
+        # ── Payables ─────────────────────────────────────────────────────────
+        _section_header(
+            f"PAYABLES — Suppliers  ({len(d['payables'])} with balance)",
+            "#fef9c3",
+        )
+        p_bal = p_030 = p_3160 = p_6190 = p_90p = 0.0
+        for p in d["payables"]:
+            _add_party(p)
+            total_pay += p["balance"]
+            p_bal  += p["balance"]
+            p_030  += p["b0_30"]
+            p_3160 += p["b31_60"]
+            p_6190 += p["b61_90"]
+            p_90p  += p["b90plus"]
+        if d["payables"]:
+            _subtotal_row("Total Payables", p_bal, p_030, p_3160, p_6190, p_90p)
+
+        footer_parts = [
+            f"Total Receivable: Rs. {fmt_pkr(total_rec)}",
+            f"Total Payable: Rs. {fmt_pkr(total_pay)}",
+        ]
+        if alert_90plus:
+            footer_parts.append(
+                f"<span style='color:#dc2626;font-weight:bold;'>"
+                f"{alert_90plus} part{'ies' if alert_90plus != 1 else 'y'} "
+                f"with 90+ day outstanding debt</span>"
+            )
+        self.footer.setText("    |    ".join(footer_parts))
+        self.footer.setTextFormat(Qt.TextFormat.RichText)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        today = datetime.date.today().strftime("%d/%m/%Y")
+        return (
+            "FIFO_Aging",
+            f"FIFO Aging — as at {today}",
+            headers, rows, {1, 2, 3, 4, 5},
+        )
+
+
+# ── Daily Digest ─────────────────────────────────────────────────────────────
+
+_BTN_GREEN = """
+    QPushButton { background:#16a34a; color:white; border:none;
+        border-radius:5px; padding:7px 18px; font-size:10pt; }
+    QPushButton:hover { background:#15803d; }
+    QPushButton:disabled { background:#86efac; color:#f0fdf4; }
+"""
+
+
+class DailyDigestTab(QWidget):
+    """
+    Phase 5b — owner daily digest.
+    Shows key day-end numbers and sends them to the owner's WhatsApp.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        self._digest = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # ── Controls ─────────────────────────────────────────────────────────
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Date:"))
+
+        self._date_edit = QDateEdit()
+        self._date_edit.setCalendarPopup(True)
+        self._date_edit.setDate(QDate.currentDate())
+        self._date_edit.setDisplayFormat("dd/MM/yyyy")
+        self._date_edit.setFixedWidth(120)
+        top.addWidget(self._date_edit)
+
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.setFixedWidth(70)
+        btn_today.clicked.connect(lambda: self._date_edit.setDate(QDate.currentDate()))
+        top.addWidget(btn_today)
+
+        btn_load = QPushButton("Load")
+        btn_load.setStyleSheet(BTN_SECONDARY)
+        btn_load.setFixedWidth(60)
+        btn_load.clicked.connect(self.refresh)
+        top.addWidget(btn_load)
+
+        top.addStretch()
+
+        self._btn_send = QPushButton("Send to Owner via WhatsApp")
+        self._btn_send.setStyleSheet(_BTN_GREEN)
+        self._btn_send.setEnabled(False)
+        self._btn_send.clicked.connect(self._send_whatsapp)
+        top.addWidget(self._btn_send)
+
+        layout.addLayout(top)
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        self._title_lbl = QLabel("Load a date to view the digest")
+        self._title_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold;"
+        )
+        layout.addWidget(self._title_lbl)
+
+        # ── Card with metric rows ─────────────────────────────────────────────
+        card = QFrame()
+        card.setStyleSheet(
+            "background:#ffffff; border:1px solid #e2e8f0; border-radius:8px;"
+        )
+        card_v = QVBoxLayout(card)
+        card_v.setContentsMargins(24, 16, 24, 16)
+        card_v.setSpacing(10)
+
+        METRICS = [
+            ("sales",       "Sales"),
+            ("profit",      "Gross Profit"),
+            ("net_cash",    "Net Cash (till)"),
+            ("net_bank",    "Net Bank"),
+            ("credit_in",   "Credit Given"),
+            ("credit_out",  "Credit Collected"),
+            ("expenses",    "Cash Expenses"),
+            ("below_cost",  "Below Cost Items"),
+            ("big_disc",    "Biggest Discount"),
+        ]
+        self._val_lbls = {}
+        for key, label in METRICS:
+            row = QHBoxLayout()
+            key_lbl = QLabel(label)
+            key_lbl.setStyleSheet("color:#64748b; font-size:10pt;")
+            key_lbl.setFixedWidth(200)
+            val_lbl = QLabel("—")
+            val_lbl.setStyleSheet(
+                "color:#1e293b; font-size:10pt; font-weight:bold;"
+            )
+            row.addWidget(key_lbl)
+            row.addWidget(val_lbl, stretch=1)
+            self._val_lbls[key] = val_lbl
+            card_v.addLayout(row)
+
+        layout.addWidget(card)
+        layout.addStretch()
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
+        self._status_lbl.setWordWrap(True)
+        layout.addWidget(self._status_lbl)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        qd = self._date_edit.date()
+        date_str = qd.toString("dd/MM/yyyy")
+
+        d = build_daily_digest(date_str)
+        self._digest = d
+
+        def _pkr(v):
+            return f"Rs. {float(v or 0):,.0f}"
+
+        self._title_lbl.setText(f"Daily Summary — {date_str}")
+
+        self._val_lbls["sales"].setText(
+            f"{int(d.get('sales_count', 0))} vouchers"
+            f"    |    {_pkr(d.get('sales_total', 0))}"
+        )
+
+        profit = float(d.get("gross_profit", 0))
+        lbl = self._val_lbls["profit"]
+        lbl.setText(_pkr(profit))
+        lbl.setStyleSheet(
+            f"color:{'#16a34a' if profit >= 0 else '#dc2626'};"
+            f" font-size:10pt; font-weight:bold;"
+        )
+
+        self._val_lbls["net_cash"].setText(_pkr(d.get("net_cash", 0)))
+        self._val_lbls["net_bank"].setText(_pkr(d.get("net_bank", 0)))
+        self._val_lbls["credit_in"].setText(_pkr(d.get("credit_given", 0)))
+        self._val_lbls["credit_out"].setText(_pkr(d.get("credit_collected", 0)))
+        self._val_lbls["expenses"].setText(_pkr(d.get("expenses_cash", 0)))
+
+        below = int(d.get("below_cost_count", 0))
+        lbl = self._val_lbls["below_cost"]
+        lbl.setText(f"{below} item(s)" if below else "None")
+        lbl.setStyleSheet(
+            f"color:{'#dc2626' if below else '#16a34a'};"
+            f" font-size:10pt; font-weight:bold;"
+        )
+
+        big_disc = float(d.get("biggest_discount", 0))
+        self._val_lbls["big_disc"].setText(
+            _pkr(big_disc) if big_disc else "None"
+        )
+
+        self._btn_send.setEnabled(True)
+        self._status_lbl.setText("")
+
+    def _send_whatsapp(self):
+        if not self._digest:
+            return
+        from whatsapp_handler import send_digest_whatsapp
+        ok, msg = send_digest_whatsapp(self._digest)
+        colour = "#16a34a" if ok else "#c2410c"
+        self._status_lbl.setText(msg)
+        self._status_lbl.setStyleSheet(
+            f"color:{colour}; font-size:9pt;"
+        )
+
+
 # ── Reports Page ──────────────────────────────────────────────────────────────
 
 # ── Closing Balances ──────────────────────────────────────────────────────────
@@ -2766,6 +3850,149 @@ class ClosingBalancesTab(QWidget):
                 headers, rows, {2})
 
 
+class DeletedVouchersTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Filter bar
+        filter_card = QFrame()
+        filter_card.setStyleSheet(
+            "background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"
+        )
+        fl = QHBoxLayout(filter_card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(10)
+
+        fl.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        fl.addWidget(self.from_date)
+
+        fl.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        fl.addWidget(self.to_date)
+
+        fl.addWidget(QLabel("Type:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["All", "sale", "purchase", "sale_return", "purchase_return"])
+        self.type_combo.setFixedWidth(160)
+        fl.addWidget(self.type_combo)
+
+        fl.addStretch()
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setStyleSheet(
+            "background:#1e40af;color:white;border-radius:5px;padding:6px 16px;"
+        )
+        btn_refresh.clicked.connect(self.refresh)
+        fl.addWidget(btn_refresh)
+
+        layout.addWidget(filter_card)
+
+        # Table
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            ["Voucher #", "Type", "Date", "Amount (PKR)", "Party", "Deleted By", "Deleted At", "Reason"]
+        )
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(True)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 110)
+        self.table.setColumnWidth(1, 130)
+        self.table.setColumnWidth(2, 95)
+        self.table.setColumnWidth(3, 130)
+        self.table.setColumnWidth(5, 100)
+        self.table.setColumnWidth(6, 100)
+        layout.addWidget(self.table, stretch=1)
+
+        self._count_lbl = QLabel("")
+        self._count_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
+        layout.addWidget(self._count_lbl)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def refresh(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso = self.to_date.date().toString("yyyy-MM-dd")
+        vtype = self.type_combo.currentText()
+
+        conn = get_connection()
+        if vtype == "All":
+            rows = conn.execute("""
+                SELECT voucher_number, voucher_type, voucher_date, amount,
+                       party_name, deleted_by, deleted_at, reason
+                FROM deleted_vouchers
+                WHERE deleted_at BETWEEN ? AND ?
+                ORDER BY deleted_at DESC
+            """, (from_iso, to_iso)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT voucher_number, voucher_type, voucher_date, amount,
+                       party_name, deleted_by, deleted_at, reason
+                FROM deleted_vouchers
+                WHERE deleted_at BETWEEN ? AND ?
+                  AND voucher_type = ?
+                ORDER BY deleted_at DESC
+            """, (from_iso, to_iso, vtype)).fetchall()
+        conn.close()
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        for r in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(r["voucher_number"] or ""))
+            self.table.setItem(row, 1, QTableWidgetItem(r["voucher_type"] or ""))
+
+            # format date DD/MM/YYYY
+            vd = r["voucher_date"] or ""
+            if vd and len(vd) == 10 and "-" in vd:
+                parts = vd.split("-")
+                vd = f"{parts[2]}/{parts[1]}/{parts[0]}"
+            self.table.setItem(row, 2, QTableWidgetItem(vd))
+
+            amt = r["amount"]
+            amt_item = QTableWidgetItem(
+                f"Rs. {amt:,.0f}" if amt is not None else ""
+            )
+            amt_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 3, amt_item)
+
+            self.table.setItem(row, 4, QTableWidgetItem(r["party_name"] or ""))
+            self.table.setItem(row, 5, QTableWidgetItem(r["deleted_by"] or ""))
+
+            dat = r["deleted_at"] or ""
+            if dat and len(dat) == 10 and "-" in dat:
+                parts = dat.split("-")
+                dat = f"{parts[2]}/{parts[1]}/{parts[0]}"
+            self.table.setItem(row, 6, QTableWidgetItem(dat))
+
+            self.table.setItem(row, 7, QTableWidgetItem(r["reason"] or ""))
+
+        self.table.setSortingEnabled(True)
+        self._count_lbl.setText(f"{len(rows)} record(s)")
+
+
 class ReportsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2800,24 +4027,34 @@ class ReportsPage(QWidget):
         self._tab_stock      = StockReportTab()
         self._tab_imei_stock = ImeiStockTab()
         self._tab_valuation  = StockValuationTab()
+        self._tab_aging      = AgingStockTab()
         self._tab_sales      = SalesReportTab()
         self._tab_purchases  = PurchaseReportTab()
         self._tab_profit     = ProfitReportTab()
         self._tab_cashbook   = CashBookTab()
+        self._tab_digest     = DailyDigestTab()
         self._tab_customers  = CustomerInsightsTab()
         self._tab_expenses   = ExpensesReportTab()
+        self._tab_aging_rec  = AgingReceivablesTab()
+        self._tab_fifo_aging = AgingFifoTab()
         self._tab_closing    = ClosingBalancesTab()
+        self._tab_deleted    = DeletedVouchersTab()
 
         self.tabs.addTab(self._tab_stock,      "Stock Summary")
         self.tabs.addTab(self._tab_imei_stock, "IMEI Stock")
         self.tabs.addTab(self._tab_valuation,  "Stock Valuation")
+        self.tabs.addTab(self._tab_aging,      "Aging Stock")
         self.tabs.addTab(self._tab_sales,      "Sales")
         self.tabs.addTab(self._tab_purchases,  "Purchases")
         self.tabs.addTab(self._tab_profit,     "Profit")
         self.tabs.addTab(self._tab_cashbook,   "Cash Book")
+        self.tabs.addTab(self._tab_digest,     "Daily Digest")
         self.tabs.addTab(self._tab_customers,  "Customer Insights")
         self.tabs.addTab(self._tab_expenses,   "Expenses")
+        self.tabs.addTab(self._tab_aging_rec,  "Aging Receivables")
+        self.tabs.addTab(self._tab_fifo_aging, "FIFO Aging")
         self.tabs.addTab(self._tab_closing,    "Closing Balances")
+        self.tabs.addTab(self._tab_deleted,    "Deleted Vouchers")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
         layout.addWidget(self.tabs)

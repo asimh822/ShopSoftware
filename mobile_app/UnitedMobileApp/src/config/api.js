@@ -1,6 +1,10 @@
 /**
  * API helper — wraps axios with auth token management.
  * All screens import { apiGet, apiPost, clearSession } from here.
+ *
+ * Server URL: use the DDNS address (e.g. http://unitedmobile.ddns.net:5000)
+ * so the app works both on local Wi-Fi and remotely over the internet.
+ * On local Wi-Fi only, the LAN IP (http://192.168.x.x:5000) also works.
  */
 
 import axios from 'axios';
@@ -92,6 +96,30 @@ export async function apiGet(path, params = {}) {
     if (err.response?.status === 401) {
       await clearSession();
       throw new Error('SESSION_EXPIRED');
+    }
+    throw err;
+  }
+}
+
+// ---------- owner (X-Owner-Pin header, no salesman token required) ----------
+
+export async function apiOwnerGet(path, ownerPin, params = {}) {
+  const base = await getBaseUrl();
+  const token = await getToken();
+  try {
+    const resp = await axios.get(`${base}${path}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? {Authorization: `Bearer ${token}`} : {}),
+        'X-Owner-Pin': ownerPin,
+      },
+      params,
+      timeout: 10000,
+    });
+    return resp.data;
+  } catch (err) {
+    if (err.response?.status === 401) {
+      throw new Error('OWNER_AUTH_FAILED');
     }
     throw err;
   }

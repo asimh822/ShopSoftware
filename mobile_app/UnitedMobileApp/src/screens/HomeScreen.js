@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Alert,
   SafeAreaView,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -16,12 +17,19 @@ import {
 } from 'react-native';
 import MaterialIcons from 'react-native-vector-icons/MaterialIcons';
 import {clearSession, getSalesmanName, apiGet} from '../config/api';
+import {getOwnerPin} from '../ownerSession';
 
 const TILES = [
   {key: 'NewSale',     label: 'New Sale',         icon: '🛒', color: '#1565C0', darkColor: '#0D47A1'},
   {key: 'NewPurchase', label: 'New Purchase',      icon: '📦', color: '#2E7D32', darkColor: '#1B5E20'},
   {key: 'StockCheck',  label: 'Stock Check',       icon: '🔍', color: '#E65100', darkColor: '#BF360C'},
   {key: 'MyToday',     label: "Today's Summary",   icon: '📊', color: '#6A1B9A', darkColor: '#4A148C'},
+];
+
+const OWNER_TILES = [
+  {key: 'OwnerDashboard',  label: 'Dashboard',      icon: '📈', color: '#37474F', darkColor: '#263238'},
+  {key: 'OwnerTodaySales', label: "Today's Sales",  icon: '💹', color: '#004D40', darkColor: '#00251A'},
+  {key: 'OwnerBalances',   label: 'Balances',        icon: '💰', color: '#4A148C', darkColor: '#38006B'},
 ];
 
 function formatPkr(amount) {
@@ -112,6 +120,14 @@ export default function HomeScreen({navigation}) {
     }
   };
 
+  const handleOwnerTile = key => {
+    if (getOwnerPin()) {
+      navigation.navigate(key);
+    } else {
+      navigation.navigate('OwnerPin', {destination: key});
+    }
+  };
+
   const handleLogout = () => {
     Alert.alert('Logout', 'Are you sure you want to logout?', [
       {text: 'Cancel', style: 'cancel'},
@@ -157,7 +173,7 @@ export default function HomeScreen({navigation}) {
       </View>
 
       {/* ── Body ───────────────────────────────────────────────────────────── */}
-      <View style={styles.body}>
+      <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
         <View style={styles.grid}>
           {TILES.map(tile => (
             <TouchableOpacity
@@ -181,9 +197,29 @@ export default function HomeScreen({navigation}) {
             </Text>
           )}
         </View>
-      </View>
 
-      <Text style={styles.footer}>United Mobile • Multan</Text>
+        {/* ── Owner section ─────────────────────────────────────────────────── */}
+        <View style={styles.ownerDivider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerLabel}>OWNER</Text>
+          <View style={styles.dividerLine} />
+        </View>
+
+        <View style={styles.ownerGrid}>
+          {OWNER_TILES.map(tile => (
+            <TouchableOpacity
+              key={tile.key}
+              style={[styles.ownerTile, {backgroundColor: tile.color}]}
+              onPress={() => handleOwnerTile(tile.key)}
+              activeOpacity={0.8}>
+              <Text style={styles.ownerTileIcon}>{tile.icon}</Text>
+              <Text style={styles.ownerTileLabel}>{tile.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <Text style={styles.footer}>United Mobile • Multan</Text>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -299,5 +335,53 @@ const styles = StyleSheet.create({
     color: '#9E9E9E',
     fontSize: 12,
     paddingVertical: 16,
+  },
+  ownerDivider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 12,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#BDBDBD',
+  },
+  dividerLabel: {
+    marginHorizontal: 10,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#9E9E9E',
+    letterSpacing: 1.5,
+  },
+  ownerGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingHorizontal: 16,
+    paddingBottom: 4,
+  },
+  ownerTile: {
+    width: '29%',
+    margin: '2%',
+    aspectRatio: 1,
+    borderRadius: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 5,
+    shadowOffset: {width: 0, height: 2},
+  },
+  ownerTileIcon: {
+    fontSize: 28,
+    marginBottom: 6,
+  },
+  ownerTileLabel: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: 'bold',
+    textAlign: 'center',
   },
 });

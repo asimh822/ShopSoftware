@@ -1,13 +1,17 @@
 import hashlib
 import sqlite3
 import os
+from datetime import date, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -128,10 +132,25 @@ def init_db():
             name TEXT NOT NULL,
             opening_balance REAL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS deleted_vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            voucher_number TEXT NOT NULL,
+            voucher_type TEXT NOT NULL,
+            voucher_date TEXT,
+            amount REAL,
+            party_name TEXT,
+            deleted_by TEXT,
+            deleted_at TEXT NOT NULL,
+            reason TEXT,
+            purge_after TEXT NOT NULL
+        );
     """)
 
     _seed_settings(c)
     _run_migrations(conn)
+    _ensure_columns(conn)
+    conn.commit()
     from capital import migrate_capital_tables
     migrate_capital_tables(conn)
     if conn.execute("SELECT COUNT(*) FROM capital_accounts").fetchone()[0] == 0:
@@ -139,6 +158,7 @@ def init_db():
             "INSERT INTO capital_accounts (name, opening_balance) VALUES (?,?)",
             [("Asim Hussain", 3000000), ("Khurram Ansari", 1500000), ("Mumtaz Ahmad", 1500000)],
         )
+    conn.execute("DELETE FROM deleted_vouchers WHERE purge_after < date('now')")
     conn.commit()
     conn.close()
 
@@ -181,6 +201,36 @@ def _seed_settings(c):
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+
+# ── Additive column helper ────────────────────────────────────────────────────
+
+def ensure_column(conn, table: str, column: str, definition: str) -> None:
+    """
+    Idempotently add a column to an existing table.
+    Safe to call every launch — acts only when the column is absent.
+
+    SQLite ADD COLUMN limits (no full table rebuild needed unless these apply):
+      - Cannot add a UNIQUE or PRIMARY KEY column.
+      - DEFAULT must be a constant literal; CURRENT_TIMESTAMP is rejected on
+        SQLite < 3.37.0 — use a string like '2000-01-01 00:00:01' instead.
+      - Cannot drop or rename a column this way — use the rename-copy-drop
+        pattern already used in _migrate_v7/_v8/_v9 for those cases.
+    """
+    existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_columns(conn) -> None:
+    """
+    Called once per startup after _run_migrations().
+    Add one ensure_column() call here for each new column that hasn't yet been
+    promoted to a numbered _migrate_vN(). Once a column has been in production
+    long enough, move it into a migration and remove the call from here.
+    """
+    # No pending columns at this time.
+    pass
 
 
 # ── Versioned migration system ────────────────────────────────────────────────
@@ -2017,6 +2067,289 @@ def db_today_sales_by_salesman(today_str: str) -> list:
     """, (today_str, today_str)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Voucher Deletion ─────────────────────────────────────────────────────────
+
+def confirm_owner_pin(parent_widget) -> bool:
+    from PyQt6.QtWidgets import QInputDialog, QLineEdit
+    pin, ok = QInputDialog.getText(
+        parent_widget, "Owner PIN", "Enter Owner PIN:",
+        QLineEdit.EchoMode.Password
+    )
+    if not ok or not pin.strip():
+        return False
+    return check_owner_pin(pin.strip())
+
+
+def db_delete_sale_voucher(sv_id: int, deleted_by: str, reason: str):
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT sv.sv_number, sv.date, sv.total_amount,
+                   COALESCE(c.name, sv.cash_customer_name, 'Cash') AS party_name,
+                   sv.type, sv.payment_method,
+                   sv.cash_paid, sv.bank_amount, sv.bank_account_id
+            FROM sale_vouchers sv
+            LEFT JOIN customers c ON c.id = sv.customer_id
+            WHERE sv.id = ?
+        """, (sv_id,)).fetchone()
+        if not row:
+            raise ValueError("Sale voucher not found")
+        r = dict(row)
+
+        lines = conn.execute("""
+            SELECT sl.stock_item_id, sl.final_price, sv.customer_id, sv.type
+            FROM sale_lines sl
+            JOIN sale_vouchers sv ON sv.id = sl.sv_id
+            WHERE sl.sv_id = ?
+        """, (sv_id,)).fetchall()
+
+        for line in lines:
+            conn.execute(
+                "UPDATE stock_items SET status='in_stock', sold_line_id=NULL WHERE id=?",
+                (line["stock_item_id"],)
+            )
+
+        if r["type"] == "credit" and lines:
+            total = r["total_amount"] or 0
+            cust_id = lines[0]["customer_id"]
+            conn.execute(
+                "UPDATE customers SET opening_balance = opening_balance - ? WHERE id=?",
+                (total, cust_id)
+            )
+
+        pm = r["payment_method"]
+        total = r["total_amount"] or 0
+        cash_amt = r["cash_paid"] or 0
+        bank_amt = r["bank_amount"] or 0
+        bank_acct_id = r["bank_account_id"]
+        if pm == "cash":
+            conn.execute(
+                "UPDATE settings SET value = CAST(CAST(value AS REAL) - ? AS TEXT) WHERE key='cash_opening_balance'",
+                (total,)
+            )
+        elif pm == "bank":
+            if bank_acct_id:
+                conn.execute(
+                    "UPDATE bank_accounts SET opening_balance = opening_balance - ? WHERE id=?",
+                    (total, bank_acct_id)
+                )
+        elif pm == "split":
+            conn.execute(
+                "UPDATE settings SET value = CAST(CAST(value AS REAL) - ? AS TEXT) WHERE key='cash_opening_balance'",
+                (cash_amt,)
+            )
+            if bank_acct_id:
+                conn.execute(
+                    "UPDATE bank_accounts SET opening_balance = opening_balance - ? WHERE id=?",
+                    (bank_amt, bank_acct_id)
+                )
+
+        conn.execute("DELETE FROM sale_lines WHERE sv_id=?", (sv_id,))
+        conn.execute("DELETE FROM sale_vouchers WHERE id=?", (sv_id,))
+
+        purge_after = (date.today() + timedelta(days=15)).strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT INTO deleted_vouchers
+                (voucher_number, voucher_type, voucher_date, amount, party_name,
+                 deleted_by, deleted_at, reason, purge_after)
+            VALUES (?,?,?,?,?,?,date('now'),?,?)
+        """, (r["sv_number"], "sale", r["date"], r["total_amount"],
+              r["party_name"], deleted_by, reason, purge_after))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT pv.pv_number, pv.date, pv.total_amount, s.name AS party_name
+            FROM purchase_vouchers pv
+            LEFT JOIN suppliers s ON s.id = pv.supplier_id
+            WHERE pv.id = ?
+        """, (pv_id,)).fetchone()
+        if not row:
+            raise ValueError("Purchase voucher not found")
+        r = dict(row)
+
+        lines = conn.execute("""
+            SELECT pl.stock_item_id, pl.purchase_price, pv.supplier_id
+            FROM purchase_lines pl
+            JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+            WHERE pl.pv_id = ?
+        """, (pv_id,)).fetchall()
+
+        for line in lines:
+            conn.execute("DELETE FROM stock_items WHERE id=?", (line["stock_item_id"],))
+
+        if lines:
+            total = r["total_amount"] or 0
+            sup_id = lines[0]["supplier_id"]
+            conn.execute(
+                "UPDATE suppliers SET opening_balance = opening_balance - ? WHERE id=?",
+                (total, sup_id)
+            )
+
+        conn.execute("DELETE FROM purchase_lines WHERE pv_id=?", (pv_id,))
+        conn.execute("DELETE FROM purchase_vouchers WHERE id=?", (pv_id,))
+
+        purge_after = (date.today() + timedelta(days=15)).strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT INTO deleted_vouchers
+                (voucher_number, voucher_type, voucher_date, amount, party_name,
+                 deleted_by, deleted_at, reason, purge_after)
+            VALUES (?,?,?,?,?,?,date('now'),?,?)
+        """, (r["pv_number"], "purchase", r["date"], r["total_amount"],
+              r["party_name"], deleted_by, reason, purge_after))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_delete_sale_return(sr_id: int, deleted_by: str, reason: str):
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT sr.sr_number, sr.date, c.name AS party_name, sr.customer_id
+            FROM sale_returns sr
+            LEFT JOIN customers c ON c.id = sr.customer_id
+            WHERE sr.id = ?
+        """, (sr_id,)).fetchone()
+        if not row:
+            raise ValueError("Sale return not found")
+        r = dict(row)
+
+        lines = conn.execute(
+            "SELECT stock_item_id, return_price FROM sale_return_lines WHERE sr_id=?",
+            (sr_id,)
+        ).fetchall()
+
+        total = sum((line["return_price"] or 0) for line in lines)
+
+        for line in lines:
+            conn.execute(
+                "UPDATE stock_items SET status='sold' WHERE id=?",
+                (line["stock_item_id"],)
+            )
+
+        if r["customer_id"]:
+            conn.execute(
+                "UPDATE customers SET opening_balance = opening_balance + ? WHERE id=?",
+                (total, r["customer_id"])
+            )
+
+        conn.execute("DELETE FROM sale_return_lines WHERE sr_id=?", (sr_id,))
+        conn.execute("DELETE FROM sale_returns WHERE id=?", (sr_id,))
+
+        purge_after = (date.today() + timedelta(days=15)).strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT INTO deleted_vouchers
+                (voucher_number, voucher_type, voucher_date, amount, party_name,
+                 deleted_by, deleted_at, reason, purge_after)
+            VALUES (?,?,?,?,?,?,date('now'),?,?)
+        """, (r["sr_number"], "sale_return", r["date"], total,
+              r["party_name"], deleted_by, reason, purge_after))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_delete_purchase_return(pr_id: int, deleted_by: str, reason: str):
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT pr.pr_number, pr.date, s.name AS party_name, pr.supplier_id
+            FROM purchase_returns pr
+            LEFT JOIN suppliers s ON s.id = pr.supplier_id
+            WHERE pr.id = ?
+        """, (pr_id,)).fetchone()
+        if not row:
+            raise ValueError("Purchase return not found")
+        r = dict(row)
+
+        lines = conn.execute("""
+            SELECT prl.stock_item_id, prl.model_id, prl.imei, prl.return_price
+            FROM purchase_return_lines prl
+            WHERE prl.pr_id = ?
+        """, (pr_id,)).fetchall()
+
+        total = sum((line["return_price"] or 0) for line in lines)
+
+        # Restore stock items using data from the return lines
+        for line in lines:
+            conn.execute("""
+                INSERT INTO stock_items (model_id, imei, purchase_price, status)
+                VALUES (?, ?, ?, 'in_stock')
+            """, (line["model_id"], line["imei"], line["return_price"] or 0))
+
+        if r["supplier_id"]:
+            conn.execute(
+                "UPDATE suppliers SET opening_balance = opening_balance + ? WHERE id=?",
+                (total, r["supplier_id"])
+            )
+
+        conn.execute("DELETE FROM purchase_return_lines WHERE pr_id=?", (pr_id,))
+        conn.execute("DELETE FROM purchase_returns WHERE id=?", (pr_id,))
+
+        purge_after = (date.today() + timedelta(days=15)).strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT INTO deleted_vouchers
+                (voucher_number, voucher_type, voucher_date, amount, party_name,
+                 deleted_by, deleted_at, reason, purge_after)
+            VALUES (?,?,?,?,?,?,date('now'),?,?)
+        """, (r["pr_number"], "purchase_return", r["date"], total,
+              r["party_name"], deleted_by, reason, purge_after))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def prompt_and_delete_voucher(parent_widget, voucher_type: str, voucher_id: int,
+                               voucher_number: str, deleted_by: str) -> bool:
+    from PyQt6.QtWidgets import QInputDialog, QMessageBox, QLineEdit
+
+    if not confirm_owner_pin(parent_widget):
+        QMessageBox.warning(parent_widget, "Access Denied", "Incorrect Owner PIN.")
+        return False
+
+    reason, ok = QInputDialog.getText(
+        parent_widget, "Delete Reason",
+        f"Reason for deleting {voucher_number}:"
+    )
+    if not ok or not reason.strip():
+        return False
+
+    reply = QMessageBox.question(
+        parent_widget, "Confirm Delete",
+        f"Permanently delete {voucher_number}?\n\nThis cannot be undone.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return False
+
+    try:
+        if voucher_type == "sale":
+            db_delete_sale_voucher(voucher_id, deleted_by, reason.strip())
+        elif voucher_type == "purchase":
+            db_delete_purchase_voucher(voucher_id, deleted_by, reason.strip())
+        elif voucher_type == "sale_return":
+            db_delete_sale_return(voucher_id, deleted_by, reason.strip())
+        elif voucher_type == "purchase_return":
+            db_delete_purchase_return(voucher_id, deleted_by, reason.strip())
+        else:
+            raise ValueError(f"Unknown voucher_type: {voucher_type}")
+        QMessageBox.information(parent_widget, "Deleted", f"{voucher_number} deleted successfully.")
+        return True
+    except Exception as e:
+        QMessageBox.critical(parent_widget, "Error", f"Delete failed:\n{e}")
+        return False
 
 
 if __name__ == "__main__":
