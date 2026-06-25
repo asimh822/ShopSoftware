@@ -281,6 +281,7 @@ def _run_migrations(conn) -> None:
         12: _migrate_v12,
         13: _migrate_v13,
         14: _migrate_v14,
+        15: _migrate_v15,
     }
 
     current = _get_db_version(conn)
@@ -864,6 +865,43 @@ def _migrate_v14(conn) -> None:
             FROM _je_v14_old
         """)
         c.execute("DROP TABLE _je_v14_old")
+
+
+def _migrate_v15(conn) -> None:
+    """
+    Version 15 — Restore last_modified on payments and journal_entries.
+    The v14 rebuild created new tables without the last_modified column that
+    v11/v12 had added. Re-add the column, triggers, and backfill all rows.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    for table in ("payments", "journal_entries"):
+        existing = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "last_modified" not in existing:
+            c.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                f"last_modified TEXT DEFAULT '2000-01-01 00:00:01'"
+            )
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_update
+            AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_insert
+            AFTER INSERT ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+        c.execute(
+            f"UPDATE {table} SET last_modified = CURRENT_TIMESTAMP "
+            f"WHERE last_modified IS NULL OR last_modified = '2000-01-01 00:00:01'"
+        )
 
 
 _SUPABASE_SYNC_TABLES = [
