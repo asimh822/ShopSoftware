@@ -281,12 +281,6 @@ class BalanceSheetPage(QWidget):
         top_lyt.setContentsMargins(24, 0, 24, 0)
         top_lyt.setSpacing(12)
 
-        title_lbl = QLabel("Balance Sheet")
-        f = QFont()
-        f.setBold(True)
-        f.setPointSize(14)
-        title_lbl.setFont(f)
-        top_lyt.addWidget(title_lbl)
         top_lyt.addStretch()
 
         as_at_lbl = QLabel("As at:")

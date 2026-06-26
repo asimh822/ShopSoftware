@@ -26,7 +26,7 @@ from whatsapp_page import WhatsAppPage
 from settings_page import SettingsPage
 from capital import CapitalPage
 from balance_sheet import BalanceSheetPage
-from supabase_sync import run_sync
+# from supabase_sync import run_sync  # DEV PC — sync disabled, only shop PC syncs
 
 # ── API Server subprocess management ─────────────────────────────────────────
 
@@ -111,7 +111,7 @@ NAV_ITEMS = [
     ("Ledger",           "ledger"),
     ("Capital",          "capital"),
     ("Reports",          "reports"),
-    ("Bal. Sheet",       "balance_sheet"),
+    ("Balance Sheet",    "balance_sheet"),
     ("WhatsApp",         "whatsapp"),
     ("Settings",         "settings"),
 ]
@@ -217,12 +217,12 @@ class Sidebar(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Logo / shop name
+        # Logo / shop name — total height matches the top header bar (56px)
         logo = QLabel("United Mobile")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         logo.setStyleSheet("color: #ffffff; padding: 8px 0 2px 0;")
-        logo.setFixedHeight(36)
+        logo.setFixedHeight(38)
         layout.addWidget(logo)
 
         sub = QLabel("EPOS System")
@@ -303,11 +303,6 @@ class DashboardPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(20)
-
-        title = QLabel("Dashboard")
-        title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
-        title.setStyleSheet("color: #1e293b;")
-        layout.addWidget(title)
 
         cards_row = QHBoxLayout()
         cards_row.setSpacing(16)
@@ -776,6 +771,13 @@ class ImeiLookupDialog(QDialog):
         # Candidate picker — shown only when multiple IMEIs match
         self._list = QListWidget()
         self._list.setMaximumHeight(120)
+        self._list.setStyleSheet(
+            "QListWidget { background:#ffffff; color:#1e293b; border:1px solid #e2e8f0;"
+            " border-radius:6px; outline:none; }"
+            "QListWidget::item { padding:6px 10px; }"
+            "QListWidget::item:hover { background:#dbeafe; color:#1e293b; }"
+            "QListWidget::item:selected { background:#2563eb; color:#ffffff; }"
+        )
         self._list.itemClicked.connect(
             lambda it: self._show_history(it.data(Qt.ItemDataRole.UserRole))
         )
@@ -1093,10 +1095,6 @@ class VouchersPage(QWidget):
 
         # ── Title row + Go to Voucher ─────────────────────────────────────────
         top = QHBoxLayout()
-        title = QLabel("Vouchers")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        top.addWidget(title)
         top.addStretch()
         top.addWidget(QLabel("Go to:"))
         self._goto_edit = QLineEdit()
@@ -1675,7 +1673,7 @@ class MainWindow(QMainWindow):
 
     def _make_header_bar(self) -> QFrame:
         bar = QFrame()
-        bar.setFixedHeight(52)
+        bar.setFixedHeight(56)
         bar.setStyleSheet(
             f"background: {HEADER_BG}; border-bottom: 2px solid {HEADER_BORDER};"
         )
@@ -1684,7 +1682,7 @@ class MainWindow(QMainWindow):
         hl.setSpacing(0)
 
         self._header_page_label = QLabel("Dashboard")
-        self._header_page_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        self._header_page_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         self._header_page_label.setStyleSheet("color: #ffffff; background: transparent;")
         hl.addWidget(self._header_page_label)
 
@@ -1800,18 +1798,9 @@ def main():
     init_db()
     _start_api_server()
 
-    def _sync_loop():
-        import time
-        run_sync()          # run immediately on startup
-        while True:
-            time.sleep(3600)
-            try:
-                run_sync()
-            except Exception as e:
-                print(f"[Supabase Sync] Thread error: {e}")
-
-    sync_thread = threading.Thread(target=_sync_loop, daemon=True)
-    sync_thread.start()
+    # DEV PC — Supabase sync disabled. Only the shop PC should push data.
+    # sync_thread = threading.Thread(target=_sync_loop, daemon=True)
+    # sync_thread.start()
 
     _auto_register_startup()
     app = QApplication(sys.argv)
@@ -1944,7 +1933,7 @@ def main():
         sys.exit(0)
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 

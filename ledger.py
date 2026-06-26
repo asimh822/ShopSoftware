@@ -7,8 +7,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QMessageBox, QHeaderView, QAbstractItemView,
     QFrame, QButtonGroup, QRadioButton,
 )
-from PyQt6.QtCore import Qt, QDate, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QBrush
+from PyQt6.QtCore import Qt, QDate, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QColor, QBrush, QShortcut, QKeySequence
 
 from database import (
     get_connection, db_bank_accounts,
@@ -833,9 +833,10 @@ class MultiLineCpCrDialog(QDialog):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(self.reject)
-        btn_save = QPushButton("Save")
+        btn_save = QPushButton("Save  [F9]")
         btn_save.setStyleSheet(BTN_PRIMARY)
         btn_save.clicked.connect(self._save)
+        QShortcut(QKeySequence("F9"), self).activated.connect(self._save)
         foot.addWidget(btn_cancel)
         foot.addWidget(btn_save)
         layout.addLayout(foot)
@@ -1517,11 +1518,6 @@ class LedgerPage(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(10)
 
-        title = QLabel("Ledger")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        layout.addWidget(title)
-
         # ── Party type toggle (Suppliers | Customers | Bank) ──────────────────
         type_card = QFrame()
         type_card.setStyleSheet(CARD_STYLE)
@@ -1540,6 +1536,8 @@ class LedgerPage(QWidget):
         _style_toggle(self.btn_cust,  False, "mid")
         _style_toggle(self.btn_other, False, "mid")
         _style_toggle(self.btn_bank,  False, "right")
+        for _b in (self.btn_sup, self.btn_cust, self.btn_other, self.btn_bank):
+            _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
         self.btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
         self.btn_other.clicked.connect(lambda: self._set_party_type("other"))
@@ -1634,17 +1632,6 @@ class LedgerPage(QWidget):
         contact_col.addWidget(lbl_ct)
         contact_col.addWidget(self._lbl_contact)
         il.addLayout(contact_col)
-        il.addStretch()
-        balance_col = QVBoxLayout()
-        balance_col.setSpacing(2)
-        self._lbl_bal_title = QLabel("Current Balance")
-        self._lbl_bal_title.setStyleSheet("color:#64748b; font-size:9pt;")
-        self._lbl_balance = QLabel("PKR 0")
-        self._lbl_balance.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        self._lbl_balance.setMinimumWidth(220)
-        balance_col.addWidget(self._lbl_bal_title)
-        balance_col.addWidget(self._lbl_balance)
-        il.addLayout(balance_col)
         layout.addWidget(self.info_card)
 
         # ── Party ledger table ────────────────────────────────────────────────
@@ -1695,8 +1682,10 @@ class LedgerPage(QWidget):
 
         if is_bank:
             self._bank_widget.refresh()
+            QTimer.singleShot(0, self._bank_widget.setFocus)
         else:
             self._load_party_combo()
+            QTimer.singleShot(0, self.party_combo.setFocus)
 
     def _load_party_combo(self):
         self.party_combo.blockSignals(True)
@@ -1769,7 +1758,18 @@ class LedgerPage(QWidget):
         _do_export_csv(self)
 
     def _export_payload(self):
-        headers, rows = _table_to_rows(self.table)
+        headers = ["Date", "Voucher", "Description", "Debit (PKR)", "Credit (PKR)", "Balance (PKR)"]
+        rows = [
+            [
+                e.get("date", ""),
+                e.get("voucher", ""),
+                e.get("desc", ""),
+                fmt_pkr(e["dr"]) if e.get("dr") else "",
+                fmt_pkr(e["cr"]) if e.get("cr") else "",
+                fmt_pkr(e["balance"]),
+            ]
+            for e in getattr(self, "_entries_asc", [])
+        ]
         ptype_label = {"supplier": "Supplier", "customer": "Customer",
                        "other": "Other_Party"}.get(self._party_type, "Customer")
         name = f"{ptype_label}_Ledger_{self._party_name}"
@@ -1777,7 +1777,6 @@ class LedgerPage(QWidget):
         bal = self.closing_label.text().strip()
         if bal:
             title += f"   ({bal})"
-        # Right-align Debit, Credit, Balance columns.
         return (name, title, headers, rows, {3, 4, 5})
 
     def _edit_ledger_entry(self):
@@ -1829,6 +1828,7 @@ class LedgerPage(QWidget):
                 f"and use the ✏ Edit button.")
 
     def _populate_table(self, entries):
+        self._entries_asc = list(entries)   # kept in ascending order for export
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.table.setWordWrap(True)
@@ -1836,8 +1836,8 @@ class LedgerPage(QWidget):
         DR_COLOR  = QColor("#dc2626")
         CR_COLOR  = QColor("#16a34a")
         BAL_FONT  = QFont("Segoe UI", 10, QFont.Weight.Bold)
-        closing_balance = 0.0
-        for e in entries:
+        closing_balance = entries[-1]["balance"] if entries else 0.0
+        for e in reversed(entries):   # display newest first
             row = self.table.rowCount()
             self.table.insertRow(row)
             is_hdr = e.get("is_header", False)
@@ -1869,11 +1869,7 @@ class LedgerPage(QWidget):
                         DR_COLOR if bal > 0 else (CR_COLOR if bal < 0 else QColor("#475569"))
                     ))
                 self.table.setItem(row, col, item)
-            closing_balance = e["balance"]
         self.table.resizeRowsToContents()
-        self._lbl_balance.setText(f"PKR {fmt_pkr(closing_balance)}")
-        bal_color = "#dc2626" if closing_balance > 0 else "#16a34a"
-        self._lbl_balance.setStyleSheet(f"color:{bal_color};")
         if entries:
             dr_cr = "DR" if closing_balance > 0 else "CR"
             self.closing_label.setText(

@@ -60,12 +60,6 @@ class WhatsAppPage(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        # Title
-        title = QLabel("WhatsApp")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        layout.addWidget(title)
-
         # Info card
         info = QFrame()
         info.setStyleSheet(CARD_STYLE)

@@ -588,9 +588,6 @@ class CapitalPage(QWidget):
 
         # ── Header ──
         header_row = QHBoxLayout()
-        title = QLabel("Capital Accounts")
-        title.setStyleSheet("font-size:20px;font-weight:bold;color:#1a3a5c;")
-        header_row.addWidget(title)
         header_row.addStretch()
 
         self._adj_btn = QPushButton("Adjust Opening Stock")

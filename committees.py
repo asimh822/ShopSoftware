@@ -260,9 +260,6 @@ class CommitteesDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         title_row = QHBoxLayout()
-        title_lbl = QLabel("Committees (Comety)")
-        title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        title_row.addWidget(title_lbl)
         title_row.addStretch()
         btn_add = QPushButton("+ Add Committee")
         btn_add.setStyleSheet(BTN_PRIMARY)

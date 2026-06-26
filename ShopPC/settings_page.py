@@ -281,6 +281,7 @@ class YearEndCloseDialog(QDialog):
 class SettingsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._dirty = False
         self.setStyleSheet("background:#f1f5f9;")
 
         outer = QVBoxLayout(self)
@@ -300,17 +301,12 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(24, 20, 24, 24)
         layout.setSpacing(16)
 
-        # Title
         title_row = QHBoxLayout()
-        title = QLabel("Settings")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        title_row.addWidget(title)
         title_row.addStretch()
-        btn_save = QPushButton("Save All Settings")
-        btn_save.setStyleSheet(BTN_PRIMARY)
-        btn_save.clicked.connect(self._save)
-        title_row.addWidget(btn_save)
+        self.btn_save = QPushButton("Save All Settings")
+        self.btn_save.setStyleSheet(BTN_PRIMARY)
+        self.btn_save.clicked.connect(self._save)
+        title_row.addWidget(self.btn_save)
         layout.addLayout(title_row)
 
         # ── Shop Information ──────────────────────────────────────────────────
@@ -780,6 +776,16 @@ class SettingsPage(QWidget):
 
         layout.addStretch()
 
+        # Connect change signals for unsaved-changes tracking
+        for _field in (
+            self.shop_name, self.shop_address, self.shop_contact,
+            self.printer_name, self.receipt_footer, self.owner_whatsapp,
+            self.printer_ip, self.printer_port,
+        ):
+            _field.textChanged.connect(self._mark_dirty)
+        self.wa_template.textChanged.connect(self._mark_dirty)
+        self.printer_mode.currentIndexChanged.connect(self._mark_dirty)
+
     def _on_printer_mode_changed(self):
         """Show only the fields relevant to the selected connection mode."""
         is_network = self.printer_mode.currentData() == "network"
@@ -798,6 +804,11 @@ class SettingsPage(QWidget):
                 w.setVisible(is_network)
         self._net_note.setVisible(is_network)
 
+    def _mark_dirty(self):
+        if not self._dirty:
+            self._dirty = True
+            self.btn_save.setText("Save All Settings  ●")
+
     def _save(self):
         set_setting("shop_name",       self.shop_name.text().strip())
         set_setting("shop_address",    self.shop_address.text().strip())
@@ -813,7 +824,21 @@ class SettingsPage(QWidget):
         port = self.printer_port.text().strip() or "9100"
         set_setting("printer_port", port)
 
+        self._dirty = False
+        self.btn_save.setText("Save All Settings")
         QMessageBox.information(self, "Saved", "Settings saved successfully.")
+
+    def hideEvent(self, event):
+        if self._dirty:
+            ans = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved settings changes. Save before leaving?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard,
+                QMessageBox.StandardButton.Save,
+            )
+            if ans == QMessageBox.StandardButton.Save:
+                self._save()
+        super().hideEvent(event)
 
     def _change_pin(self):
         current = self.pin_current.text()

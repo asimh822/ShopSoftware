@@ -131,7 +131,7 @@ def db_load_purchase_for_edit(pv_id):
         SELECT pl.id AS pl_id, pl.model_id, pl.imei, pl.purchase_price,
                COALESCE(si.id, 0) AS stock_item_id,
                COALESCE(si.status, 'unknown') AS stock_status,
-               b.name AS brand_name, m.name AS model_name
+               b.id AS brand_id, b.name AS brand_name, m.name AS model_name
         FROM purchase_lines pl
         JOIN models m ON m.id = pl.model_id
         JOIN brands b ON b.id = m.brand_id
@@ -141,6 +141,24 @@ def db_load_purchase_for_edit(pv_id):
     """, (pv_id,)).fetchall()]
     conn.close()
     return pv, lines
+
+
+def _db_brands_list():
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM brands ORDER BY name"
+    ).fetchall()]
+    conn.close()
+    return rows
+
+
+def _db_models_for_brand(brand_id):
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM models WHERE brand_id=? ORDER BY name", (brand_id,)
+    ).fetchall()]
+    conn.close()
+    return rows
 
 
 def db_lookup_payment(voucher_number):
@@ -548,7 +566,7 @@ class _PurchaseLineAddDialog(QDialog):
         g3 = QHBoxLayout()
         g3.addWidget(QLabel("IMEI:"))
         self._imei_edit = QLineEdit()
-        self._imei_edit.setMaxLength(20)
+        self._imei_edit.setMaxLength(15)
         self._imei_edit.setPlaceholderText("15-digit IMEI")
         g3.addWidget(self._imei_edit)
         layout.addLayout(g3)
@@ -602,6 +620,11 @@ class _PurchaseLineAddDialog(QDialog):
         imei = self._imei_edit.text().strip()
         if not imei:
             QMessageBox.warning(self, "Missing", "Enter IMEI.")
+            return
+        if len(imei) != 15 or not imei.isdigit():
+            QMessageBox.warning(self, "Invalid IMEI",
+                "IMEI must be exactly 15 digits (numbers only).")
+            self._imei_edit.setFocus()
             return
         if self._price_spin.value() <= 0:
             QMessageBox.warning(self, "Missing", "Enter purchase price.")
@@ -1085,8 +1108,8 @@ class SaleEditDialog(QDialog):
             "brand_name": r["brand_name"],
             "model_name": r["model_name"],
             "imei": r["imei"],
-            "ref_price": float(r.get("reference_price") or 0),
-            "final_price": float(r.get("reference_price") or 0),
+            "ref_price": float(r["reference_price"] or 0),
+            "final_price": float(r["reference_price"] or 0),
         })
         self._rebuild_lines_table()
         # Scroll to last row so user sees the new line
@@ -1197,12 +1220,13 @@ class PurchaseEditDialog(QDialog):
 
         self._lines = [
             {
-                "model_id": r["model_id"],
-                "brand_name": r["brand_name"],
-                "model_name": r["model_name"],
-                "imei": r["imei"],
+                "model_id":      r["model_id"],
+                "brand_id":      r["brand_id"],
+                "brand_name":    r["brand_name"],
+                "model_name":    r["model_name"],
+                "imei":          r["imei"],
                 "purchase_price": float(r["purchase_price"] or 0),
-                "stock_status": r["stock_status"],
+                "stock_status":  r["stock_status"],
             }
             for r in lines
         ]
@@ -1308,7 +1332,7 @@ class PurchaseEditDialog(QDialog):
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)    # IMEI
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)    # Purchase Price
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)    # Remove
-        self.lines_table.setColumnWidth(0, 90)
+        self.lines_table.setColumnWidth(0, 150)
         self.lines_table.setColumnWidth(2, 160)
         self.lines_table.setColumnWidth(3, 180)   # Purchase Price — QLineEdit
         self.lines_table.setColumnWidth(4, 90)    # Remove button
@@ -1328,15 +1352,59 @@ class PurchaseEditDialog(QDialog):
 
         self._rebuild_lines_table()
 
+    def _populate_model_combo(self, combo, brand_id, current_model_id=None):
+        combo.clear()
+        for m in _db_models_for_brand(brand_id):
+            combo.addItem(m["name"], m["id"])
+            if current_model_id and m["id"] == current_model_id:
+                combo.setCurrentIndex(combo.count() - 1)
+
+    def _on_brand_changed(self, brand_combo, model_combo):
+        brand_id = brand_combo.currentData()
+        if brand_id:
+            self._populate_model_combo(model_combo, brand_id)
+
     def _rebuild_lines_table(self):
         self.lines_table.setSortingEnabled(False)
         self.lines_table.setRowCount(0)
+        brands = _db_brands_list()
+        brand_name_to_id = {b["name"]: b["id"] for b in brands}
         total = 0.0
         for i, ln in enumerate(self._lines):
             row = self.lines_table.rowCount()
             self.lines_table.insertRow(row)
-            self.lines_table.setItem(row, 0, QTableWidgetItem(ln["brand_name"]))
-            self.lines_table.setItem(row, 1, QTableWidgetItem(ln["model_name"]))
+
+            # Brand combo
+            brand_id = ln.get("brand_id") or brand_name_to_id.get(ln.get("brand_name"))
+            brand_combo = QComboBox()
+            brand_combo.setStyleSheet(
+                "QComboBox { background:#ffffff; color:#1e293b; border:1px solid #cbd5e1;"
+                " border-radius:4px; padding:3px 6px; font-size:10pt; }"
+                "QComboBox QAbstractItemView { background:#ffffff; color:#1e293b;"
+                " selection-background-color:#dbeafe; selection-color:#1e40af; }"
+            )
+            for b in brands:
+                brand_combo.addItem(b["name"], b["id"])
+                if b["id"] == brand_id:
+                    brand_combo.setCurrentIndex(brand_combo.count() - 1)
+
+            # Model combo
+            model_combo = QComboBox()
+            model_combo.setStyleSheet(
+                "QComboBox { background:#ffffff; color:#1e293b; border:1px solid #cbd5e1;"
+                " border-radius:4px; padding:3px 6px; font-size:10pt; }"
+                "QComboBox QAbstractItemView { background:#ffffff; color:#1e293b;"
+                " selection-background-color:#dbeafe; selection-color:#1e40af; }"
+            )
+            if brand_id:
+                self._populate_model_combo(model_combo, brand_id, ln.get("model_id"))
+
+            brand_combo.currentIndexChanged.connect(
+                lambda _, bc=brand_combo, mc=model_combo: self._on_brand_changed(bc, mc)
+            )
+
+            self.lines_table.setCellWidget(row, 0, brand_combo)
+            self.lines_table.setCellWidget(row, 1, model_combo)
             self.lines_table.setItem(row, 2, QTableWidgetItem(ln["imei"]))
 
             price_edit = QLineEdit(str(int(ln["purchase_price"])))
@@ -1432,7 +1500,11 @@ class PurchaseEditDialog(QDialog):
         else:
             supplier_id = self.supplier_combo.currentData()
         notes = self.notes_edit.text().strip()
-        db_lines = [(ln["model_id"], ln["imei"], ln["purchase_price"]) for ln in self._lines]
+        db_lines = []
+        for i, ln in enumerate(self._lines):
+            model_combo = self.lines_table.cellWidget(i, 1)
+            model_id = model_combo.currentData() if model_combo else ln["model_id"]
+            db_lines.append((model_id, ln["imei"], ln["purchase_price"]))
 
         try:
             db_update_purchase(self._pv_id, date_str, supplier_id, notes, db_lines)

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QPoint, QEvent, pyqtSignal
-from PyQt6.QtGui import QFont, QBrush, QColor, QPainter, QPixmap
+from PyQt6.QtGui import QFont, QBrush, QColor, QPainter, QPixmap, QShortcut, QKeySequence
 
 from database import get_connection, db_bank_accounts, db_active_salesmen
 from widgets import SearchableComboBox
@@ -742,6 +742,7 @@ class SaleDetailDialog(QDialog):
             note_lbl.setStyleSheet("color:#64748b; font-size:9pt;")
             layout.addWidget(note_lbl)
 
+        footer = QHBoxLayout()
         btn_delete = QPushButton("🗑 Delete Voucher")
         btn_delete.setStyleSheet("""
             QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
@@ -749,11 +750,13 @@ class SaleDetailDialog(QDialog):
             QPushButton:hover { background:#fecaca; }
         """)
         btn_delete.clicked.connect(lambda: self._delete_and_close(sv_row))
-        layout.addWidget(btn_delete)
-
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        footer.addWidget(btn_delete)
+        footer.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(BTN_SECONDARY)
+        btn_close.clicked.connect(self.reject)
+        footer.addWidget(btn_close)
+        layout.addLayout(footer)
 
     def _delete_and_close(self, sv_row):
         from database import prompt_and_delete_voucher
@@ -821,6 +824,8 @@ class SaleForm(QWidget):
             BTN_TOGGLE_OFF + "QPushButton { border-radius: 0 5px 5px 0; "
             "border-left: none; }"
         )
+        self.btn_cash.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_credit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_cash.clicked.connect(lambda: self._set_type("cash"))
         self.btn_credit.clicked.connect(lambda: self._set_type("credit"))
         toggle_row.addWidget(self.btn_cash)
@@ -845,40 +850,35 @@ class SaleForm(QWidget):
                 "No active salesmen — add one in Masters → Salesmen first."
             )
         hl.addWidget(self.salesman_combo)
-
         hl.addSpacing(8)
-        # Customer section — stacked (cash / credit)
+
         self._sale_type = "cash"
-        self.customer_stack = QStackedWidget()
 
-        # Cash page — contact number first, name second
-        cash_widget = QWidget()
-        cash_row = QHBoxLayout(cash_widget)
-        cash_row.setContentsMargins(0, 0, 0, 0)
-        cash_row.setSpacing(12)
-
+        # ── Cash customer fields ──────────────────────────────────────────────
         self.cash_contact = ContactLineEdit()
         self.cash_contact.setPlaceholderText("03XXXXXXXXX")
         self.cash_contact.setMaxLength(11)
-        self.cash_contact.setFixedWidth(105)
+        self.cash_contact.setFixedWidth(110)
         self.cash_contact.textChanged.connect(self._on_cash_contact_changed)
         self.cash_contact.returnPressed.connect(lambda: self.cash_contact.focusNextChild())
-        cash_row.addWidget(self.cash_contact)
+        hl.addWidget(self.cash_contact)
 
         self.contact_status_lbl = QLabel("")
-        self.contact_status_lbl.setMinimumWidth(24)
-        cash_row.addWidget(self.contact_status_lbl)
+        self.contact_status_lbl.setFixedWidth(16)
+        hl.addWidget(self.contact_status_lbl)
 
-        cash_row.addWidget(QLabel("Name *:"))
+        self._name_lbl = QLabel("Name:")
+        hl.addWidget(self._name_lbl)
         self.cash_name = QLineEdit()
-        self.cash_name.setPlaceholderText("Auto-filled or enter name")
-        self.cash_name.setMinimumWidth(180)
+        self.cash_name.setPlaceholderText("Customer name")
+        self.cash_name.setFixedWidth(145)
+        self.cash_name.setMaxLength(20)
         self.cash_name.setEnabled(False)
         self.cash_name.returnPressed.connect(lambda: self.cash_name.focusNextChild())
         _setup_titlecase_edit(self.cash_name)
-        cash_row.addWidget(self.cash_name)
+        hl.addWidget(self.cash_name)
 
-        # WhatsApp icon — green circle with phone glyph, no external file needed
+        # WhatsApp icon — green circle with phone glyph
         _wa_px = QPixmap(22, 22)
         _wa_px.fill(Qt.GlobalColor.transparent)
         _wa_p = QPainter(_wa_px)
@@ -890,24 +890,18 @@ class SaleForm(QWidget):
         _wa_p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         _wa_p.drawText(_wa_px.rect(), Qt.AlignmentFlag.AlignCenter, "✆")
         _wa_p.end()
-        _wa_lbl = QLabel()
-        _wa_lbl.setPixmap(_wa_px)
-        _wa_lbl.setToolTip("Send WhatsApp on save")
-        cash_row.addWidget(_wa_lbl)
+        self._wa_lbl = QLabel()
+        self._wa_lbl.setPixmap(_wa_px)
+        self._wa_lbl.setToolTip("Send WhatsApp on save")
+        hl.addWidget(self._wa_lbl)
         self.chk_whatsapp = QCheckBox()
         self.chk_whatsapp.setChecked(False)
         self.chk_whatsapp.setToolTip("Send WhatsApp on save")
-        cash_row.addWidget(self.chk_whatsapp)
+        hl.addWidget(self.chk_whatsapp)
 
-        cash_row.addStretch()
-        self.customer_stack.addWidget(cash_widget)
-
-        # Credit page
-        credit_widget = QWidget()
-        credit_row = QHBoxLayout(credit_widget)
-        credit_row.setContentsMargins(0, 0, 0, 0)
-        credit_row.setSpacing(12)
-        credit_row.addWidget(QLabel("Credit Customer *"))
+        # ── Credit customer fields (hidden initially) ─────────────────────────
+        self._credit_lbl = QLabel("Credit Customer *")
+        hl.addWidget(self._credit_lbl)
         self.credit_combo = SearchableComboBox()
         self.credit_combo.setMinimumWidth(220)
         self.credit_combo.addItem("— Select Customer —", None)
@@ -920,20 +914,20 @@ class SaleForm(QWidget):
             self.credit_combo.model().item(_sep_idx).setEnabled(False)
             for s in _sups_for_sale:
                 self.credit_combo.addItem(s['name'], {"type": "supplier", "id": s["id"]})
-        credit_row.addWidget(self.credit_combo)
+        hl.addWidget(self.credit_combo)
         self.credit_balance_lbl = QLabel("")
         self.credit_balance_lbl.setStyleSheet(STATUS_INFO)
-        credit_row.addWidget(self.credit_balance_lbl)
+        hl.addWidget(self.credit_balance_lbl)
         self.credit_combo.currentIndexChanged.connect(self._on_credit_customer_changed)
-        credit_row.addStretch()
-        self.customer_stack.addWidget(credit_widget)
 
-        # Disable Credit toggle if no credit customers or suppliers exist
+        self._credit_lbl.setVisible(False)
+        self.credit_combo.setVisible(False)
+        self.credit_balance_lbl.setVisible(False)
+
         if self.credit_combo.count() <= 1:
             self.btn_credit.setEnabled(False)
             self.btn_credit.setToolTip("No credit customers — add one in Masters first.")
 
-        hl.addWidget(self.customer_stack)
         hl.addStretch()
         layout.addWidget(header)
 
@@ -1090,9 +1084,10 @@ class SaleForm(QWidget):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Sale")
+        self.btn_save = QPushButton("Save Sale  [F9]")
         self.btn_save.setStyleSheet(BTN_PRIMARY)
         self.btn_save.clicked.connect(self._save)
+        QShortcut(QKeySequence("F9"), self).activated.connect(self.btn_save.click)
         footer_strip.addWidget(btn_cancel)
         footer_strip.addWidget(self.btn_save)
 
@@ -1210,16 +1205,15 @@ class SaleForm(QWidget):
 
     def _set_type(self, sale_type):
         self._sale_type = sale_type
-        if sale_type == "cash":
+        is_cash = sale_type == "cash"
+
+        if is_cash:
             self.btn_cash.setStyleSheet(
                 BTN_TOGGLE_ON + "QPushButton { border-radius: 5px 0 0 5px; }"
             )
             self.btn_credit.setStyleSheet(
                 BTN_TOGGLE_OFF + "QPushButton { border-radius: 0 5px 5px 0; border-left: none; }"
             )
-            self.customer_stack.setCurrentIndex(0)
-            self._pay_method_widget.setVisible(True)
-            self._pm_detail.setVisible(self._payment_mode != "cash")
         else:
             self.btn_credit.setStyleSheet(
                 BTN_TOGGLE_ON + "QPushButton { border-radius: 0 5px 5px 0; border-left: none; }"
@@ -1227,9 +1221,25 @@ class SaleForm(QWidget):
             self.btn_cash.setStyleSheet(
                 BTN_TOGGLE_OFF + "QPushButton { border-radius: 5px 0 0 5px; }"
             )
-            self.customer_stack.setCurrentIndex(1)
-            self._pay_method_widget.setVisible(False)
-            self._pm_detail.setVisible(False)
+
+        self.cash_contact.setVisible(is_cash)
+        self.contact_status_lbl.setVisible(is_cash)
+        self._name_lbl.setVisible(is_cash)
+        self.cash_name.setVisible(is_cash)
+        self._wa_lbl.setVisible(is_cash)
+        self.chk_whatsapp.setVisible(is_cash)
+
+        self._credit_lbl.setVisible(not is_cash)
+        self.credit_combo.setVisible(not is_cash)
+        self.credit_balance_lbl.setVisible(not is_cash)
+
+        self._pay_method_widget.setVisible(is_cash)
+        self._pm_detail.setVisible(is_cash and self._payment_mode != "cash")
+
+        if is_cash:
+            QTimer.singleShot(0, self.cash_contact.setFocus)
+        else:
+            QTimer.singleShot(0, self.credit_combo.setFocus)
 
     # ── Payment mode toggle ───────────────────────────────────────────────────
 
@@ -1699,10 +1709,13 @@ class SaleForm(QWidget):
                         return True
             elif event.type() == QEvent.Type.FocusOut:
                 # Small delay so a click on the dropdown is processed before it hides
-                QTimer.singleShot(120, lambda: (
-                    self._imei_dropdown.hide()
-                    if not self.imei_input.hasFocus() else None
-                ))
+                def _maybe_hide_sale():
+                    try:
+                        if not self.imei_input.hasFocus():
+                            self._imei_dropdown.hide()
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(120, _maybe_hide_sale)
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):
@@ -1721,10 +1734,6 @@ class SaleListView(QWidget):
         layout.setSpacing(12)
 
         top = QHBoxLayout()
-        title = QLabel("Sales")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        top.addWidget(title)
         top.addStretch()
         top.addWidget(QLabel("Go to Voucher:"))
         self._goto_edit = QLineEdit()
@@ -2060,10 +2069,11 @@ class SaleReturnForm(QWidget):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Return")
+        self.btn_save = QPushButton("Save Return  [F9]")
         self.btn_save.setStyleSheet(BTN_PRIMARY)
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save)
+        QShortcut(QKeySequence("F9"), self).activated.connect(self.btn_save.click)
         top.addWidget(btn_cancel)
         top.addWidget(self.btn_save)
         layout.addLayout(top)
@@ -2328,10 +2338,13 @@ class SaleReturnForm(QWidget):
                 if key == Qt.Key.Key_Escape:
                     self._imei_dropdown.hide(); return True
             elif event.type() == QEvent.Type.FocusOut:
-                QTimer.singleShot(120, lambda: (
-                    self._imei_dropdown.hide()
-                    if not self.imei_input.hasFocus() else None
-                ))
+                def _maybe_hide_sr():
+                    try:
+                        if not self.imei_input.hasFocus():
+                            self._imei_dropdown.hide()
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(120, _maybe_hide_sr)
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):

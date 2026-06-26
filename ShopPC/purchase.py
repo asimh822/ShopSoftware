@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QCheckBox, QTabWidget, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QDate, QPoint, QTimer, QEvent, pyqtSignal
-from PyQt6.QtGui import QFont, QBrush, QColor
+from PyQt6.QtGui import QFont, QBrush, QColor, QShortcut, QKeySequence
 
 from database import get_connection
 from widgets import SearchableComboBox
@@ -632,10 +632,11 @@ class PurchaseReturnForm(QWidget):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Return")
+        self.btn_save = QPushButton("Save Return  [F9]")
         self.btn_save.setStyleSheet(BTN_PRIMARY)
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save)
+        QShortcut(QKeySequence("F9"), self).activated.connect(self.btn_save.click)
         footer_strip.addWidget(btn_cancel)
         footer_strip.addWidget(self.btn_save)
         layout.addLayout(footer_strip)
@@ -1061,6 +1062,7 @@ class PurchaseForm(QWidget):
         self._updating_price = False
         self._purchase_type = "supplier"   # 'supplier' | 'cash'
         self._pay_method    = "cash"       # 'cash' | 'bank' | 'split'
+        self._total         = 0.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -1083,6 +1085,8 @@ class PurchaseForm(QWidget):
         self._btn_cash_type.setFixedHeight(30)
         _apply_toggle_style(self._btn_supplier_type, True,  "left")
         _apply_toggle_style(self._btn_cash_type,     False, "right")
+        self._btn_supplier_type.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_cash_type.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_supplier_type.clicked.connect(lambda: self._set_purchase_type("supplier"))
         self._btn_cash_type.clicked.connect(    lambda: self._set_purchase_type("cash"))
         toggle_row.addWidget(self._btn_supplier_type)
@@ -1091,21 +1095,21 @@ class PurchaseForm(QWidget):
         header_layout.addSpacing(12)
 
         # Date
-        date_col = QVBoxLayout()
-        date_col.addWidget(QLabel("Date"))
+        header_layout.addWidget(QLabel("Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setCalendarPopup(True)
-        self.date_edit.setMinimumWidth(130)
-        date_col.addWidget(self.date_edit)
-        header_layout.addLayout(date_col)
+        self.date_edit.setFixedWidth(108)
+        header_layout.addWidget(self.date_edit)
 
         # Supplier (wrapped in a QWidget so it can be hidden for cash purchases)
         self._sup_widget = QWidget()
-        sup_inner = QVBoxLayout(self._sup_widget)
-        sup_inner.setContentsMargins(0, 0, 0, 0)
-        sup_inner.setSpacing(4)
-        sup_inner.addWidget(QLabel("Supplier *"))
+        _sup_h = QHBoxLayout(self._sup_widget)
+        _sup_h.setContentsMargins(0, 0, 0, 0)
+        _sup_h.setSpacing(6)
+        _sup_lbl = QLabel("Supplier *:")
+        _sup_lbl.setStyleSheet("color:#dc2626; font-weight:bold;")
+        _sup_h.addWidget(_sup_lbl)
         self.supplier_combo = SearchableComboBox()
         self.supplier_combo.setMinimumWidth(200)
         self.supplier_combo.addItem("— Select Supplier —", None)
@@ -1118,148 +1122,22 @@ class PurchaseForm(QWidget):
             self.supplier_combo.model().item(_sep_idx).setEnabled(False)
             for cc in _cust_for_pur:
                 self.supplier_combo.addItem(cc['name'], {"type": "customer", "id": cc["id"]})
-        sup_inner.addWidget(self.supplier_combo)
+        _sup_h.addWidget(self.supplier_combo)
+        header_layout.addWidget(self._sup_widget)
         self.supplier_balance_lbl = QLabel("")
         self.supplier_balance_lbl.setStyleSheet(STATUS_INFO)
-        sup_inner.addWidget(self.supplier_balance_lbl)
+        header_layout.addWidget(self.supplier_balance_lbl)
         self.supplier_combo.currentIndexChanged.connect(self._on_supplier_changed)
-        header_layout.addWidget(self._sup_widget)
 
         # Notes
-        notes_col = QVBoxLayout()
-        notes_col.addWidget(QLabel("Notes"))
+        header_layout.addWidget(QLabel("Notes:"))
         self.notes_edit = QLineEdit()
-        self.notes_edit.setPlaceholderText("Optional notes for this purchase")
-        self.notes_edit.setMinimumWidth(220)
+        self.notes_edit.setPlaceholderText("Optional notes")
+        self.notes_edit.setMinimumWidth(160)
         self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
-        notes_col.addWidget(self.notes_edit)
-        header_layout.addLayout(notes_col)
-
-        header_layout.addStretch()
+        header_layout.addWidget(self.notes_edit)
+        header_layout.setStretchFactor(self.notes_edit, 1)
         layout.addWidget(header_card)
-
-        # ── Cash Purchase Panel ───────────────────────────────────────────────
-        self._cash_pay_card = QFrame()
-        self._cash_pay_card.setStyleSheet(CARD_STYLE)
-        self._cash_pay_card.setVisible(False)
-        cpay_v = QVBoxLayout(self._cash_pay_card)
-        cpay_v.setContentsMargins(16, 12, 16, 12)
-        cpay_v.setSpacing(10)
-
-        # Row 1 — eGadget reference number
-        ref_row = QHBoxLayout()
-        ref_row.setSpacing(10)
-        ref_lbl = QLabel("eGadget Ref #")
-        ref_lbl.setMinimumWidth(120)
-        ref_row.addWidget(ref_lbl)
-        self.egadget_ref_edit = QLineEdit()
-        self.egadget_ref_edit.setPlaceholderText("Optional — eGadget reference number")
-        self.egadget_ref_edit.setMinimumWidth(240)
-        self.egadget_ref_edit.returnPressed.connect(
-            lambda: self.egadget_ref_edit.focusNextChild())
-        ref_row.addWidget(self.egadget_ref_edit)
-        ref_row.addStretch()
-        cpay_v.addLayout(ref_row)
-
-        # Row 2 — Payment method toggle
-        pm_row = QHBoxLayout()
-        pm_row.setSpacing(0)
-        pm_lbl = QLabel("Payment *")
-        pm_lbl.setMinimumWidth(80)
-        pm_row.addWidget(pm_lbl)
-        pm_row.addSpacing(10)
-        self._pay_btn_cash  = QPushButton("Cash")
-        self._pay_btn_bank  = QPushButton("Bank Transfer")
-        self._pay_btn_split = QPushButton("Split")
-        for b in (self._pay_btn_cash, self._pay_btn_bank, self._pay_btn_split):
-            b.setFixedHeight(30)
-        _apply_toggle_style(self._pay_btn_cash,  True,  "left")
-        _apply_toggle_style(self._pay_btn_bank,  False, "mid")
-        _apply_toggle_style(self._pay_btn_split, False, "right")
-        self._pay_btn_cash.clicked.connect( lambda: self._set_pay_method("cash"))
-        self._pay_btn_bank.clicked.connect( lambda: self._set_pay_method("bank"))
-        self._pay_btn_split.clicked.connect(lambda: self._set_pay_method("split"))
-        pm_row.addWidget(self._pay_btn_cash)
-        pm_row.addWidget(self._pay_btn_bank)
-        pm_row.addWidget(self._pay_btn_split)
-        pm_row.addStretch()
-        cpay_v.addLayout(pm_row)
-
-        # Row 3 — Payment detail stacked widget
-        self._pay_stack = QStackedWidget()
-
-        # Page 0 — Cash
-        pg_cash = QFrame()
-        pg_cash_h = QHBoxLayout(pg_cash)
-        pg_cash_h.setContentsMargins(0, 2, 0, 2)
-        self._cash_pay_info_lbl = QLabel("Full purchase amount will be paid in cash.")
-        self._cash_pay_info_lbl.setStyleSheet(STATUS_INFO)
-        pg_cash_h.addWidget(self._cash_pay_info_lbl)
-        pg_cash_h.addStretch()
-        self._pay_stack.addWidget(pg_cash)
-
-        # Page 1 — Bank Transfer
-        pg_bank = QFrame()
-        pg_bank_h = QHBoxLayout(pg_bank)
-        pg_bank_h.setContentsMargins(0, 2, 0, 2)
-        pg_bank_h.setSpacing(10)
-        pg_bank_h.addWidget(QLabel("Account:"))
-        self.pay_bank_combo = QComboBox()
-        self.pay_bank_combo.setMinimumWidth(180)
-        self._populate_bank_combo(self.pay_bank_combo)
-        pg_bank_h.addWidget(self.pay_bank_combo)
-        pg_bank_h.addWidget(QLabel("Reference:"))
-        self.pay_bank_ref_edit = QLineEdit()
-        self.pay_bank_ref_edit.setPlaceholderText("Transfer reference number")
-        self.pay_bank_ref_edit.setMinimumWidth(180)
-        self.pay_bank_ref_edit.returnPressed.connect(
-            lambda: self.pay_bank_ref_edit.focusNextChild())
-        pg_bank_h.addWidget(self.pay_bank_ref_edit)
-        pg_bank_h.addStretch()
-        self._pay_stack.addWidget(pg_bank)
-
-        # Page 2 — Split
-        pg_split = QFrame()
-        pg_split_h = QHBoxLayout(pg_split)
-        pg_split_h.setContentsMargins(0, 2, 0, 2)
-        pg_split_h.setSpacing(10)
-        pg_split_h.addWidget(QLabel("Cash:"))
-        self.split_cash_spin = QDoubleSpinBox()
-        self.split_cash_spin.setRange(0, 9_999_999)
-        self.split_cash_spin.setDecimals(0)
-        self.split_cash_spin.setSingleStep(1000)
-        self.split_cash_spin.setGroupSeparatorShown(True)
-        self.split_cash_spin.setMinimumWidth(110)
-        self.split_cash_spin.lineEdit().returnPressed.connect(
-            lambda: self.split_cash_spin.focusNextChild())
-        pg_split_h.addWidget(self.split_cash_spin)
-        pg_split_h.addWidget(QLabel("Bank:"))
-        self.split_bank_spin = QDoubleSpinBox()
-        self.split_bank_spin.setRange(0, 9_999_999)
-        self.split_bank_spin.setDecimals(0)
-        self.split_bank_spin.setSingleStep(1000)
-        self.split_bank_spin.setGroupSeparatorShown(True)
-        self.split_bank_spin.setMinimumWidth(110)
-        self.split_bank_spin.lineEdit().returnPressed.connect(
-            lambda: self.split_bank_spin.focusNextChild())
-        pg_split_h.addWidget(self.split_bank_spin)
-        pg_split_h.addWidget(QLabel("Account:"))
-        self.split_bank_combo = QComboBox()
-        self.split_bank_combo.setMinimumWidth(160)
-        self._populate_bank_combo(self.split_bank_combo)
-        pg_split_h.addWidget(self.split_bank_combo)
-        pg_split_h.addWidget(QLabel("Ref:"))
-        self.split_ref_edit = QLineEdit()
-        self.split_ref_edit.setPlaceholderText("Bank ref (optional)")
-        self.split_ref_edit.setMinimumWidth(130)
-        self.split_ref_edit.returnPressed.connect(
-            lambda: self.split_ref_edit.focusNextChild())
-        pg_split_h.addWidget(self.split_ref_edit)
-        pg_split_h.addStretch()
-        self._pay_stack.addWidget(pg_split)
-
-        cpay_v.addWidget(self._pay_stack)
-        layout.addWidget(self._cash_pay_card)
 
         # ── Add line card ─────────────────────────────────────────────────────
         add_card = QFrame()
@@ -1372,23 +1250,128 @@ class PurchaseForm(QWidget):
         self.lines_table.setColumnWidth(5, 80)
         layout.addWidget(self.lines_table, stretch=1)
 
-        # ── Pinned footer strip ───────────────────────────────────────────────
-        footer_strip = QHBoxLayout()
-        footer_strip.setSpacing(8)
+        # ── Footer card ───────────────────────────────────────────────────────
+        footer_card = QFrame()
+        footer_card.setStyleSheet(CARD_STYLE)
+        footer_v = QVBoxLayout(footer_card)
+        footer_v.setContentsMargins(12, 8, 12, 8)
+        footer_v.setSpacing(4)
+
+        # Payment row — visible only for cash purchases
+        self._pm_row_widget = QWidget()
+        _pm_inner = QHBoxLayout(self._pm_row_widget)
+        _pm_inner.setContentsMargins(0, 0, 0, 0)
+        _pm_inner.setSpacing(6)
+        _pm_lbl = QLabel("Payment *:")
+        _pm_lbl.setStyleSheet("font-weight:bold;")
+        _pm_inner.addWidget(_pm_lbl)
+        _pm_inner.addSpacing(4)
+        self._pay_btn_cash  = QPushButton("Cash")
+        self._pay_btn_bank  = QPushButton("Bank Transfer")
+        self._pay_btn_split = QPushButton("Split")
+        for b in (self._pay_btn_cash, self._pay_btn_bank, self._pay_btn_split):
+            b.setFixedHeight(30)
+        _apply_toggle_style(self._pay_btn_cash,  True,  "left")
+        _apply_toggle_style(self._pay_btn_bank,  False, "mid")
+        _apply_toggle_style(self._pay_btn_split, False, "right")
+        self._pay_btn_cash.clicked.connect( lambda: self._set_pay_method("cash"))
+        self._pay_btn_bank.clicked.connect( lambda: self._set_pay_method("bank"))
+        self._pay_btn_split.clicked.connect(lambda: self._set_pay_method("split"))
+        _pm_inner.addWidget(self._pay_btn_cash)
+        _pm_inner.addWidget(self._pay_btn_bank)
+        _pm_inner.addWidget(self._pay_btn_split)
+        _pm_inner.addSpacing(8)
+
+        # Inline payment detail stack
+        self._pay_stack = QStackedWidget()
+
+        # Page 0 — Cash (empty)
+        self._pay_stack.addWidget(QWidget())
+
+        # Page 1 — Bank Transfer
+        pg_bank = QWidget()
+        pg_bank_h = QHBoxLayout(pg_bank)
+        pg_bank_h.setContentsMargins(0, 0, 0, 0)
+        pg_bank_h.setSpacing(6)
+        pg_bank_h.addWidget(QLabel("Account:"))
+        self.pay_bank_combo = QComboBox()
+        self.pay_bank_combo.setMinimumWidth(160)
+        self._populate_bank_combo(self.pay_bank_combo)
+        pg_bank_h.addWidget(self.pay_bank_combo)
+        pg_bank_h.addWidget(QLabel("Ref:"))
+        self.pay_bank_ref_edit = QLineEdit()
+        self.pay_bank_ref_edit.setPlaceholderText("Transfer reference number")
+        self.pay_bank_ref_edit.setMinimumWidth(120)
+        self.pay_bank_ref_edit.returnPressed.connect(
+            lambda: self.pay_bank_ref_edit.focusNextChild())
+        pg_bank_h.addWidget(self.pay_bank_ref_edit)
+        self._pay_stack.addWidget(pg_bank)
+
+        # Page 2 — Split
+        pg_split = QWidget()
+        pg_split_h = QHBoxLayout(pg_split)
+        pg_split_h.setContentsMargins(0, 0, 0, 0)
+        pg_split_h.setSpacing(6)
+        pg_split_h.addWidget(QLabel("Cash:"))
+        self.split_cash_spin = QDoubleSpinBox()
+        self.split_cash_spin.setRange(0, 9_999_999)
+        self.split_cash_spin.setDecimals(0)
+        self.split_cash_spin.setSingleStep(1000)
+        self.split_cash_spin.setGroupSeparatorShown(True)
+        self.split_cash_spin.setFixedWidth(90)
+        self.split_cash_spin.valueChanged.connect(self._on_split_cash_changed)
+        self.split_cash_spin.lineEdit().returnPressed.connect(
+            lambda: self.split_cash_spin.focusNextChild())
+        pg_split_h.addWidget(self.split_cash_spin)
+        pg_split_h.addWidget(QLabel("Bank:"))
+        self.split_bank_spin = QDoubleSpinBox()
+        self.split_bank_spin.setRange(0, 9_999_999)
+        self.split_bank_spin.setDecimals(0)
+        self.split_bank_spin.setSingleStep(1000)
+        self.split_bank_spin.setGroupSeparatorShown(True)
+        self.split_bank_spin.setFixedWidth(90)
+        self.split_bank_spin.lineEdit().returnPressed.connect(
+            lambda: self.split_bank_spin.focusNextChild())
+        pg_split_h.addWidget(self.split_bank_spin)
+        pg_split_h.addWidget(QLabel("Acct:"))
+        self.split_bank_combo = QComboBox()
+        self.split_bank_combo.setMinimumWidth(140)
+        self._populate_bank_combo(self.split_bank_combo)
+        pg_split_h.addWidget(self.split_bank_combo)
+        pg_split_h.addWidget(QLabel("Ref:"))
+        self.split_ref_edit = QLineEdit()
+        self.split_ref_edit.setPlaceholderText("Bank ref (optional)")
+        self.split_ref_edit.setMinimumWidth(90)
+        self.split_ref_edit.returnPressed.connect(
+            lambda: self.split_ref_edit.focusNextChild())
+        pg_split_h.addWidget(self.split_ref_edit)
+        self._pay_stack.addWidget(pg_split)
+
+        _pm_inner.addWidget(self._pay_stack)
+        _pm_inner.addStretch()
+        footer_v.addWidget(self._pm_row_widget)
+        self._pm_row_widget.setVisible(False)
+
+        # Action row: total + buttons
+        action_strip = QHBoxLayout()
+        action_strip.setSpacing(8)
         self.total_label = QLabel("Total: PKR 0")
         self.total_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.total_label.setStyleSheet("color:#1d4ed8;")
-        footer_strip.addWidget(self.total_label)
-        footer_strip.addStretch()
+        action_strip.addWidget(self.total_label)
+        action_strip.addStretch()
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(BTN_SECONDARY)
         btn_cancel.clicked.connect(on_cancel)
-        self.btn_save = QPushButton("Save Purchase")
+        self.btn_save = QPushButton("Save Purchase  [F9]")
         self.btn_save.setStyleSheet(BTN_PRIMARY)
         self.btn_save.clicked.connect(self._save)
-        footer_strip.addWidget(btn_cancel)
-        footer_strip.addWidget(self.btn_save)
-        layout.addLayout(footer_strip)
+        QShortcut(QKeySequence("F9"), self).activated.connect(self.btn_save.click)
+        action_strip.addWidget(btn_cancel)
+        action_strip.addWidget(self.btn_save)
+        footer_v.addLayout(action_strip)
+
+        layout.addWidget(footer_card)
 
     # ── Purchase type / payment method helpers ────────────────────────────────
 
@@ -1408,7 +1391,12 @@ class PurchaseForm(QWidget):
         _apply_toggle_style(self._btn_supplier_type, ptype == "supplier", "left")
         _apply_toggle_style(self._btn_cash_type,     ptype == "cash",     "right")
         self._sup_widget.setVisible(ptype == "supplier")
-        self._cash_pay_card.setVisible(ptype == "cash")
+        self.supplier_balance_lbl.setVisible(ptype == "supplier")
+        self._pm_row_widget.setVisible(ptype == "cash")
+        if ptype == "supplier":
+            QTimer.singleShot(0, self.supplier_combo.setFocus)
+        else:
+            QTimer.singleShot(0, self.imei_edit.setFocus)
 
     def _set_pay_method(self, method: str):
         self._pay_method = method
@@ -1416,6 +1404,15 @@ class PurchaseForm(QWidget):
         _apply_toggle_style(self._pay_btn_bank,  method == "bank",  "mid")
         _apply_toggle_style(self._pay_btn_split, method == "split", "right")
         self._pay_stack.setCurrentIndex({"cash": 0, "bank": 1, "split": 2}.get(method, 0))
+        if method == "split":
+            self.split_cash_spin.setValue(0)
+            self.split_bank_spin.setValue(self._total)
+
+    def _on_split_cash_changed(self, val):
+        bank = max(0.0, self._total - val)
+        self.split_bank_spin.blockSignals(True)
+        self.split_bank_spin.setValue(bank)
+        self.split_bank_spin.blockSignals(False)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
@@ -1559,12 +1556,8 @@ class PurchaseForm(QWidget):
             del_btn.clicked.connect(lambda _, i=idx: self._remove_line(i))
             self.lines_table.setCellWidget(r, 5, del_btn)
             total += price
+        self._total = total
         self.total_label.setText(f"Total: PKR {fmt_pkr(total)}")
-        # Keep cash info label current
-        if hasattr(self, "_cash_pay_info_lbl"):
-            self._cash_pay_info_lbl.setText(
-                f"Full purchase amount will be paid in cash: PKR {fmt_pkr(total)}"
-            )
 
     def _remove_line(self, idx):
         self._lines.pop(idx)
@@ -1603,8 +1596,6 @@ class PurchaseForm(QWidget):
 
         else:
             # ── Cash purchase ─────────────────────────────────────────────
-            egadget_ref = self.egadget_ref_edit.text().strip()
-
             pm = self._pay_method
             if pm == "cash":
                 cash_amount    = total
@@ -1642,7 +1633,7 @@ class PurchaseForm(QWidget):
                 pv_number = db_save_purchase(
                     date_str, 0, notes, db_lines,
                     purchase_type="cash",
-                    egadget_ref=egadget_ref,
+                    egadget_ref="",
                     payment_method=pm,
                     cash_amount=cash_amount,
                     bank_amount=bank_amount,
@@ -1660,10 +1651,8 @@ class PurchaseForm(QWidget):
             except Exception:
                 pass
 
-            ref_line = f"eGadget Ref: {egadget_ref}\n" if egadget_ref else ""
             QMessageBox.information(self, "Saved",
                 f"Cash Purchase {pv_number} saved.\n"
-                f"{ref_line}"
                 f"Total: PKR {fmt_pkr(total)}")
 
         self._on_save(pv_number)
@@ -1680,12 +1669,7 @@ class PurchaseListView(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 
-        # Title + New button
         top = QHBoxLayout()
-        title = QLabel("Purchases")
-        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#1e293b;")
-        top.addWidget(title)
         top.addStretch()
         top.addWidget(QLabel("Go to Voucher:"))
         self._goto_edit = QLineEdit()

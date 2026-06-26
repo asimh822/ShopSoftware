@@ -7,7 +7,7 @@ What it does:
   3. Resets last_supabase_sync in the local SQLite DB to epoch so the next
      app startup pushes EVERY local row to Supabase.
 
-Usage (from ShopPC folder on Shop PC):
+Usage (from ShopSoftware folder on Shop PC):
     python reset_supabase_and_sync.py
 """
 
@@ -19,11 +19,7 @@ import requests
 # Read credentials from supabase_sync.py — key is stored there, not repeated here
 from supabase_sync import SUPABASE_URL, SUPABASE_KEY
 
-_here = os.path.dirname(os.path.abspath(__file__))
-_candidate = os.path.join(_here, "united_mobile.db")
-if not os.path.exists(_candidate) or os.path.getsize(_candidate) < 4096:
-    _candidate = os.path.join(os.path.dirname(_here), "united_mobile.db")
-DB_PATH = _candidate
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
