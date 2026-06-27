@@ -1591,9 +1591,9 @@ class JVListWidget(QWidget):
         layout.addWidget(ctrl)
 
         # ── Table ─────────────────────────────────────────────────────────────
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
-            ["JV Number", "Date", "Notes", "Lines", "Total Dr (PKR)"]
+            ["JV Number", "Date", "Lines", "Total Dr (PKR)"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1601,7 +1601,7 @@ class JVListWidget(QWidget):
         self.table.verticalHeader().setVisible(False)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.setStyleSheet(TABLE_STYLE)
         self.table.doubleClicked.connect(self._edit_row)
         layout.addWidget(self.table, stretch=1)
@@ -1647,13 +1647,12 @@ class JVListWidget(QWidget):
             cells = [
                 r["jv_number"],
                 r["date"],
-                r["notes"],
                 lc,
                 fmt_pkr(r["total_dr"]),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if col == 4:
+                if col == 3:
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
@@ -1717,25 +1716,20 @@ class LedgerPage(QWidget):
         self.btn_other.setFixedHeight(32)
         self.btn_bank = QPushButton("Bank")
         self.btn_bank.setFixedHeight(32)
-        self.btn_jv = QPushButton("Journal Vouchers")
-        self.btn_jv.setFixedHeight(32)
         _style_toggle(self.btn_sup,   True,  "left")
         _style_toggle(self.btn_cust,  False, "mid")
         _style_toggle(self.btn_other, False, "mid")
-        _style_toggle(self.btn_bank,  False, "mid")
-        _style_toggle(self.btn_jv,    False, "right")
-        for _b in (self.btn_sup, self.btn_cust, self.btn_other, self.btn_bank, self.btn_jv):
+        _style_toggle(self.btn_bank,  False, "right")
+        for _b in (self.btn_sup, self.btn_cust, self.btn_other, self.btn_bank):
             _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
         self.btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
         self.btn_other.clicked.connect(lambda: self._set_party_type("other"))
         self.btn_bank.clicked.connect(lambda: self._set_party_type("bank"))
-        self.btn_jv.clicked.connect(lambda: self._set_party_type("jv"))
         tl.addWidget(self.btn_sup)
         tl.addWidget(self.btn_cust)
         tl.addWidget(self.btn_other)
         tl.addWidget(self.btn_bank)
-        tl.addWidget(self.btn_jv)
         tl.addStretch()
         layout.addWidget(type_card)
 
@@ -1852,11 +1846,6 @@ class LedgerPage(QWidget):
         self._bank_widget.setVisible(False)
         layout.addWidget(self._bank_widget, stretch=1)
 
-        # ── Journal Vouchers widget ───────────────────────────────────────────
-        self._jv_widget = JVListWidget(self)
-        self._jv_widget.setVisible(False)
-        layout.addWidget(self._jv_widget, stretch=1)
-
         self._load_party_combo()
 
     # ── Party type toggle ─────────────────────────────────────────────────────
@@ -1866,26 +1855,20 @@ class LedgerPage(QWidget):
         _style_toggle(self.btn_sup,   ptype == "supplier", "left")
         _style_toggle(self.btn_cust,  ptype == "customer", "mid")
         _style_toggle(self.btn_other, ptype == "other",    "mid")
-        _style_toggle(self.btn_bank,  ptype == "bank",     "mid")
-        _style_toggle(self.btn_jv,    ptype == "jv",       "right")
+        _style_toggle(self.btn_bank,  ptype == "bank",     "right")
 
-        is_bank = ptype == "bank"
-        is_jv   = ptype == "jv"
-        is_party = not is_bank and not is_jv
+        is_bank  = ptype == "bank"
+        is_party = not is_bank
 
         self.ctrl_card.setVisible(is_party)
         self.info_card.setVisible(False)
         self.table.setVisible(is_party)
         self.closing_label.setVisible(is_party)
         self._bank_widget.setVisible(is_bank)
-        self._jv_widget.setVisible(is_jv)
 
         if is_bank:
             self._bank_widget.refresh()
             QTimer.singleShot(0, self._bank_widget.setFocus)
-        elif is_jv:
-            self._jv_widget.refresh()
-            QTimer.singleShot(0, self._jv_widget.setFocus)
         else:
             self._load_party_combo()
             QTimer.singleShot(0, self.party_combo.setFocus)
@@ -2161,7 +2144,5 @@ class LedgerPage(QWidget):
         # Refresh whichever view is active
         if self._party_type == "bank":
             self._bank_widget.refresh()
-        elif self._party_type == "jv":
-            self._jv_widget.refresh()
         else:
             self._load_ledger()

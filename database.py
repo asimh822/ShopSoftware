@@ -283,6 +283,7 @@ def _run_migrations(conn) -> None:
         14: _migrate_v14,
         15: _migrate_v15,
         16: _migrate_v16,
+        17: _migrate_v17,
     }
 
     current = _get_db_version(conn)
@@ -931,6 +932,15 @@ def _migrate_v16(conn) -> None:
             credit REAL NOT NULL DEFAULT 0
         )
     """)
+
+
+def _migrate_v17(conn) -> None:
+    """Version 17 — Add reference column to journal_voucher_lines."""
+    try:
+        conn.execute("ALTER TABLE journal_voucher_lines ADD COLUMN reference TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
 
 
 _SUPABASE_SYNC_TABLES = [
@@ -1628,6 +1638,8 @@ def _resolve_party_name(party_type: str, party_id, conn) -> str:
     """Return display name for a journal_voucher_line party."""
     if party_type == "cash":
         return "Cash in Hand"
+    if party_type == "incentive_income":
+        return "Incentive Income"
     if party_id is None:
         return party_type.title()
     tbl = {
@@ -1675,9 +1687,10 @@ def db_save_journal_voucher(date_str: str, notes: str, lines: list) -> str:
         for line in lines:
             c.execute(
                 "INSERT INTO journal_voucher_lines "
-                "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+                "(jv_id, party_type, party_id, debit, credit, reference) VALUES (?,?,?,?,?,?)",
                 (jv_id, line["party_type"], line.get("party_id"),
-                 float(line.get("debit") or 0), float(line.get("credit") or 0)),
+                 float(line.get("debit") or 0), float(line.get("credit") or 0),
+                 line.get("reference") or ""),
             )
         conn.commit()
     except Exception:
@@ -1699,7 +1712,7 @@ def db_load_journal_voucher(jv_id: int):
         conn.close()
         return None, []
     lines = conn.execute(
-        "SELECT id, party_type, party_id, debit, credit "
+        "SELECT id, party_type, party_id, debit, credit, reference "
         "FROM journal_voucher_lines WHERE jv_id=? ORDER BY id",
         (jv_id,)
     ).fetchall()
@@ -1713,6 +1726,7 @@ def db_load_journal_voucher(jv_id: int):
             "party_name": name,
             "debit": float(ln["debit"] or 0),
             "credit": float(ln["credit"] or 0),
+            "reference": ln["reference"] or "",
         })
     conn.close()
     return dict(hdr), line_list
@@ -1739,9 +1753,10 @@ def db_update_journal_voucher(jv_id: int, date_str: str, notes: str, lines: list
         for line in lines:
             conn.execute(
                 "INSERT INTO journal_voucher_lines "
-                "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+                "(jv_id, party_type, party_id, debit, credit, reference) VALUES (?,?,?,?,?,?)",
                 (jv_id, line["party_type"], line.get("party_id"),
-                 float(line.get("debit") or 0), float(line.get("credit") or 0)),
+                 float(line.get("debit") or 0), float(line.get("credit") or 0),
+                 line.get("reference") or ""),
             )
         conn.commit()
     except Exception:
@@ -1863,9 +1878,16 @@ def db_income_account(name: str = "Incentives Income"):
 
 
 def db_incentives_income_total() -> float:
-    """Total incentives income earned to date (running balance)."""
+    """Total incentives income earned to date (income_accounts balance + JVL net credits)."""
     acct = db_income_account("Incentives Income")
-    return float(acct["balance"] or 0) if acct else 0.0
+    base = float(acct["balance"] or 0) if acct else 0.0
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(credit), 0) - COALESCE(SUM(debit), 0) "
+        "FROM journal_voucher_lines WHERE party_type='incentive_income'"
+    ).fetchone()
+    conn.close()
+    return base + float(row[0] or 0)
 
 
 def db_cash_in_hand() -> float:

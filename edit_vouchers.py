@@ -1818,11 +1818,12 @@ class BankTransactionEditDialog(QDialog):
 # ── JV multi-line form helpers ────────────────────────────────────────────────
 
 _JV_PARTY_TYPES = [
-    ("Supplier",     "supplier"),
-    ("Customer",     "customer"),
-    ("Bank",         "bank"),
-    ("Cash in Hand", "cash"),
-    ("Expense",      "expense"),
+    ("Supplier",         "supplier"),
+    ("Customer",         "customer"),
+    ("Bank",             "bank"),
+    ("Cash in Hand",     "cash"),
+    ("Expense",          "expense"),
+    ("Incentive Income", "incentive_income"),
 ]
 
 
@@ -1879,13 +1880,16 @@ def _fill_jv_party_combo(party_combo: QComboBox, type_key: str, selected_id=None
             party_combo.addItem(r["name"], r["id"])
             if selected_id is not None and r["id"] == selected_id:
                 party_combo.setCurrentIndex(party_combo.count() - 1)
+    elif type_key == "incentive_income":
+        party_combo.addItem("Incentive Income", None)
+        party_combo.setEnabled(False)
     else:
         party_combo.setEnabled(False)
     party_combo.blockSignals(False)
 
 
 def _build_jv_row(rows_layout, line_rows, on_balance_update,
-                  party_type=None, party_id=None, debit=0.0, credit=0.0):
+                  party_type=None, party_id=None, debit=0.0, credit=0.0, reference=""):
     """Build one JV line row, append it to rows_layout and line_rows list."""
     row_w = QFrame()
     row_l = QHBoxLayout(row_w)
@@ -1910,6 +1914,12 @@ def _build_jv_row(rows_layout, line_rows, on_balance_update,
     cr_edit.setFixedWidth(110)
     cr_edit.setValidator(QDoubleValidator(0, 99_999_999, 0))
 
+    ref_edit = QLineEdit()
+    ref_edit.setPlaceholderText("Optional")
+    ref_edit.setMinimumWidth(160)
+    if reference:
+        ref_edit.setText(reference)
+
     btn_remove = QPushButton("✕")
     btn_remove.setFixedWidth(28)
     btn_remove.setStyleSheet(
@@ -1922,10 +1932,11 @@ def _build_jv_row(rows_layout, line_rows, on_balance_update,
     row_l.addWidget(party_combo, stretch=1)
     row_l.addWidget(dr_edit)
     row_l.addWidget(cr_edit)
+    row_l.addWidget(ref_edit)
     row_l.addWidget(btn_remove)
     rows_layout.addWidget(row_w)
 
-    entry = (type_combo, party_combo, dr_edit, cr_edit, row_w)
+    entry = (type_combo, party_combo, dr_edit, cr_edit, ref_edit, row_w)
     line_rows.append(entry)
 
     init_type = party_type or "supplier"
@@ -1941,11 +1952,33 @@ def _build_jv_row(rows_layout, line_rows, on_balance_update,
 
     if debit:
         dr_edit.setText(str(int(debit)))
-    if credit:
+        cr_edit.setEnabled(False)
+    elif credit:
         cr_edit.setText(str(int(credit)))
+        dr_edit.setEnabled(False)
 
-    dr_edit.textChanged.connect(on_balance_update)
-    cr_edit.textChanged.connect(on_balance_update)
+    def _on_dr_changed(text, cr=cr_edit):
+        if text.strip() and text.strip() != "0":
+            cr.blockSignals(True)
+            cr.clear()
+            cr.setEnabled(False)
+            cr.blockSignals(False)
+        else:
+            cr.setEnabled(True)
+        on_balance_update()
+
+    def _on_cr_changed(text, dr=dr_edit):
+        if text.strip() and text.strip() != "0":
+            dr.blockSignals(True)
+            dr.clear()
+            dr.setEnabled(False)
+            dr.blockSignals(False)
+        else:
+            dr.setEnabled(True)
+        on_balance_update()
+
+    dr_edit.textChanged.connect(_on_dr_changed)
+    cr_edit.textChanged.connect(_on_cr_changed)
 
     def _remove(_checked, rw=row_w, e=entry):
         if len(line_rows) <= 1:
@@ -1961,7 +1994,7 @@ def _build_jv_row(rows_layout, line_rows, on_balance_update,
 def _jv_balance_text(line_rows):
     """Return (text, style) for the balance indicator."""
     total_dr = total_cr = 0.0
-    for _tc, _pc, dr_e, cr_e, _rw in line_rows:
+    for _tc, _pc, dr_e, cr_e, _re, _rw in line_rows:
         try:
             total_dr += float(dr_e.text() or 0)
         except ValueError:
@@ -1986,8 +2019,9 @@ def _jv_balance_text(line_rows):
 
 def _jv_collect_lines(line_rows):
     """Validate and return line dicts. Raises ValueError on bad input."""
+    _no_party_types = ("cash", "incentive_income")
     lines = []
-    for i, (tc, pc, dr_e, cr_e, _rw) in enumerate(line_rows):
+    for i, (tc, pc, dr_e, cr_e, ref_e, _rw) in enumerate(line_rows):
         type_key = tc.currentData()
         party_id = pc.currentData()
         try:
@@ -1998,7 +2032,7 @@ def _jv_collect_lines(line_rows):
             cr = float(cr_e.text() or 0)
         except ValueError:
             cr = 0.0
-        if type_key != "cash" and party_id is None:
+        if type_key not in _no_party_types and party_id is None:
             raise ValueError(f"Row {i + 1}: please select a party / account.")
         if dr == 0 and cr == 0:
             raise ValueError(f"Row {i + 1}: enter either a Debit or Credit amount.")
@@ -2008,9 +2042,10 @@ def _jv_collect_lines(line_rows):
             )
         lines.append({
             "party_type": type_key,
-            "party_id": None if type_key == "cash" else party_id,
+            "party_id": None if type_key in _no_party_types else party_id,
             "debit": dr,
             "credit": cr,
+            "reference": ref_e.text().strip(),
         })
     return lines
 
@@ -2018,7 +2053,7 @@ def _jv_collect_lines(line_rows):
 def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lines=None):
     """
     Builds the shared JV form body into `outer` (QVBoxLayout).
-    Returns (date_edit, notes_edit, line_rows, bal_lbl, rows_layout).
+    Returns (date_edit, line_rows, bal_lbl, rows_layout).
     """
     title_lbl = QLabel(title_text)
     title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
@@ -2035,21 +2070,18 @@ def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lin
         d = prefill_hdr["date"].split("/")
         date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
     top.addWidget(date_edit)
-    top.addSpacing(16)
-    top.addWidget(QLabel("Notes:"))
-    notes_edit = QLineEdit(prefill_hdr.get("notes", "") if prefill_hdr else "")
-    notes_edit.setPlaceholderText("Description / reason (required)")
-    top.addWidget(notes_edit, stretch=1)
+    top.addStretch()
     outer.addLayout(top)
 
     # Column headers
     hdr_row = QHBoxLayout()
     hdr_row.setSpacing(4)
     for txt, w, style in [
-        ("Party Type", 120, "color:#475569; font-weight:bold; font-size:9pt;"),
+        ("Party Type",    120,  "color:#475569; font-weight:bold; font-size:9pt;"),
         ("Party / Account", None, "color:#475569; font-weight:bold; font-size:9pt;"),
-        ("Debit (PKR)", 110, "color:#dc2626; font-weight:bold; font-size:9pt;"),
-        ("Credit (PKR)", 110, "color:#16a34a; font-weight:bold; font-size:9pt;"),
+        ("Debit (PKR)",   110,  "color:#dc2626; font-weight:bold; font-size:9pt;"),
+        ("Credit (PKR)",  110,  "color:#16a34a; font-weight:bold; font-size:9pt;"),
+        ("Reference",     160,  "color:#475569; font-weight:bold; font-size:9pt;"),
     ]:
         lbl = QLabel(txt)
         lbl.setStyleSheet(style)
@@ -2098,12 +2130,12 @@ def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lin
         for ln in prefill_lines:
             _build_jv_row(rows_layout, line_rows, _update_balance,
                           ln["party_type"], ln["party_id"],
-                          ln["debit"], ln["credit"])
+                          ln["debit"], ln["credit"], ln.get("reference", ""))
     else:
         _build_jv_row(rows_layout, line_rows, _update_balance)
         _build_jv_row(rows_layout, line_rows, _update_balance)
 
-    return date_edit, notes_edit, line_rows, bal_lbl, rows_layout
+    return date_edit, line_rows, bal_lbl, rows_layout
 
 
 class JVFormDialog(QDialog):
@@ -2120,7 +2152,7 @@ class JVFormDialog(QDialog):
         outer.setContentsMargins(20, 16, 20, 16)
         outer.setSpacing(10)
 
-        self._date_edit, self._notes_edit, self._line_rows, self._bal_lbl, _ = \
+        self._date_edit, self._line_rows, self._bal_lbl, _ = \
             _build_jv_form_body(self, outer, "New Journal Voucher")
 
         btns = QDialogButtonBox(
@@ -2132,10 +2164,6 @@ class JVFormDialog(QDialog):
         outer.addWidget(btns)
 
     def _save(self):
-        notes = self._notes_edit.text().strip()
-        if not notes:
-            QMessageBox.warning(self, "Validation", "Description / notes are required.")
-            return
         try:
             lines = _jv_collect_lines(self._line_rows)
         except ValueError as ex:
@@ -2144,7 +2172,7 @@ class JVFormDialog(QDialog):
         date_str = self._date_edit.date().toString("dd/MM/yyyy")
         try:
             from database import db_save_journal_voucher
-            jv_num = db_save_journal_voucher(date_str, notes, lines)
+            jv_num = db_save_journal_voucher(date_str, "", lines)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
@@ -2214,7 +2242,7 @@ class JVEditDialog(QDialog):
         outer.setContentsMargins(20, 16, 20, 16)
         outer.setSpacing(10)
 
-        self._date_edit, self._notes_edit, self._line_rows, self._bal_lbl, _ = \
+        self._date_edit, self._line_rows, self._bal_lbl, _ = \
             _build_jv_form_body(
                 self, outer,
                 f"Edit — {self._jv_number}",
@@ -2242,10 +2270,6 @@ class JVEditDialog(QDialog):
         outer.addLayout(btn_row)
 
     def _save(self):
-        notes = self._notes_edit.text().strip()
-        if not notes:
-            QMessageBox.warning(self, "Validation", "Description / notes are required.")
-            return
         try:
             lines = _jv_collect_lines(self._line_rows)
         except ValueError as ex:
@@ -2254,7 +2278,7 @@ class JVEditDialog(QDialog):
         date_str = self._date_edit.date().toString("dd/MM/yyyy")
         try:
             from database import db_update_journal_voucher
-            db_update_journal_voucher(self._jv_id, date_str, notes, lines)
+            db_update_journal_voucher(self._jv_id, date_str, "", lines)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
