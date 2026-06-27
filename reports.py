@@ -3993,6 +3993,432 @@ class DeletedVouchersTab(QWidget):
         self._count_lbl.setText(f"{len(rows)} record(s)")
 
 
+# ── Tab 16: Sales Search ─────────────────────────────────────────────────────
+
+
+def db_sales_search(from_iso=None, to_iso=None, party=None, brand_id=None, model_id=None):
+    """
+    party: dict {"type": "customer", "id": N} | {"type": "cash"} | None
+    """
+    de = _date_expr("sv.date")
+    conds, params = [], []
+    if from_iso:
+        conds.append(f"{de} >= ?")
+        params.append(from_iso)
+    if to_iso:
+        conds.append(f"{de} <= ?")
+        params.append(to_iso)
+    if isinstance(party, dict):
+        if party.get("type") == "customer":
+            conds.append("sv.customer_id = ?")
+            params.append(party["id"])
+        elif party.get("type") == "cash":
+            conds.append("sv.type = 'cash'")
+    if brand_id:
+        conds.append("m.brand_id = ?")
+        params.append(brand_id)
+    if model_id:
+        conds.append("sl.model_id = ?")
+        params.append(model_id)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    conn = get_connection()
+    rows = conn.execute(f"""
+        SELECT sv.sv_number, sv.date,
+               COALESCE(c.name, sv.cash_customer_name, '—') AS party,
+               b.name AS brand_name, m.name AS model_name,
+               sl.imei, sl.final_price
+        FROM sale_lines sl
+        JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        JOIN models m ON m.id = sl.model_id
+        JOIN brands b ON b.id = m.brand_id
+        LEFT JOIN customers c ON c.id = sv.customer_id
+        {where}
+        ORDER BY sv.id DESC
+    """, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+class SalesSearchTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        filter_card = QFrame()
+        filter_card.setStyleSheet(CARD_STYLE)
+        fl = QVBoxLayout(filter_card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+
+        row1.addWidget(QLabel("Party:"))
+        self.party_combo = QComboBox()
+        self.party_combo.setMinimumWidth(200)
+        self.party_combo.addItem("All Parties", None)
+        conn = get_connection()
+        _credit = conn.execute(
+            "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
+        ).fetchall()
+        conn.close()
+        for c in _credit:
+            self.party_combo.addItem(c["name"], {"type": "customer", "id": c["id"]})
+        self.party_combo.addItem("Cash Customer", {"type": "cash"})
+        row1.addWidget(self.party_combo)
+
+        row1.addWidget(QLabel("Brand:"))
+        self.brand_combo = QComboBox()
+        self.brand_combo.setMinimumWidth(140)
+        self.brand_combo.addItem("All Brands", None)
+        for b in db_brands_list():
+            self.brand_combo.addItem(b["name"], b["id"])
+        self.brand_combo.currentIndexChanged.connect(self._on_brand_change)
+        row1.addWidget(self.brand_combo)
+
+        row1.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.addItem("All Models", None)
+        row1.addWidget(self.model_combo)
+
+        row1.addStretch()
+        fl.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+
+        row2.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addDays(-30))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        row2.addWidget(self.from_date)
+
+        row2.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        row2.addWidget(self.to_date)
+
+        row2.addStretch()
+
+        btn_search = QPushButton("Search")
+        btn_search.setStyleSheet(BTN_PRIMARY)
+        btn_search.clicked.connect(self.refresh)
+        row2.addWidget(btn_search)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setStyleSheet(BTN_SECONDARY)
+        btn_clear.clicked.connect(self._clear)
+        row2.addWidget(btn_clear)
+
+        btn_csv = QPushButton("Export CSV")
+        btn_csv.setStyleSheet(BTN_SECONDARY)
+        btn_csv.clicked.connect(self._export_csv)
+        row2.addWidget(btn_csv)
+
+        fl.addLayout(row2)
+        layout.addWidget(filter_card)
+
+        self.table = _make_table(
+            ["SV Number", "Date", "Party", "Brand", "Model", "IMEI", "Final Price (PKR)"]
+        )
+        layout.addWidget(self.table, stretch=1)
+
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    def _on_brand_change(self):
+        brand_id = self.brand_combo.currentData()
+        self.model_combo.clear()
+        self.model_combo.addItem("All Models", None)
+        if brand_id:
+            for m in db_models_list(brand_id):
+                self.model_combo.addItem(m["name"], m["id"])
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def _clear(self):
+        self.party_combo.setCurrentIndex(0)
+        self.brand_combo.setCurrentIndex(0)
+        self.model_combo.clear()
+        self.model_combo.addItem("All Models", None)
+        self.from_date.setDate(QDate.currentDate().addDays(-30))
+        self.to_date.setDate(QDate.currentDate())
+        self.refresh()
+
+    def refresh(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        party    = self.party_combo.currentData()
+        brand_id = self.brand_combo.currentData()
+        model_id = self.model_combo.currentData()
+
+        rows = db_sales_search(from_iso=from_iso, to_iso=to_iso,
+                               party=party, brand_id=brand_id, model_id=model_id)
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        total = 0.0
+        for r in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(r["sv_number"] or ""))
+            self.table.setItem(row, 1, QTableWidgetItem(r["date"] or ""))
+            self.table.setItem(row, 2, QTableWidgetItem(r["party"] or "—"))
+            self.table.setItem(row, 3, QTableWidgetItem(r["brand_name"] or ""))
+            self.table.setItem(row, 4, QTableWidgetItem(r["model_name"] or ""))
+            self.table.setItem(row, 5, QTableWidgetItem(r["imei"] or ""))
+            price_item = QTableWidgetItem(fmt_pkr(r["final_price"]))
+            price_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 6, price_item)
+            total += float(r["final_price"] or 0)
+        self.table.setSortingEnabled(True)
+
+        n = self.table.rowCount()
+        self.footer.setText(
+            f"{n} line{'s' if n != 1 else ''}    |    Total: Rs. {fmt_pkr(total)}"
+        )
+
+    def _export_csv(self):
+        from datetime import date as _dt_date
+        today = _dt_date.today().strftime("%d%m%Y")
+        _export_table_csv(self.table, f"SalesSearch_{today}.csv", self)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        return ("Sales_Search", "Sales Search", headers, rows, {6})
+
+
+# ── Tab 17: Purchase Search ───────────────────────────────────────────────────
+
+
+def db_purchases_search(from_iso=None, to_iso=None, party=None, brand_id=None, model_id=None):
+    """
+    party: dict {"type": "supplier", "id": N} | {"type": "customer", "id": N}
+                | {"type": "cash"} | None
+    """
+    de = _date_expr("pv.date")
+    conds, params = [], []
+    if from_iso:
+        conds.append(f"{de} >= ?")
+        params.append(from_iso)
+    if to_iso:
+        conds.append(f"{de} <= ?")
+        params.append(to_iso)
+    if isinstance(party, dict):
+        if party.get("type") == "supplier":
+            conds.append("pv.supplier_id = ?")
+            params.append(party["id"])
+        elif party.get("type") == "customer":
+            conds.append("pv.customer_as_supplier_id = ?")
+            params.append(party["id"])
+        elif party.get("type") == "cash":
+            conds.append("COALESCE(pv.purchase_type, '') = 'cash'")
+    if brand_id:
+        conds.append("m.brand_id = ?")
+        params.append(brand_id)
+    if model_id:
+        conds.append("pl.model_id = ?")
+        params.append(model_id)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    conn = get_connection()
+    rows = conn.execute(f"""
+        SELECT pv.pv_number, pv.date,
+               COALESCE(s.name, c_sup.name, 'Cash Purchase') AS supplier,
+               b.name AS brand_name, m.name AS model_name,
+               pl.imei, pl.purchase_price
+        FROM purchase_lines pl
+        JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+        JOIN models m ON m.id = pl.model_id
+        JOIN brands b ON b.id = m.brand_id
+        LEFT JOIN suppliers s ON s.id = pv.supplier_id AND pv.supplier_id != 0
+        LEFT JOIN customers c_sup ON c_sup.id = pv.customer_as_supplier_id
+        {where}
+        ORDER BY pv.id DESC
+    """, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+class PurchaseSearchTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        filter_card = QFrame()
+        filter_card.setStyleSheet(CARD_STYLE)
+        fl = QVBoxLayout(filter_card)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+
+        row1.addWidget(QLabel("Party:"))
+        self.party_combo = QComboBox()
+        self.party_combo.setMinimumWidth(200)
+        self.party_combo.addItem("All Parties", None)
+        conn = get_connection()
+        _suppliers = conn.execute(
+            "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+        ).fetchall()
+        _cust_sup = conn.execute(
+            "SELECT DISTINCT c.id, c.name FROM customers c "
+            "JOIN purchase_vouchers pv ON pv.customer_as_supplier_id = c.id "
+            "ORDER BY c.name"
+        ).fetchall()
+        conn.close()
+        for s in _suppliers:
+            self.party_combo.addItem(s["name"], {"type": "supplier", "id": s["id"]})
+        if _cust_sup:
+            sep_idx = self.party_combo.count()
+            self.party_combo.addItem("── Credit Customers ──", None)
+            self.party_combo.model().item(sep_idx).setEnabled(False)
+            for c in _cust_sup:
+                self.party_combo.addItem(c["name"], {"type": "customer", "id": c["id"]})
+        self.party_combo.addItem("Cash Purchase", {"type": "cash"})
+        row1.addWidget(self.party_combo)
+
+        row1.addWidget(QLabel("Brand:"))
+        self.brand_combo = QComboBox()
+        self.brand_combo.setMinimumWidth(140)
+        self.brand_combo.addItem("All Brands", None)
+        for b in db_brands_list():
+            self.brand_combo.addItem(b["name"], b["id"])
+        self.brand_combo.currentIndexChanged.connect(self._on_brand_change)
+        row1.addWidget(self.brand_combo)
+
+        row1.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.addItem("All Models", None)
+        row1.addWidget(self.model_combo)
+
+        row1.addStretch()
+        fl.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+
+        row2.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addDays(-30))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        row2.addWidget(self.from_date)
+
+        row2.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        row2.addWidget(self.to_date)
+
+        row2.addStretch()
+
+        btn_search = QPushButton("Search")
+        btn_search.setStyleSheet(BTN_PRIMARY)
+        btn_search.clicked.connect(self.refresh)
+        row2.addWidget(btn_search)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setStyleSheet(BTN_SECONDARY)
+        btn_clear.clicked.connect(self._clear)
+        row2.addWidget(btn_clear)
+
+        btn_csv = QPushButton("Export CSV")
+        btn_csv.setStyleSheet(BTN_SECONDARY)
+        btn_csv.clicked.connect(self._export_csv)
+        row2.addWidget(btn_csv)
+
+        fl.addLayout(row2)
+        layout.addWidget(filter_card)
+
+        self.table = _make_table(
+            ["PV Number", "Date", "Supplier", "Brand", "Model", "IMEI", "Purchase Price (PKR)"]
+        )
+        layout.addWidget(self.table, stretch=1)
+
+        self.footer = QLabel("")
+        self.footer.setStyleSheet(TOTAL_STYLE)
+        layout.addWidget(self.footer)
+
+    def _on_brand_change(self):
+        brand_id = self.brand_combo.currentData()
+        self.model_combo.clear()
+        self.model_combo.addItem("All Models", None)
+        if brand_id:
+            for m in db_models_list(brand_id):
+                self.model_combo.addItem(m["name"], m["id"])
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def _clear(self):
+        self.party_combo.setCurrentIndex(0)
+        self.brand_combo.setCurrentIndex(0)
+        self.model_combo.clear()
+        self.model_combo.addItem("All Models", None)
+        self.from_date.setDate(QDate.currentDate().addDays(-30))
+        self.to_date.setDate(QDate.currentDate())
+        self.refresh()
+
+    def refresh(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        party    = self.party_combo.currentData()
+        brand_id = self.brand_combo.currentData()
+        model_id = self.model_combo.currentData()
+
+        rows = db_purchases_search(from_iso=from_iso, to_iso=to_iso,
+                                   party=party, brand_id=brand_id, model_id=model_id)
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        total = 0.0
+        for r in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(r["pv_number"] or ""))
+            self.table.setItem(row, 1, QTableWidgetItem(r["date"] or ""))
+            self.table.setItem(row, 2, QTableWidgetItem(r["supplier"] or "—"))
+            self.table.setItem(row, 3, QTableWidgetItem(r["brand_name"] or ""))
+            self.table.setItem(row, 4, QTableWidgetItem(r["model_name"] or ""))
+            self.table.setItem(row, 5, QTableWidgetItem(r["imei"] or ""))
+            price_item = QTableWidgetItem(fmt_pkr(r["purchase_price"]))
+            price_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 6, price_item)
+            total += float(r["purchase_price"] or 0)
+        self.table.setSortingEnabled(True)
+
+        n = self.table.rowCount()
+        self.footer.setText(
+            f"{n} line{'s' if n != 1 else ''}    |    Total: Rs. {fmt_pkr(total)}"
+        )
+
+    def _export_csv(self):
+        from datetime import date as _dt_date
+        today = _dt_date.today().strftime("%d%m%Y")
+        _export_table_csv(self.table, f"PurchaseSearch_{today}.csv", self)
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        return ("Purchase_Search", "Purchase Search", headers, rows, {6})
+
+
 class ReportsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4019,37 +4445,41 @@ class ReportsPage(QWidget):
             QTabBar::tab:hover:!selected { background:#f1f5f9; }
         """)
 
-        self._tab_stock      = StockReportTab()
-        self._tab_imei_stock = ImeiStockTab()
-        self._tab_valuation  = StockValuationTab()
-        self._tab_aging      = AgingStockTab()
-        self._tab_sales      = SalesReportTab()
-        self._tab_purchases  = PurchaseReportTab()
-        self._tab_profit     = ProfitReportTab()
-        self._tab_cashbook   = CashBookTab()
-        self._tab_digest     = DailyDigestTab()
-        self._tab_customers  = CustomerInsightsTab()
-        self._tab_expenses   = ExpensesReportTab()
-        self._tab_aging_rec  = AgingReceivablesTab()
-        self._tab_fifo_aging = AgingFifoTab()
-        self._tab_closing    = ClosingBalancesTab()
-        self._tab_deleted    = DeletedVouchersTab()
+        self._tab_stock        = StockReportTab()
+        self._tab_imei_stock   = ImeiStockTab()
+        self._tab_valuation    = StockValuationTab()
+        self._tab_aging        = AgingStockTab()
+        self._tab_sales        = SalesReportTab()
+        self._tab_purchases    = PurchaseReportTab()
+        self._tab_profit       = ProfitReportTab()
+        self._tab_cashbook     = CashBookTab()
+        self._tab_digest       = DailyDigestTab()
+        self._tab_customers    = CustomerInsightsTab()
+        self._tab_expenses     = ExpensesReportTab()
+        self._tab_aging_rec    = AgingReceivablesTab()
+        self._tab_fifo_aging   = AgingFifoTab()
+        self._tab_closing      = ClosingBalancesTab()
+        self._tab_deleted      = DeletedVouchersTab()
+        self._tab_sales_search = SalesSearchTab()
+        self._tab_pur_search   = PurchaseSearchTab()
 
-        self.tabs.addTab(self._tab_stock,      "Stock Summary")
-        self.tabs.addTab(self._tab_imei_stock, "IMEI Stock")
-        self.tabs.addTab(self._tab_valuation,  "Stock Valuation")
-        self.tabs.addTab(self._tab_aging,      "Aging Stock")
-        self.tabs.addTab(self._tab_sales,      "Sales")
-        self.tabs.addTab(self._tab_purchases,  "Purchases")
-        self.tabs.addTab(self._tab_profit,     "Profit")
-        self.tabs.addTab(self._tab_cashbook,   "Cash Book")
-        self.tabs.addTab(self._tab_digest,     "Daily Digest")
-        self.tabs.addTab(self._tab_customers,  "Customer Insights")
-        self.tabs.addTab(self._tab_expenses,   "Expenses")
-        self.tabs.addTab(self._tab_aging_rec,  "Aging Receivables")
-        self.tabs.addTab(self._tab_fifo_aging, "FIFO Aging")
-        self.tabs.addTab(self._tab_closing,    "Closing Balances")
-        self.tabs.addTab(self._tab_deleted,    "Deleted Vouchers")
+        self.tabs.addTab(self._tab_stock,        "Stock Summary")
+        self.tabs.addTab(self._tab_imei_stock,   "IMEI Stock")
+        self.tabs.addTab(self._tab_valuation,    "Stock Valuation")
+        self.tabs.addTab(self._tab_aging,        "Aging Stock")
+        self.tabs.addTab(self._tab_sales,        "Sales")
+        self.tabs.addTab(self._tab_purchases,    "Purchases")
+        self.tabs.addTab(self._tab_profit,       "Profit")
+        self.tabs.addTab(self._tab_cashbook,     "Cash Book")
+        self.tabs.addTab(self._tab_digest,       "Daily Digest")
+        self.tabs.addTab(self._tab_customers,    "Customer Insights")
+        self.tabs.addTab(self._tab_expenses,     "Expenses")
+        self.tabs.addTab(self._tab_aging_rec,    "Aging Receivables")
+        self.tabs.addTab(self._tab_fifo_aging,   "FIFO Aging")
+        self.tabs.addTab(self._tab_closing,      "Closing Balances")
+        self.tabs.addTab(self._tab_deleted,      "Deleted Vouchers")
+        self.tabs.addTab(self._tab_sales_search, "Sales Search")
+        self.tabs.addTab(self._tab_pur_search,   "Purchase Search")
 
         self.tabs.currentChanged.connect(self._on_tab_change)
         layout.addWidget(self.tabs)

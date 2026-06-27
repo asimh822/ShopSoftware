@@ -32,6 +32,8 @@ TABLES = [
     "brands",
     "payments",
     "journal_entries",
+    "journal_vouchers",
+    "journal_voucher_lines",
     "purchase_returns",
     "sale_returns",
     "bank_transactions",

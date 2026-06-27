@@ -282,6 +282,7 @@ def _run_migrations(conn) -> None:
         13: _migrate_v13,
         14: _migrate_v14,
         15: _migrate_v15,
+        16: _migrate_v16,
     }
 
     current = _get_db_version(conn)
@@ -902,6 +903,34 @@ def _migrate_v15(conn) -> None:
             f"UPDATE {table} SET last_modified = CURRENT_TIMESTAMP "
             f"WHERE last_modified IS NULL OR last_modified = '2000-01-01 00:00:01'"
         )
+
+
+def _migrate_v16(conn) -> None:
+    """
+    Version 16 — Multi-line Journal Voucher tables.
+    journal_vouchers: header (jv_number, date, notes)
+    journal_voucher_lines: per-line debits/credits for any party type.
+    Legacy journal_entries rows remain untouched and read-only.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS journal_vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jv_number TEXT UNIQUE NOT NULL,
+            date TEXT NOT NULL,
+            notes TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS journal_voucher_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jv_id INTEGER NOT NULL REFERENCES journal_vouchers(id),
+            party_type TEXT NOT NULL,
+            party_id INTEGER,
+            debit REAL NOT NULL DEFAULT 0,
+            credit REAL NOT NULL DEFAULT 0
+        )
+    """)
 
 
 _SUPABASE_SYNC_TABLES = [
@@ -1593,6 +1622,234 @@ def db_save_double_entry_jv(date_str: str, notes: str,
     return jv_number
 
 
+# ── Multi-line Journal Voucher helpers ───────────────────────────────────────
+
+def _resolve_party_name(party_type: str, party_id, conn) -> str:
+    """Return display name for a journal_voucher_line party."""
+    if party_type == "cash":
+        return "Cash in Hand"
+    if party_id is None:
+        return party_type.title()
+    tbl = {
+        "supplier": "suppliers",
+        "customer": "customers",
+        "other": "other_parties",
+        "bank": "bank_accounts",
+        "expense": "expense_categories",
+    }.get(party_type)
+    if not tbl:
+        return party_type.title()
+    row = conn.execute(f"SELECT name FROM {tbl} WHERE id=?", (party_id,)).fetchone()
+    return row["name"] if row else party_type.title()
+
+
+def db_save_journal_voucher(date_str: str, notes: str, lines: list) -> str:
+    """
+    lines = [{"party_type": str, "party_id": int|None, "debit": float, "credit": float}, ...]
+    Validates Dr == Cr, saves journal_vouchers + journal_voucher_lines.
+    Returns jv_number.
+    """
+    total_dr = sum(float(l.get("debit") or 0) for l in lines)
+    total_cr = sum(float(l.get("credit") or 0) for l in lines)
+    if abs(total_dr - total_cr) > 0.01:
+        raise ValueError(
+            f"Journal Voucher does not balance — "
+            f"Debit: {total_dr:,.0f}  Credit: {total_cr:,.0f}"
+        )
+    if total_dr == 0:
+        raise ValueError("Journal Voucher must have at least one non-zero line.")
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT value FROM settings WHERE key='last_jv_number'"
+        ).fetchone()
+        n = int(row["value"]) + 1 if row else 1
+        c.execute("UPDATE settings SET value=? WHERE key='last_jv_number'", (str(n),))
+        jv_number = f"JV-{n:04d}"
+        c.execute(
+            "INSERT INTO journal_vouchers (jv_number, date, notes) VALUES (?,?,?)",
+            (jv_number, date_str, notes or ""),
+        )
+        jv_id = c.lastrowid
+        for line in lines:
+            c.execute(
+                "INSERT INTO journal_voucher_lines "
+                "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+                (jv_id, line["party_type"], line.get("party_id"),
+                 float(line.get("debit") or 0), float(line.get("credit") or 0)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return jv_number
+
+
+def db_load_journal_voucher(jv_id: int):
+    """Returns (header_dict, [line_dicts]) or (None, []) if not found."""
+    conn = get_connection()
+    hdr = conn.execute(
+        "SELECT id, jv_number, date, notes FROM journal_vouchers WHERE id=?",
+        (jv_id,)
+    ).fetchone()
+    if not hdr:
+        conn.close()
+        return None, []
+    lines = conn.execute(
+        "SELECT id, party_type, party_id, debit, credit "
+        "FROM journal_voucher_lines WHERE jv_id=? ORDER BY id",
+        (jv_id,)
+    ).fetchall()
+    line_list = []
+    for ln in lines:
+        name = _resolve_party_name(ln["party_type"], ln["party_id"], conn)
+        line_list.append({
+            "id": ln["id"],
+            "party_type": ln["party_type"],
+            "party_id": ln["party_id"],
+            "party_name": name,
+            "debit": float(ln["debit"] or 0),
+            "credit": float(ln["credit"] or 0),
+        })
+    conn.close()
+    return dict(hdr), line_list
+
+
+def db_update_journal_voucher(jv_id: int, date_str: str, notes: str, lines: list):
+    """Validates balance, deletes old lines and reinserts."""
+    total_dr = sum(float(l.get("debit") or 0) for l in lines)
+    total_cr = sum(float(l.get("credit") or 0) for l in lines)
+    if abs(total_dr - total_cr) > 0.01:
+        raise ValueError(
+            f"Journal Voucher does not balance — "
+            f"Debit: {total_dr:,.0f}  Credit: {total_cr:,.0f}"
+        )
+    if total_dr == 0:
+        raise ValueError("Journal Voucher must have at least one non-zero line.")
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE journal_vouchers SET date=?, notes=? WHERE id=?",
+            (date_str, notes or "", jv_id)
+        )
+        conn.execute("DELETE FROM journal_voucher_lines WHERE jv_id=?", (jv_id,))
+        for line in lines:
+            conn.execute(
+                "INSERT INTO journal_voucher_lines "
+                "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+                (jv_id, line["party_type"], line.get("party_id"),
+                 float(line.get("debit") or 0), float(line.get("credit") or 0)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+
+
+def db_delete_journal_voucher(jv_id: int):
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM journal_voucher_lines WHERE jv_id=?", (jv_id,))
+        conn.execute("DELETE FROM journal_vouchers WHERE id=?", (jv_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+
+
+def db_load_journal_vouchers_list(from_iso=None, to_iso=None):
+    """
+    Returns list of dicts sorted by date:
+    id, jv_number, date, notes, line_count, total_dr, is_legacy.
+    New-style JVs (journal_vouchers) are fully editable.
+    Legacy (journal_entries) appear with is_legacy=True and line_count='—'.
+    """
+    conn = get_connection()
+
+    def _de(col):
+        return f"substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2)"
+
+    rows = []
+
+    # New-style JVs
+    q = """
+        SELECT jv.id, jv.jv_number, jv.date, jv.notes,
+               COUNT(jvl.id) AS line_count,
+               COALESCE(SUM(jvl.debit), 0) AS total_dr
+        FROM journal_vouchers jv
+        LEFT JOIN journal_voucher_lines jvl ON jvl.jv_id = jv.id
+    """
+    conds, params = [], []
+    de = _de("jv.date")
+    if from_iso:
+        conds.append(f"{de} >= ?")
+        params.append(from_iso)
+    if to_iso:
+        conds.append(f"{de} <= ?")
+        params.append(to_iso)
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += f" GROUP BY jv.id ORDER BY {de}, jv.jv_number"
+    for r in conn.execute(q, params).fetchall():
+        rows.append({
+            "id": r["id"],
+            "jv_number": r["jv_number"],
+            "date": r["date"],
+            "notes": r["notes"] or "",
+            "line_count": r["line_count"],
+            "total_dr": float(r["total_dr"]),
+            "is_legacy": False,
+        })
+
+    # Legacy journal_entries (read-only)
+    lq = """
+        SELECT jv_number, date, COALESCE(notes,'') AS notes,
+               COUNT(*) AS line_count, COALESCE(SUM(amount),0) AS total_dr
+        FROM journal_entries
+    """
+    l_conds, l_params = [], []
+    de2 = _de("date")
+    if from_iso:
+        l_conds.append(f"{de2} >= ?")
+        l_params.append(from_iso)
+    if to_iso:
+        l_conds.append(f"{de2} <= ?")
+        l_params.append(to_iso)
+    if l_conds:
+        lq += " WHERE " + " AND ".join(l_conds)
+    lq += f" GROUP BY jv_number ORDER BY {de2}, jv_number"
+    for r in conn.execute(lq, l_params).fetchall():
+        rows.append({
+            "id": None,
+            "jv_number": r["jv_number"] + " (Legacy)",
+            "date": r["date"],
+            "notes": r["notes"],
+            "line_count": "—",
+            "total_dr": float(r["total_dr"]),
+            "is_legacy": True,
+        })
+
+    conn.close()
+
+    def _sort_key(r):
+        d = r["date"]
+        try:
+            parts = d.split("/")
+            return (f"{parts[2]}-{parts[1]}-{parts[0]}", r["jv_number"])
+        except Exception:
+            return ("0000-00-00", r["jv_number"])
+
+    rows.sort(key=_sort_key)
+    return rows
+
+
 # ── Income account helpers ────────────────────────────────────────────────────
 
 def db_income_account(name: str = "Incentives Income"):
@@ -1643,6 +1900,8 @@ def db_cash_in_hand() -> float:
                         WHERE purchase_type='cash' AND cash_amount > 0), 0)
             - COALESCE((SELECT SUM(amount) FROM expenses
                         WHERE payment_method='cash'), 0)
+            + COALESCE((SELECT SUM(debit) FROM journal_voucher_lines WHERE party_type='cash'), 0)
+            - COALESCE((SELECT SUM(credit) FROM journal_voucher_lines WHERE party_type='cash'), 0)
     """).fetchone()[0]
     conn.close()
     return cash_ob + float(result or 0.0)
@@ -1686,7 +1945,15 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='other' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
+        jvl_dr = conn.execute(
+            "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
+            "WHERE party_type='other' AND party_id=?", (party_id,)
+        ).fetchone()[0]
+        jvl_cr = conn.execute(
+            "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
+            "WHERE party_type='other' AND party_id=?", (party_id,)
+        ).fetchone()[0]
+        return ob + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) + float(jvl_dr) - float(jvl_cr)
 
     if party_type == "supplier":
         # Purchases → DR (increases what you owe)
@@ -1715,13 +1982,21 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='supplier' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
+        jvl_dr = conn.execute(
+            "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
+            "WHERE party_type='supplier' AND party_id=?", (party_id,)
+        ).fetchone()[0]
+        jvl_cr = conn.execute(
+            "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
+            "WHERE party_type='supplier' AND party_id=?", (party_id,)
+        ).fetchone()[0]
         # Sales to this supplier reduce their balance (they owe us / we owe them less)
         sac = conn.execute(
             "SELECT COALESCE(SUM(total_amount), 0) FROM sale_vouchers "
             "WHERE supplier_as_customer_id=?",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) - float(sac)
+        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) + float(jvl_dr) - float(jvl_cr) - float(sac)
 
     else:  # customer
         # Credit sales → DR (customer owes more)
@@ -1751,13 +2026,21 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='customer' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
+        jvl_dr = conn.execute(
+            "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
+            "WHERE party_type='customer' AND party_id=?", (party_id,)
+        ).fetchone()[0]
+        jvl_cr = conn.execute(
+            "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
+            "WHERE party_type='customer' AND party_id=?", (party_id,)
+        ).fetchone()[0]
         # Purchases from this customer reduce their balance (we owe them / they owe us less)
         cas = conn.execute(
             "SELECT COALESCE(SUM(total_amount), 0) FROM purchase_vouchers "
             "WHERE customer_as_supplier_id=?",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) - float(jv_cr) - float(cas)
+        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) - float(jv_cr) + float(jvl_dr) - float(jvl_cr) - float(cas)
 
 
 def db_bank_account_closing_balance(account_id: int) -> float:
@@ -1782,8 +2065,16 @@ def db_bank_account_closing_balance(account_id: int) -> float:
         "WHERE bank_account_id=? AND type='CR'",
         (account_id,)
     ).fetchone()[0]
+    jvl_dr = conn.execute(
+        "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
+        "WHERE party_type='bank' AND party_id=?", (account_id,)
+    ).fetchone()[0]
+    jvl_cr = conn.execute(
+        "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
+        "WHERE party_type='bank' AND party_id=?", (account_id,)
+    ).fetchone()[0]
     conn.close()
-    return ob + float(sales) + float(cp) - float(cr)
+    return ob + float(sales) + float(cp) - float(cr) + float(jvl_dr) - float(jvl_cr)
 
 
 def db_year_end_summary(year_start_iso: str, year_end_iso: str) -> dict:
@@ -2205,7 +2496,9 @@ def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
     conn = get_connection()
     try:
         row = conn.execute("""
-            SELECT pv.pv_number, pv.date, pv.total_amount, s.name AS party_name
+            SELECT pv.pv_number, pv.date, pv.total_amount,
+                   pv.purchase_type, pv.cash_amount, pv.bank_amount, pv.bank_account_id,
+                   s.name AS party_name
             FROM purchase_vouchers pv
             LEFT JOIN suppliers s ON s.id = pv.supplier_id
             WHERE pv.id = ?
@@ -2215,22 +2508,56 @@ def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
         r = dict(row)
 
         lines = conn.execute("""
-            SELECT pl.stock_item_id, pl.purchase_price, pv.supplier_id
+            SELECT si.id AS stock_item_id, si.status, si.imei,
+                   pl.purchase_price, pv.supplier_id
             FROM purchase_lines pl
             JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+            LEFT JOIN stock_items si ON si.purchase_line_id = pl.id
             WHERE pl.pv_id = ?
         """, (pv_id,)).fetchall()
 
+        sold_imeis = [line["imei"] for line in lines if line["status"] == "sold"]
+        if sold_imeis:
+            imei_list = "\n".join(f"- {imei}" for imei in sold_imeis)
+            raise ValueError(
+                f"Cannot delete {r['pv_number']}. The following IMEIs have already been "
+                f"sold — delete the sale vouchers first:\n{imei_list}"
+            )
+
         for line in lines:
-            conn.execute("DELETE FROM stock_items WHERE id=?", (line["stock_item_id"],))
+            if line["stock_item_id"]:
+                conn.execute("DELETE FROM stock_items WHERE id=?", (line["stock_item_id"],))
 
         if lines:
             total = r["total_amount"] or 0
             sup_id = lines[0]["supplier_id"]
-            conn.execute(
-                "UPDATE suppliers SET opening_balance = opening_balance - ? WHERE id=?",
-                (total, sup_id)
-            )
+            if sup_id:
+                conn.execute(
+                    "UPDATE suppliers SET opening_balance = opening_balance - ? WHERE id=?",
+                    (total, sup_id)
+                )
+
+        # Reverse cash/bank outflow recorded at purchase time
+        ptype = (r.get("purchase_type") or "").strip().lower()
+        if ptype == "cash":
+            cash_amt = float(r.get("cash_amount") or 0)
+            bank_amt = float(r.get("bank_amount") or 0)
+            bank_acct_id = r.get("bank_account_id")
+            if cash_amt > 0:
+                conn.execute(
+                    "UPDATE settings SET value = CAST(CAST(value AS REAL) + ? AS TEXT) "
+                    "WHERE key='cash_opening_balance'",
+                    (cash_amt,)
+                )
+            if bank_amt > 0 and bank_acct_id:
+                conn.execute(
+                    "UPDATE bank_accounts SET opening_balance = opening_balance + ? WHERE id=?",
+                    (bank_amt, bank_acct_id)
+                )
+                conn.execute(
+                    "DELETE FROM bank_transactions WHERE voucher_number=?",
+                    (r["pv_number"],)
+                )
 
         conn.execute("DELETE FROM purchase_lines WHERE pv_id=?", (pv_id,))
         conn.execute("DELETE FROM purchase_vouchers WHERE id=?", (pv_id,))

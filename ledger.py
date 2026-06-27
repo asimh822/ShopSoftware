@@ -14,6 +14,9 @@ from database import (
     get_connection, db_bank_accounts,
     db_save_bank_cp_cr, db_save_double_entry_jv,
     db_income_account,
+    db_save_journal_voucher, db_load_journal_voucher,
+    db_update_journal_voucher, db_delete_journal_voucher,
+    db_load_journal_vouchers_list,
 )
 # Reuse the unified report export engine (reportlab PDF + csv, folder picker,
 # <ReportName>_DDMMYYYY.<ext>) so ledger exports match every other report.
@@ -270,7 +273,7 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
                 raw.append({"date": r[0], "voucher": r[1], "desc": desc,
                             "dr": 0.0, "cr": amt})
 
-    # Journal entries apply to both
+    # Legacy journal_entries
     for r in conn.execute(
         "SELECT date, jv_number, COALESCE(notes,'Journal Entry'), type, amount "
         "FROM journal_entries WHERE party_type=? AND party_id=?",
@@ -279,6 +282,18 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         dr = float(r[4] or 0) if r[3] == "debit" else 0.0
         cr = float(r[4] or 0) if r[3] == "credit" else 0.0
         raw.append({"date": r[0], "voucher": r[1], "desc": r[2], "dr": dr, "cr": cr})
+
+    # New-style journal_voucher_lines
+    for r in conn.execute("""
+        SELECT jv.date, jv.jv_number, COALESCE(jv.notes,'Journal Entry') AS notes,
+               jvl.debit, jvl.credit
+        FROM journal_voucher_lines jvl
+        JOIN journal_vouchers jv ON jv.id = jvl.jv_id
+        WHERE jvl.party_type=? AND jvl.party_id=?
+    """, (party_type, party_id)):
+        raw.append({"date": r["date"], "voucher": r["jv_number"],
+                    "desc": r["notes"],
+                    "dr": float(r["debit"] or 0), "cr": float(r["credit"] or 0)})
 
     conn.close()
 
@@ -464,6 +479,18 @@ def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
         else:
             raw.append({"date": r["date"], "voucher": r["voucher_number"],
                         "desc": desc, "dr": 0.0, "cr": float(r["amount"])})
+
+    # New-style journal_voucher_lines for this bank account
+    for r in conn.execute("""
+        SELECT jv.date, jv.jv_number, COALESCE(jv.notes,'Journal Entry') AS notes,
+               jvl.debit, jvl.credit
+        FROM journal_voucher_lines jvl
+        JOIN journal_vouchers jv ON jv.id = jvl.jv_id
+        WHERE jvl.party_type='bank' AND jvl.party_id=?
+    """, (bank_account_id,)):
+        raw.append({"date": r["date"], "voucher": r["jv_number"],
+                    "desc": r["notes"],
+                    "dr": float(r["debit"] or 0), "cr": float(r["credit"] or 0)})
 
     conn.close()
 
@@ -1504,6 +1531,164 @@ class BankLedgerWidget(QWidget):
         self._reload_bank_combo()
 
 
+# ── JV List Widget ────────────────────────────────────────────────────────────
+
+class JVListWidget(QWidget):
+    """Shows all journal vouchers (new + legacy) with filter bar and actions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(10)
+
+        # ── Filter bar ────────────────────────────────────────────────────────
+        ctrl = QFrame()
+        ctrl.setStyleSheet(CARD_STYLE)
+        cl = QHBoxLayout(ctrl)
+        cl.setContentsMargins(12, 10, 12, 10)
+        cl.setSpacing(8)
+
+        cl.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+        cl.addWidget(self.from_date)
+
+        cl.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+        cl.addWidget(self.to_date)
+
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(self._set_today)
+        cl.addWidget(btn_today)
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(self._set_yesterday)
+        cl.addWidget(btn_yesterday)
+
+        btn_search = QPushButton("Search")
+        btn_search.setStyleSheet(BTN_SECONDARY)
+        btn_search.clicked.connect(self._load)
+        cl.addWidget(btn_search)
+
+        btn_all = QPushButton("All")
+        btn_all.setStyleSheet(BTN_SECONDARY)
+        btn_all.clicked.connect(self._load_all)
+        cl.addWidget(btn_all)
+
+        cl.addStretch()
+
+        self.btn_new = QPushButton("+ New JV")
+        self.btn_new.setStyleSheet(BTN_PRIMARY)
+        self.btn_new.clicked.connect(self._new_jv)
+        cl.addWidget(self.btn_new)
+
+        layout.addWidget(ctrl)
+
+        # ── Table ─────────────────────────────────────────────────────────────
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["JV Number", "Date", "Notes", "Lines", "Total Dr (PKR)"]
+        )
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setStyleSheet(TABLE_STYLE)
+        self.table.doubleClicked.connect(self._edit_row)
+        layout.addWidget(self.table, stretch=1)
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        footer = QHBoxLayout()
+        self._footer_lbl = QLabel("")
+        self._footer_lbl.setStyleSheet("color:#475569; font-size:9pt;")
+        footer.addWidget(self._footer_lbl)
+        footer.addStretch()
+        layout.addLayout(footer)
+
+        self._load_all()
+
+    def _set_today(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(today)
+        self.to_date.setDate(today)
+        self._load()
+
+    def _set_yesterday(self):
+        yesterday = QDate.currentDate().addDays(-1)
+        self.from_date.setDate(yesterday)
+        self.to_date.setDate(yesterday)
+        self._load()
+
+    def _load(self):
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        self._populate(db_load_journal_vouchers_list(from_iso, to_iso))
+
+    def _load_all(self):
+        self._populate(db_load_journal_vouchers_list())
+
+    def _populate(self, rows):
+        self._rows = rows
+        self.table.setRowCount(0)
+        LEGACY_BG = QBrush(QColor("#fef9c3"))
+        for r in rows:
+            i = self.table.rowCount()
+            self.table.insertRow(i)
+            lc = str(r["line_count"]) if r["line_count"] != "—" else "—"
+            cells = [
+                r["jv_number"],
+                r["date"],
+                r["notes"],
+                lc,
+                fmt_pkr(r["total_dr"]),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col == 4:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                if r["is_legacy"]:
+                    item.setBackground(LEGACY_BG)
+                    item.setForeground(QBrush(QColor("#92400e")))
+                self.table.setItem(i, col, item)
+        count = len(rows)
+        total = sum(r["total_dr"] for r in rows)
+        self._footer_lbl.setText(
+            f"{count} voucher{'s' if count != 1 else ''}  •  "
+            f"Total Dr: Rs. {fmt_pkr(total)}"
+        )
+
+    def _new_jv(self):
+        from edit_vouchers import JVFormDialog
+        dlg = JVFormDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._load_all()
+
+    def _edit_row(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._rows):
+            return
+        r = self._rows[row]
+        from edit_vouchers import JVEditDialog
+        dlg = JVEditDialog(r["id"], r["is_legacy"], r.get("jv_number", ""), self)
+        result = dlg.exec()
+        if result in (QDialog.DialogCode.Accepted,):
+            self._load_all()
+
+    def refresh(self):
+        self._load_all()
+
+
 # ── Ledger Page ───────────────────────────────────────────────────────────────
 
 class LedgerPage(QWidget):
@@ -1532,20 +1717,25 @@ class LedgerPage(QWidget):
         self.btn_other.setFixedHeight(32)
         self.btn_bank = QPushButton("Bank")
         self.btn_bank.setFixedHeight(32)
+        self.btn_jv = QPushButton("Journal Vouchers")
+        self.btn_jv.setFixedHeight(32)
         _style_toggle(self.btn_sup,   True,  "left")
         _style_toggle(self.btn_cust,  False, "mid")
         _style_toggle(self.btn_other, False, "mid")
-        _style_toggle(self.btn_bank,  False, "right")
-        for _b in (self.btn_sup, self.btn_cust, self.btn_other, self.btn_bank):
+        _style_toggle(self.btn_bank,  False, "mid")
+        _style_toggle(self.btn_jv,    False, "right")
+        for _b in (self.btn_sup, self.btn_cust, self.btn_other, self.btn_bank, self.btn_jv):
             _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_sup.clicked.connect(lambda: self._set_party_type("supplier"))
         self.btn_cust.clicked.connect(lambda: self._set_party_type("customer"))
         self.btn_other.clicked.connect(lambda: self._set_party_type("other"))
         self.btn_bank.clicked.connect(lambda: self._set_party_type("bank"))
+        self.btn_jv.clicked.connect(lambda: self._set_party_type("jv"))
         tl.addWidget(self.btn_sup)
         tl.addWidget(self.btn_cust)
         tl.addWidget(self.btn_other)
         tl.addWidget(self.btn_bank)
+        tl.addWidget(self.btn_jv)
         tl.addStretch()
         layout.addWidget(type_card)
 
@@ -1662,6 +1852,11 @@ class LedgerPage(QWidget):
         self._bank_widget.setVisible(False)
         layout.addWidget(self._bank_widget, stretch=1)
 
+        # ── Journal Vouchers widget ───────────────────────────────────────────
+        self._jv_widget = JVListWidget(self)
+        self._jv_widget.setVisible(False)
+        layout.addWidget(self._jv_widget, stretch=1)
+
         self._load_party_combo()
 
     # ── Party type toggle ─────────────────────────────────────────────────────
@@ -1671,18 +1866,26 @@ class LedgerPage(QWidget):
         _style_toggle(self.btn_sup,   ptype == "supplier", "left")
         _style_toggle(self.btn_cust,  ptype == "customer", "mid")
         _style_toggle(self.btn_other, ptype == "other",    "mid")
-        _style_toggle(self.btn_bank,  ptype == "bank",     "right")
+        _style_toggle(self.btn_bank,  ptype == "bank",     "mid")
+        _style_toggle(self.btn_jv,    ptype == "jv",       "right")
 
         is_bank = ptype == "bank"
-        self.ctrl_card.setVisible(not is_bank)
+        is_jv   = ptype == "jv"
+        is_party = not is_bank and not is_jv
+
+        self.ctrl_card.setVisible(is_party)
         self.info_card.setVisible(False)
-        self.table.setVisible(not is_bank)
-        self.closing_label.setVisible(not is_bank)
+        self.table.setVisible(is_party)
+        self.closing_label.setVisible(is_party)
         self._bank_widget.setVisible(is_bank)
+        self._jv_widget.setVisible(is_jv)
 
         if is_bank:
             self._bank_widget.refresh()
             QTimer.singleShot(0, self._bank_widget.setFocus)
+        elif is_jv:
+            self._jv_widget.refresh()
+            QTimer.singleShot(0, self._jv_widget.setFocus)
         else:
             self._load_party_combo()
             QTimer.singleShot(0, self.party_combo.setFocus)
@@ -1806,19 +2009,32 @@ class LedgerPage(QWidget):
                 self._load_ledger()
 
         elif voucher.startswith("JV-"):
-            je = db_lookup_journal_entry(
-                voucher,
-                party_type=self._party_type,
-                party_id=self._party_id,
-            )
-            if not je:
-                QMessageBox.information(self, "Not Found",
-                    f"Journal entry {voucher} not found for this party.\n"
-                    "System-generated JVs (from sale/purchase returns) cannot be edited here.")
-                return
-            dlg = JVEditDialog(je, self)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self._load_ledger()
+            # Check if this is a new-style JV in journal_vouchers first
+            from edit_vouchers import JVEditDialog as _JVEditDialog
+            conn = get_connection()
+            jv_row = conn.execute(
+                "SELECT id FROM journal_vouchers WHERE jv_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if jv_row:
+                dlg = _JVEditDialog(jv_row["id"], False, voucher, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self._load_ledger()
+            else:
+                # Legacy journal_entry
+                je = db_lookup_journal_entry(
+                    voucher,
+                    party_type=self._party_type,
+                    party_id=self._party_id,
+                )
+                if not je:
+                    QMessageBox.information(self, "Not Found",
+                        f"Journal entry {voucher} not found for this party.\n"
+                        "System-generated JVs (from sale/purchase returns) cannot be edited here.")
+                    return
+                dlg = _JVEditDialog(None, True, voucher, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self._load_ledger()
 
         else:
             # SV / PV / SR / PR rows — tell user to go to the relevant page
@@ -1938,25 +2154,14 @@ class LedgerPage(QWidget):
         QMessageBox.information(self, "Saved", f"Cash payment {voucher} saved.")
 
     def _standalone_jv(self):
-        dlg = DoubleEntryJournalDialog(self)
+        from edit_vouchers import JVFormDialog
+        dlg = JVFormDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        date_str, notes, dr_type, dr_id, cr_type, cr_id, amount = dlg.get_data()
-        try:
-            jv = db_save_double_entry_jv(
-                date_str, notes, dr_type, dr_id, cr_type, cr_id, amount
-            )
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
-            return
-        QMessageBox.information(
-            self, "Saved",
-            f"Journal Voucher {jv} saved.\n\n"
-            f"Dr: {dr_type.capitalize()}  →  Cr: {cr_type.capitalize()}\n"
-            f"Amount: PKR {fmt_pkr(amount)}"
-        )
         # Refresh whichever view is active
         if self._party_type == "bank":
             self._bank_widget.refresh()
+        elif self._party_type == "jv":
+            self._jv_widget.refresh()
         else:
             self._load_ledger()

@@ -19,7 +19,7 @@ import requests
 # Read credentials from supabase_sync.py — key is stored there, not repeated here
 from supabase_sync import SUPABASE_URL, SUPABASE_KEY
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "united_mobile.db")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -28,16 +28,22 @@ HEADERS = {
 }
 
 ID_TABLES = [
-    "sale_vouchers",
     "sale_lines",
+    "sale_vouchers",
     "purchase_vouchers",
-    "purchase_lines",
     "stock_items",
     "payments",
     "journal_entries",
+    "purchase_returns",
+    "sale_returns",
     "expenses",
     "bank_transactions",
     "cash_journal_lines",
+    "suppliers",
+    "customers",
+    "bank_accounts",
+    "models",
+    "brands",
 ]
 
 print("=" * 55)

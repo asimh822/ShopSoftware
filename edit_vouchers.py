@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QComboBox, QLineEdit,
     QDoubleSpinBox, QDateEdit, QMessageBox, QHeaderView,
     QAbstractItemView, QFrame, QStackedWidget, QDialogButtonBox,
-    QListWidget, QListWidgetItem, QCheckBox,
+    QListWidget, QListWidgetItem, QCheckBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QFont, QBrush, QColor, QDoubleValidator
@@ -278,7 +278,7 @@ def db_update_sale(sv_id, date_str, sale_type, customer_id, cash_name, cash_cont
     conn.close()
 
 
-def db_update_purchase(pv_id, date_str, supplier_id, notes, lines):
+def db_update_purchase(pv_id, date_str, supplier_id, notes, lines, customer_as_supplier_id=None):
     """
     lines = [(model_id, imei, purchase_price), ...]
     Handles add/remove/price-change vs existing purchase_lines.
@@ -351,10 +351,11 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines):
                     )
 
         total = sum(p for _, _, p in lines)
+        new_ptype = "supplier" if (supplier_id or customer_as_supplier_id) else "cash"
         c.execute(
-            "UPDATE purchase_vouchers SET date=?, supplier_id=?, notes=?, total_amount=? "
-            "WHERE id=?",
-            (date_str, supplier_id, notes or "", total, pv_id),
+            "UPDATE purchase_vouchers SET date=?, supplier_id=?, notes=?, total_amount=?, "
+            "customer_as_supplier_id=?, purchase_type=? WHERE id=?",
+            (date_str, supplier_id, notes or "", total, customer_as_supplier_id, new_ptype, pv_id),
         )
         conn.commit()
     except Exception:
@@ -1283,17 +1284,31 @@ class PurchaseEditDialog(QDialog):
         dc.addWidget(self.date_edit)
         hl.addLayout(dc)
 
-        from purchase import db_suppliers_list
+        from purchase import db_suppliers_list, db_credit_customers_for_purchase
         sc = QVBoxLayout()
         sc.addWidget(QLabel("Supplier *"))
         self.supplier_combo = QComboBox()
         self.supplier_combo.setMinimumWidth(200)
         self.supplier_combo.addItem("— Select Supplier —", None)
         for s in db_suppliers_list():
-            self.supplier_combo.addItem(s["name"], s["id"])
-            if s["id"] == pv["supplier_id"]:
+            self.supplier_combo.addItem(s["name"], {"type": "supplier", "id": s["id"]})
+            if s["id"] == pv.get("supplier_id"):
                 self.supplier_combo.setCurrentIndex(self.supplier_combo.count() - 1)
+        _cust_for_pur = list(db_credit_customers_for_purchase())
+        if _cust_for_pur:
+            _sep_idx = self.supplier_combo.count()
+            self.supplier_combo.addItem("── Credit Customers ──", None)
+            self.supplier_combo.model().item(_sep_idx).setEnabled(False)
+            for cc in _cust_for_pur:
+                self.supplier_combo.addItem(cc["name"], {"type": "customer", "id": cc["id"]})
+                if pv.get("customer_as_supplier_id") and cc["id"] == pv.get("customer_as_supplier_id"):
+                    self.supplier_combo.setCurrentIndex(self.supplier_combo.count() - 1)
         sc.addWidget(self.supplier_combo)
+        self.supplier_balance_lbl = QLabel("")
+        self.supplier_balance_lbl.setStyleSheet("color:#475569; font-size:9pt;")
+        sc.addWidget(self.supplier_balance_lbl)
+        self.supplier_combo.currentIndexChanged.connect(self._update_supplier_balance)
+        self._update_supplier_balance()
         hl.addLayout(sc)
 
         nc = QVBoxLayout()
@@ -1477,15 +1492,28 @@ class PurchaseEditDialog(QDialog):
         })
         self._rebuild_lines_table()
 
+    def _update_supplier_balance(self):
+        sup_data = self.supplier_combo.currentData()
+        if not isinstance(sup_data, dict):
+            self.supplier_balance_lbl.setText("")
+            return
+        if sup_data.get("type") == "supplier":
+            from purchase import db_supplier_balance
+            bal = db_supplier_balance(sup_data["id"])
+            self.supplier_balance_lbl.setText(f"Balance: Rs. {bal:,.0f}")
+        else:
+            self.supplier_balance_lbl.setText("")
+
     def _save(self):
-        # Cash purchases have no real supplier (system supplier_id=0), so the
-        # supplier selection is only required for supplier/credit purchases.
-        # Prefer the loaded purchase_type; fall back to supplier_id when it's
-        # NULL/empty (legacy rows without a purchase_type).
         ptype = (self._pv.get("purchase_type") or "").strip().lower()
         is_cash_purchase = ptype == "cash" or not self._pv.get("supplier_id")
 
-        if not is_cash_purchase and self.supplier_combo.currentData() is None:
+        sup_data = self.supplier_combo.currentData()
+        user_selected_supplier = isinstance(sup_data, dict)
+
+        # Require a supplier selection only for non-cash purchases where nothing
+        # is chosen — cash purchases may be saved without selecting one.
+        if not is_cash_purchase and not user_selected_supplier:
             QMessageBox.warning(self, "Missing", "Select a supplier.")
             return
         if not self._lines:
@@ -1493,12 +1521,18 @@ class PurchaseEditDialog(QDialog):
             return
 
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        # Keep the original supplier for cash purchases (system id=0); use the
-        # chosen supplier for supplier/credit purchases.
-        if is_cash_purchase:
-            supplier_id = self._pv.get("supplier_id")
+        if user_selected_supplier:
+            # User explicitly picked something — honour it even on cash purchases.
+            if sup_data.get("type") == "customer":
+                supplier_id = None
+                customer_as_supplier_id = sup_data["id"]
+            else:
+                supplier_id = sup_data["id"]
+                customer_as_supplier_id = None
         else:
-            supplier_id = self.supplier_combo.currentData()
+            # No selection made; keep whatever was originally recorded.
+            supplier_id = self._pv.get("supplier_id")
+            customer_as_supplier_id = None
         notes = self.notes_edit.text().strip()
         db_lines = []
         for i, ln in enumerate(self._lines):
@@ -1507,7 +1541,8 @@ class PurchaseEditDialog(QDialog):
             db_lines.append((model_id, ln["imei"], ln["purchase_price"]))
 
         try:
-            db_update_purchase(self._pv_id, date_str, supplier_id, notes, db_lines)
+            db_update_purchase(self._pv_id, date_str, supplier_id, notes, db_lines,
+                               customer_as_supplier_id=customer_as_supplier_id)
         except ValueError as ex:
             QMessageBox.warning(self, "Cannot Save", str(ex))
             return
@@ -1780,104 +1815,467 @@ class BankTransactionEditDialog(QDialog):
 
 # ── Journal Entry Edit Dialog (single-party JV) ───────────────────────────────
 
-class JVEditDialog(QDialog):
-    """Edit a single-party journal entry (JV from the per-party journal button)."""
+# ── JV multi-line form helpers ────────────────────────────────────────────────
 
-    def __init__(self, je_dict, parent=None):
+_JV_PARTY_TYPES = [
+    ("Supplier",     "supplier"),
+    ("Customer",     "customer"),
+    ("Bank",         "bank"),
+    ("Cash in Hand", "cash"),
+    ("Expense",      "expense"),
+]
+
+
+def _fill_jv_party_combo(party_combo: QComboBox, type_key: str, selected_id=None):
+    """Populate party sub-combo based on selected party type."""
+    party_combo.blockSignals(True)
+    party_combo.clear()
+    if type_key == "cash":
+        party_combo.addItem("Cash in Hand", None)
+        party_combo.setEnabled(False)
+    elif type_key == "bank":
+        party_combo.setEnabled(True)
+        party_combo.addItem("— Select Bank —", None)
+        for a in db_bank_accounts():
+            party_combo.addItem(a["name"], a["id"])
+            if selected_id is not None and a["id"] == selected_id:
+                party_combo.setCurrentIndex(party_combo.count() - 1)
+    elif type_key == "supplier":
+        party_combo.setEnabled(True)
+        party_combo.addItem("— Select Supplier —", None)
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+        ).fetchall()
+        conn.close()
+        for r in rows:
+            party_combo.addItem(r["name"], r["id"])
+            if selected_id is not None and r["id"] == selected_id:
+                party_combo.setCurrentIndex(party_combo.count() - 1)
+    elif type_key == "customer":
+        party_combo.setEnabled(True)
+        party_combo.addItem("— Select Customer —", None)
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, name FROM customers WHERE type='credit' ORDER BY name"
+        ).fetchall()
+        conn.close()
+        for r in rows:
+            party_combo.addItem(r["name"], r["id"])
+            if selected_id is not None and r["id"] == selected_id:
+                party_combo.setCurrentIndex(party_combo.count() - 1)
+    elif type_key == "expense":
+        party_combo.setEnabled(True)
+        party_combo.addItem("— Select Expense —", None)
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT id, name FROM expense_categories ORDER BY name"
+            ).fetchall()
+        except Exception:
+            rows = []
+        conn.close()
+        for r in rows:
+            party_combo.addItem(r["name"], r["id"])
+            if selected_id is not None and r["id"] == selected_id:
+                party_combo.setCurrentIndex(party_combo.count() - 1)
+    else:
+        party_combo.setEnabled(False)
+    party_combo.blockSignals(False)
+
+
+def _build_jv_row(rows_layout, line_rows, on_balance_update,
+                  party_type=None, party_id=None, debit=0.0, credit=0.0):
+    """Build one JV line row, append it to rows_layout and line_rows list."""
+    row_w = QFrame()
+    row_l = QHBoxLayout(row_w)
+    row_l.setContentsMargins(0, 2, 0, 2)
+    row_l.setSpacing(4)
+
+    type_combo = QComboBox()
+    type_combo.setFixedWidth(120)
+    for label, key in _JV_PARTY_TYPES:
+        type_combo.addItem(label, key)
+
+    party_combo = QComboBox()
+    party_combo.setMinimumWidth(160)
+
+    dr_edit = QLineEdit()
+    dr_edit.setPlaceholderText("0")
+    dr_edit.setFixedWidth(110)
+    dr_edit.setValidator(QDoubleValidator(0, 99_999_999, 0))
+
+    cr_edit = QLineEdit()
+    cr_edit.setPlaceholderText("0")
+    cr_edit.setFixedWidth(110)
+    cr_edit.setValidator(QDoubleValidator(0, 99_999_999, 0))
+
+    btn_remove = QPushButton("✕")
+    btn_remove.setFixedWidth(28)
+    btn_remove.setStyleSheet(
+        "QPushButton { background:#fee2e2; color:#dc2626; border:none; "
+        "border-radius:4px; padding:2px 6px; } "
+        "QPushButton:hover { background:#fecaca; }"
+    )
+
+    row_l.addWidget(type_combo)
+    row_l.addWidget(party_combo, stretch=1)
+    row_l.addWidget(dr_edit)
+    row_l.addWidget(cr_edit)
+    row_l.addWidget(btn_remove)
+    rows_layout.addWidget(row_w)
+
+    entry = (type_combo, party_combo, dr_edit, cr_edit, row_w)
+    line_rows.append(entry)
+
+    init_type = party_type or "supplier"
+    for i in range(type_combo.count()):
+        if type_combo.itemData(i) == init_type:
+            type_combo.setCurrentIndex(i)
+            break
+    _fill_jv_party_combo(party_combo, init_type, party_id)
+
+    type_combo.currentIndexChanged.connect(
+        lambda _, tc=type_combo, pc=party_combo: _fill_jv_party_combo(pc, tc.currentData())
+    )
+
+    if debit:
+        dr_edit.setText(str(int(debit)))
+    if credit:
+        cr_edit.setText(str(int(credit)))
+
+    dr_edit.textChanged.connect(on_balance_update)
+    cr_edit.textChanged.connect(on_balance_update)
+
+    def _remove(_checked, rw=row_w, e=entry):
+        if len(line_rows) <= 1:
+            return
+        line_rows.remove(e)
+        rw.setParent(None)
+        rw.deleteLater()
+        on_balance_update()
+
+    btn_remove.clicked.connect(_remove)
+
+
+def _jv_balance_text(line_rows):
+    """Return (text, style) for the balance indicator."""
+    total_dr = total_cr = 0.0
+    for _tc, _pc, dr_e, cr_e, _rw in line_rows:
+        try:
+            total_dr += float(dr_e.text() or 0)
+        except ValueError:
+            pass
+        try:
+            total_cr += float(cr_e.text() or 0)
+        except ValueError:
+            pass
+    if total_dr == 0 and total_cr == 0:
+        return "Enter debit / credit amounts above", "color:#94a3b8;"
+    if abs(total_dr - total_cr) < 0.01:
+        return (f"✓ Balanced   Dr = Cr = PKR {total_dr:,.0f}",
+                "color:#16a34a; font-weight:bold;")
+    diff = total_dr - total_cr
+    side = "Dr" if diff > 0 else "Cr"
+    return (
+        f"✗ Not Balanced   Dr {total_dr:,.0f}  Cr {total_cr:,.0f}  "
+        f"({side} over by {abs(diff):,.0f})",
+        "color:#dc2626; font-weight:bold;"
+    )
+
+
+def _jv_collect_lines(line_rows):
+    """Validate and return line dicts. Raises ValueError on bad input."""
+    lines = []
+    for i, (tc, pc, dr_e, cr_e, _rw) in enumerate(line_rows):
+        type_key = tc.currentData()
+        party_id = pc.currentData()
+        try:
+            dr = float(dr_e.text() or 0)
+        except ValueError:
+            dr = 0.0
+        try:
+            cr = float(cr_e.text() or 0)
+        except ValueError:
+            cr = 0.0
+        if type_key != "cash" and party_id is None:
+            raise ValueError(f"Row {i + 1}: please select a party / account.")
+        if dr == 0 and cr == 0:
+            raise ValueError(f"Row {i + 1}: enter either a Debit or Credit amount.")
+        if dr > 0 and cr > 0:
+            raise ValueError(
+                f"Row {i + 1}: a line can have either Debit OR Credit, not both."
+            )
+        lines.append({
+            "party_type": type_key,
+            "party_id": None if type_key == "cash" else party_id,
+            "debit": dr,
+            "credit": cr,
+        })
+    return lines
+
+
+def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lines=None):
+    """
+    Builds the shared JV form body into `outer` (QVBoxLayout).
+    Returns (date_edit, notes_edit, line_rows, bal_lbl, rows_layout).
+    """
+    title_lbl = QLabel(title_text)
+    title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+    title_lbl.setStyleSheet("color:#1e293b;")
+    outer.addWidget(title_lbl)
+
+    top = QHBoxLayout()
+    top.addWidget(QLabel("Date:"))
+    date_edit = QDateEdit(QDate.currentDate())
+    date_edit.setDisplayFormat("dd/MM/yyyy")
+    date_edit.setCalendarPopup(True)
+    date_edit.setMinimumWidth(130)
+    if prefill_hdr and prefill_hdr.get("date"):
+        d = prefill_hdr["date"].split("/")
+        date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
+    top.addWidget(date_edit)
+    top.addSpacing(16)
+    top.addWidget(QLabel("Notes:"))
+    notes_edit = QLineEdit(prefill_hdr.get("notes", "") if prefill_hdr else "")
+    notes_edit.setPlaceholderText("Description / reason (required)")
+    top.addWidget(notes_edit, stretch=1)
+    outer.addLayout(top)
+
+    # Column headers
+    hdr_row = QHBoxLayout()
+    hdr_row.setSpacing(4)
+    for txt, w, style in [
+        ("Party Type", 120, "color:#475569; font-weight:bold; font-size:9pt;"),
+        ("Party / Account", None, "color:#475569; font-weight:bold; font-size:9pt;"),
+        ("Debit (PKR)", 110, "color:#dc2626; font-weight:bold; font-size:9pt;"),
+        ("Credit (PKR)", 110, "color:#16a34a; font-weight:bold; font-size:9pt;"),
+    ]:
+        lbl = QLabel(txt)
+        lbl.setStyleSheet(style)
+        if w:
+            lbl.setFixedWidth(w)
+        hdr_row.addWidget(lbl, 0 if w else 1)
+    hdr_row.addSpacing(32)
+    outer.addLayout(hdr_row)
+
+    # Scroll area for rows
+    rows_container = QFrame()
+    rows_layout = QVBoxLayout(rows_container)
+    rows_layout.setContentsMargins(0, 0, 0, 0)
+    rows_layout.setSpacing(2)
+
+    scroll = QScrollArea()
+    scroll.setWidget(rows_container)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setMinimumHeight(160)
+    outer.addWidget(scroll, stretch=1)
+
+    line_rows = []
+
+    bal_lbl = QLabel("Enter debit / credit amounts above")
+    bal_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+    bal_lbl.setStyleSheet("color:#94a3b8;")
+
+    def _update_balance():
+        txt, style = _jv_balance_text(line_rows)
+        bal_lbl.setText(txt)
+        bal_lbl.setStyleSheet(style)
+
+    # Add Row button
+    btn_add = QPushButton("+ Add Row")
+    btn_add.setStyleSheet(BTN_SECONDARY)
+    btn_add.setFixedWidth(120)
+    btn_add.clicked.connect(
+        lambda: _build_jv_row(rows_layout, line_rows, _update_balance)
+    )
+    outer.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
+    outer.addWidget(bal_lbl)
+
+    # Seed rows
+    if prefill_lines:
+        for ln in prefill_lines:
+            _build_jv_row(rows_layout, line_rows, _update_balance,
+                          ln["party_type"], ln["party_id"],
+                          ln["debit"], ln["credit"])
+    else:
+        _build_jv_row(rows_layout, line_rows, _update_balance)
+        _build_jv_row(rows_layout, line_rows, _update_balance)
+
+    return date_edit, notes_edit, line_rows, bal_lbl, rows_layout
+
+
+class JVFormDialog(QDialog):
+    """Create a new multi-line Journal Voucher."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._je = je_dict
-        vnum = je_dict["jv_number"]
-        self.setWindowTitle(f"Edit Journal Entry — {vnum}")
-        self.setMinimumWidth(500)
-        self.resize(520, 280)
+        self.setWindowTitle("New Journal Voucher")
+        self.setMinimumWidth(720)
+        self.setMinimumHeight(500)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 16)
+        outer.setSpacing(10)
 
-        lbl = QLabel(f"Edit JV — {vnum}")
-        lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        lbl.setStyleSheet("color:#1e293b;")
-        layout.addWidget(lbl)
-
-        g = QHBoxLayout()
-        g.setSpacing(10)
-        lbl_d = QLabel("Date:")
-        lbl_d.setFixedWidth(110)
-        g.addWidget(lbl_d)
-        self.date_edit = QDateEdit()
-        self.date_edit.setDisplayFormat("dd/MM/yyyy")
-        self.date_edit.setCalendarPopup(True)
-        self.date_edit.setMinimumWidth(140)
-        d = je_dict["date"].split("/")
-        self.date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
-        g.addWidget(self.date_edit)
-        g.addStretch()
-        layout.addLayout(g)
-
-        g2 = QHBoxLayout()
-        g2.setSpacing(10)
-        lbl_a = QLabel("Amount (PKR):")
-        lbl_a.setFixedWidth(110)
-        g2.addWidget(lbl_a)
-        self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setRange(0.01, 9_999_999)
-        self.amount_spin.setDecimals(0)
-        self.amount_spin.setSingleStep(1000)
-        self.amount_spin.setMinimumWidth(160)
-        self.amount_spin.setValue(float(je_dict["amount"]))
-        g2.addWidget(self.amount_spin)
-        g2.addStretch()
-        layout.addLayout(g2)
-
-        g3 = QHBoxLayout()
-        g3.setSpacing(10)
-        lbl_t = QLabel("Type:")
-        lbl_t.setFixedWidth(110)
-        g3.addWidget(lbl_t)
-        self.type_combo = QComboBox()
-        self.type_combo.setMinimumWidth(140)
-        self.type_combo.addItem("Debit", "debit")
-        self.type_combo.addItem("Credit", "credit")
-        if je_dict["type"] == "credit":
-            self.type_combo.setCurrentIndex(1)
-        g3.addWidget(self.type_combo)
-        g3.addStretch()
-        layout.addLayout(g3)
-
-        g4 = QHBoxLayout()
-        g4.setSpacing(10)
-        lbl_n = QLabel("Notes:")
-        lbl_n.setFixedWidth(110)
-        g4.addWidget(lbl_n)
-        self.notes_edit = QLineEdit(je_dict.get("notes") or "")
-        g4.addWidget(self.notes_edit)
-        layout.addLayout(g4)
-
-        info = QLabel("⚠ This edits the journal entry for this party only.")
-        info.setStyleSheet("color:#d97706; font-size:9pt;")
-        layout.addWidget(info)
+        self._date_edit, self._notes_edit, self._line_rows, self._bal_lbl, _ = \
+            _build_jv_form_body(self, outer, "New Journal Voucher")
 
         btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
         )
         btns.accepted.connect(self._save)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        outer.addWidget(btns)
 
     def _save(self):
-        date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        amount = self.amount_spin.value()
-        entry_type = self.type_combo.currentData()
-        notes = self.notes_edit.text().strip()
+        notes = self._notes_edit.text().strip()
+        if not notes:
+            QMessageBox.warning(self, "Validation", "Description / notes are required.")
+            return
         try:
-            db_update_journal_entry(self._je["id"], date_str, amount, entry_type, notes)
+            lines = _jv_collect_lines(self._line_rows)
+        except ValueError as ex:
+            QMessageBox.warning(self, "Validation", str(ex))
+            return
+        date_str = self._date_edit.date().toString("dd/MM/yyyy")
+        try:
+            from database import db_save_journal_voucher
+            jv_num = db_save_journal_voucher(date_str, notes, lines)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
-        QMessageBox.information(self, "Saved", f"{self._je['jv_number']} updated.")
+        QMessageBox.information(self, "Saved", f"Journal Voucher {jv_num} saved.")
         self.accept()
+
+
+class JVEditDialog(QDialog):
+    """
+    View / edit a journal voucher.
+    is_legacy=True  → read-only summary (journal_entries row, cannot be edited).
+    is_legacy=False → full editable form backed by journal_vouchers.
+    """
+    DELETED = 2
+
+    def __init__(self, jv_id, is_legacy, jv_number, parent=None):
+        super().__init__(parent)
+        self._jv_id = jv_id
+        self._is_legacy = is_legacy
+        self._jv_number = jv_number
+        self.setStyleSheet(FORM_INPUT_STYLE)
+        if is_legacy:
+            self._build_legacy_ui()
+        else:
+            self._build_edit_ui()
+
+    def _build_legacy_ui(self):
+        self.setWindowTitle(f"Journal Voucher — {self._jv_number} (Legacy)")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        lbl = QLabel(f"Journal Voucher — {self._jv_number}")
+        lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        lbl.setStyleSheet("color:#1e293b;")
+        layout.addWidget(lbl)
+        info = QLabel(
+            "This is a legacy journal entry recorded before the multi-line JV system.\n"
+            "It is read-only and cannot be edited or deleted.\n\n"
+            "Legacy entries remain for historical accuracy."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            "color:#92400e; background:#fef9c3; padding:12px; border-radius:6px;"
+        )
+        layout.addWidget(info)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _build_edit_ui(self):
+        self.setWindowTitle(f"Edit Journal Voucher — {self._jv_number}")
+        self.setMinimumWidth(720)
+        self.setMinimumHeight(500)
+
+        from database import db_load_journal_voucher
+        hdr, lines = db_load_journal_voucher(self._jv_id)
+        if not hdr:
+            layout = QVBoxLayout(self)
+            layout.addWidget(QLabel("Journal voucher not found."))
+            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            btns.rejected.connect(self.reject)
+            layout.addWidget(btns)
+            return
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 16)
+        outer.setSpacing(10)
+
+        self._date_edit, self._notes_edit, self._line_rows, self._bal_lbl, _ = \
+            _build_jv_form_body(
+                self, outer,
+                f"Edit — {self._jv_number}",
+                prefill_hdr=hdr,
+                prefill_lines=lines,
+            )
+
+        btn_row = QHBoxLayout()
+        btn_delete = QPushButton("Delete JV")
+        btn_delete.setStyleSheet("""
+            QPushButton { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5;
+                border-radius:5px; padding:6px 14px; }
+            QPushButton:hover { background:#fecaca; }
+        """)
+        btn_delete.clicked.connect(self._delete)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._save)
+        btns.rejected.connect(self.reject)
+        btn_row.addWidget(btns)
+        outer.addLayout(btn_row)
+
+    def _save(self):
+        notes = self._notes_edit.text().strip()
+        if not notes:
+            QMessageBox.warning(self, "Validation", "Description / notes are required.")
+            return
+        try:
+            lines = _jv_collect_lines(self._line_rows)
+        except ValueError as ex:
+            QMessageBox.warning(self, "Validation", str(ex))
+            return
+        date_str = self._date_edit.date().toString("dd/MM/yyyy")
+        try:
+            from database import db_update_journal_voucher
+            db_update_journal_voucher(self._jv_id, date_str, notes, lines)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+            return
+        QMessageBox.information(self, "Saved", f"{self._jv_number} updated.")
+        self.accept()
+
+    def _delete(self):
+        reply = QMessageBox.question(
+            self, "Delete Journal Voucher",
+            f"Delete {self._jv_number}?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from database import db_delete_journal_voucher
+            db_delete_journal_voucher(self._jv_id)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+            return
+        self.done(self.DELETED)
 
 
 # ── Simple Return Edit Dialog (date + notes only) ─────────────────────────────

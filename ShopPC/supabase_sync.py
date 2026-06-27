@@ -7,7 +7,7 @@ from datetime import datetime
 SUPABASE_URL = "https://amoojyfprkxlfonfokuq.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFtb29qeWZwcmt4bGZvbmZva3VxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTYyNjc1MSwiZXhwIjoyMDk3MjAyNzUxfQ.FOAxKG7bGn1qDaNG7xrKnw-m1O0XCCkw2uUpug7wwEs"
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "united_mobile.db")
 
 
 def _get_conn():
@@ -32,6 +32,8 @@ TABLES = [
     "brands",
     "payments",
     "journal_entries",
+    "journal_vouchers",
+    "journal_voucher_lines",
     "purchase_returns",
     "sale_returns",
     "bank_transactions",
