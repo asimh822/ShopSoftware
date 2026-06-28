@@ -179,24 +179,7 @@ def bs_data() -> dict:
             continue
         total_payables += _party_balance(conn, "supplier", s["id"])
 
-    committee_items = []
-    total_committees = 0.0
-    try:
-        # 'remaining' is not a stored column — committees.py computes it as
-        # max(0, total_amount - monthly_installment * months_paid). Compute the
-        # same here in SQL (SQLite MAX(a,b) is scalar 2-arg max) so committee
-        # liabilities actually appear on the sheet.
-        rows = conn.execute(
-            "SELECT name, "
-            "MAX(total_amount - monthly_installment * months_paid, 0) AS remaining "
-            "FROM committees ORDER BY name"
-        ).fetchall()
-        committee_items = [{"name": r["name"], "remaining": float(r["remaining"] or 0)} for r in rows]
-        total_committees = sum(ci["remaining"] for ci in committee_items)
-    except Exception:
-        pass
-
-    total_liabilities = total_payables + total_committees + total_loan_pay
+    total_liabilities = total_payables + total_loan_pay
 
     capital_items = []
     try:
@@ -226,16 +209,16 @@ def bs_data() -> dict:
             pass
 
     total_capital = sum(ci["balance"] for ci in capital_items)
-    # Retained is the balancing figure (assets - liabilities - capital). Every
-    # P&L movement, including Incentive Income, is captured inside it
-    # automatically. We pull Incentive Income (Other Income) out onto its own
-    # equity line so it is visible, and show the remaining trading result as
-    # Retained Profit/Loss. Splitting one equity figure into two lines keeps the
-    # sheet balanced — the total of the two equals the original retained figure.
+    # Retained is the balancing figure (assets - liabilities - capital).
+    # Incentive Income from JV entries is shown as a separate equity line
+    # and ADDED to retained to arrive at the true total equity.
     retained = total_assets - total_liabilities - total_capital
     incentives = db_incentives_income_total()
-    retained_trading = retained - incentives
-    check = total_liabilities + total_capital + retained_trading + incentives
+    # Incentive income is NOT yet captured in the supplier-balance equity plug
+    # (balance_sheet._party_balance reads journal_entries, not journal_voucher_lines).
+    # So we add it as a separate equity item rather than splitting it out of retained.
+    retained_trading = retained
+    check = total_liabilities + total_capital + retained_trading
 
     conn.close()
     return {
@@ -251,8 +234,6 @@ def bs_data() -> dict:
         "total_assets":      total_assets,
         "total_payables":    total_payables,
         "total_loan_pay":    total_loan_pay,
-        "committee_items":   committee_items,
-        "total_committees":  total_committees,
         "total_liabilities": total_liabilities,
         "capital_items":     capital_items,
         "total_capital":     total_capital,
@@ -497,8 +478,6 @@ class BalanceSheetPage(QWidget):
         self._add_item(lyt, "Suppliers Payable", d["total_payables"], indent=True)
         if d.get("total_loan_pay"):
             self._add_item(lyt, "Other Parties Payable", d["total_loan_pay"], indent=True)
-        if d.get("total_committees"):
-            self._add_item(lyt, "Committees", d["total_committees"], indent=True)
 
         self._add_gap(lyt, 10)
         self._add_grand_total(lyt, "TOTAL LIABILITIES", d["total_liabilities"], "#8b3535")
@@ -587,8 +566,6 @@ class BalanceSheetPage(QWidget):
         rows.append(["Liabilities", "Suppliers Payable", _a(d["total_payables"])])
         if d.get("total_loan_pay"):
             rows.append(["Liabilities", "Other Parties Payable", _a(d["total_loan_pay"])])
-        if d.get("total_committees"):
-            rows.append(["Liabilities", "Committees", _a(d["total_committees"])])
         rows.append(["Liabilities", "TOTAL LIABILITIES", _a(d["total_liabilities"])])
         for ci in d["capital_items"]:
             rows.append(["Capital", ci["name"], _a(ci["balance"])])
@@ -799,8 +776,6 @@ class BalanceSheetPage(QWidget):
         story.append(_indent_row("Suppliers Payable", d["total_payables"]))
         if d.get("total_loan_pay"):
             story.append(_indent_row("Other Parties Payable", d["total_loan_pay"]))
-        if d.get("total_committees"):
-            story.append(_indent_row("Committees", d["total_committees"]))
         story.append(Spacer(1, 6))
         story.append(_grand_row("TOTAL LIABILITIES", d["total_liabilities"], "#8b3535"))
 

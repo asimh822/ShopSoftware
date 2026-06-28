@@ -365,13 +365,21 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines, customer_as_s
     conn.close()
 
 
-def db_update_payment(payment_id, date_str, amount, reference):
+def db_update_payment(payment_id, date_str, amount, reference,
+                      party_type=None, party_id=None):
     """Update a payments record. Ledger recomputes automatically."""
     conn = get_connection()
-    conn.execute(
-        "UPDATE payments SET date=?, amount=?, reference=? WHERE id=?",
-        (date_str, amount, reference or "", payment_id),
-    )
+    if party_type is not None:
+        conn.execute(
+            "UPDATE payments SET date=?, amount=?, reference=?, "
+            "party_type=?, party_id=? WHERE id=?",
+            (date_str, amount, reference or "", party_type, party_id, payment_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE payments SET date=?, amount=?, reference=? WHERE id=?",
+            (date_str, amount, reference or "", payment_id),
+        )
     conn.commit()
     conn.close()
 
@@ -1576,7 +1584,7 @@ class PaymentEditDialog(QDialog):
         vnum  = payment_dict["voucher_number"]
         self.setWindowTitle(f"Edit Payment — {vnum}")
         self.setMinimumWidth(500)
-        self.resize(520, 240)
+        self.resize(520, 380)
         self.setStyleSheet(FORM_INPUT_STYLE)
 
         layout = QVBoxLayout(self)
@@ -1602,6 +1610,43 @@ class PaymentEditDialog(QDialog):
         g.addWidget(self.date_edit)
         g.addStretch()
         layout.addLayout(g)
+
+        # ── Party Type ──────────────────────────────────────────────────────
+        g_pt = QHBoxLayout()
+        g_pt.setSpacing(10)
+        lbl_pt = QLabel("Party Type:")
+        lbl_pt.setFixedWidth(110)
+        g_pt.addWidget(lbl_pt)
+        self.party_type_combo = QComboBox()
+        for _label, _key in [("Supplier", "supplier"), ("Customer", "customer"),
+                              ("Expense",  "expense"),  ("Other Party", "other")]:
+            self.party_type_combo.addItem(_label, _key)
+        cur_ptype = payment_dict.get("party_type", "supplier")
+        for i in range(self.party_type_combo.count()):
+            if self.party_type_combo.itemData(i) == cur_ptype:
+                self.party_type_combo.setCurrentIndex(i)
+                break
+        self.party_type_combo.setMinimumWidth(160)
+        g_pt.addWidget(self.party_type_combo)
+        g_pt.addStretch()
+        layout.addLayout(g_pt)
+
+        # ── Party Name ──────────────────────────────────────────────────────
+        g_pn = QHBoxLayout()
+        g_pn.setSpacing(10)
+        lbl_pn = QLabel("Party:")
+        lbl_pn.setFixedWidth(110)
+        g_pn.addWidget(lbl_pn)
+        self.party_name_combo = QComboBox()
+        self.party_name_combo.setMinimumWidth(240)
+        g_pn.addWidget(self.party_name_combo)
+        g_pn.addStretch()
+        layout.addLayout(g_pn)
+
+        self._refresh_party_names(select_id=payment_dict.get("party_id"))
+        self.party_type_combo.currentIndexChanged.connect(
+            lambda _: self._refresh_party_names()
+        )
 
         g2 = QHBoxLayout()
         g2.setSpacing(10)
@@ -1654,12 +1699,58 @@ class PaymentEditDialog(QDialog):
 
         layout.addLayout(btn_row)
 
+    def _load_party_names(self, party_type: str):
+        conn = get_connection()
+        if party_type == "supplier":
+            rows = conn.execute(
+                "SELECT id, name FROM suppliers WHERE id != 0 ORDER BY name"
+            ).fetchall()
+        elif party_type == "customer":
+            rows = conn.execute(
+                "SELECT id, name FROM customers ORDER BY name"
+            ).fetchall()
+        elif party_type == "expense":
+            rows = conn.execute(
+                "SELECT id, name FROM expense_categories ORDER BY name"
+            ).fetchall()
+        elif party_type == "other":
+            rows = conn.execute(
+                "SELECT id, name FROM other_parties ORDER BY name"
+            ).fetchall()
+        else:
+            rows = []
+        conn.close()
+        return [(r["id"], r["name"]) for r in rows]
+
+    def _refresh_party_names(self, select_id=None):
+        ptype   = self.party_type_combo.currentData()
+        parties = self._load_party_names(ptype)
+        label   = {"supplier": "Supplier", "customer": "Customer",
+                   "expense": "Category", "other": "Party"}.get(ptype, "Party")
+        self.party_name_combo.blockSignals(True)
+        self.party_name_combo.clear()
+        self.party_name_combo.addItem(f"— Select {label} —", None)
+        for pid, pname in parties:
+            self.party_name_combo.addItem(pname, pid)
+        if select_id is not None:
+            for i in range(self.party_name_combo.count()):
+                if self.party_name_combo.itemData(i) == select_id:
+                    self.party_name_combo.setCurrentIndex(i)
+                    break
+        self.party_name_combo.blockSignals(False)
+
     def _save(self):
-        date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        amount = self.amount_spin.value()
-        reference = self.ref_edit.text().strip()
+        date_str   = self.date_edit.date().toString("dd/MM/yyyy")
+        amount     = self.amount_spin.value()
+        reference  = self.ref_edit.text().strip()
+        party_type = self.party_type_combo.currentData()
+        party_id   = self.party_name_combo.currentData()
+        if party_id is None:
+            QMessageBox.warning(self, "Validation", "Please select a party.")
+            return
         try:
-            db_update_payment(self._pay["id"], date_str, amount, reference)
+            db_update_payment(self._pay["id"], date_str, amount, reference,
+                              party_type, party_id)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
@@ -2124,6 +2215,15 @@ def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lin
     )
     outer.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
     outer.addWidget(bal_lbl)
+
+    hint_lbl = QLabel(
+        "Supplier: Debit = reduces balance (you pay them) ↓, Credit = increases balance (you owe more) ↑   |   "
+        "Customer: Debit = increases balance (they owe more) ↑, Credit = reduces balance (they pay you) ↓   |   "
+        "Bank: Debit = money IN ↑, Credit = money OUT ↓"
+    )
+    hint_lbl.setStyleSheet("color:#94a3b8; font-size:9pt;")
+    hint_lbl.setWordWrap(True)
+    outer.addWidget(hint_lbl)
 
     # Seed rows
     if prefill_lines:

@@ -638,26 +638,6 @@ class SettingsPage(QWidget):
         fav.addWidget(btn_fa)
         layout.addWidget(fa_group)
 
-        # ── Committees ────────────────────────────────────────────────────────
-        com_group = QGroupBox("Committees (Comety)")
-        com_group.setStyleSheet(GROUP_STYLE)
-        comv = QVBoxLayout(com_group)
-        comv.setContentsMargins(16, 16, 16, 16)
-        comv.setSpacing(10)
-        com_note = QLabel(
-            "Track committee (comety) obligations. Remaining balances appear "
-            "on the Balance Sheet as liabilities."
-        )
-        com_note.setStyleSheet("color:#64748b; font-size:9pt;")
-        com_note.setWordWrap(True)
-        comv.addWidget(com_note)
-        btn_com = QPushButton("Manage Committees")
-        btn_com.setStyleSheet(BTN_SECONDARY)
-        btn_com.setFixedWidth(200)
-        btn_com.clicked.connect(self._open_committees)
-        comv.addWidget(btn_com)
-        layout.addWidget(com_group)
-
         # ── Year End Closing ──────────────────────────────────────────────────
         ye_group = QGroupBox("Year End Closing")
         ye_group.setStyleSheet(GROUP_STYLE)
@@ -1125,10 +1105,6 @@ class SettingsPage(QWidget):
     def _open_fixed_assets(self):
         from fixed_assets import FixedAssetsDialog
         FixedAssetsDialog(self).exec()
-
-    def _open_committees(self):
-        from committees import CommitteesDialog
-        CommitteesDialog(self).exec()
 
     def _pick_printer(self):
         """Show a dialog listing all installed Windows printers; click one to select it."""

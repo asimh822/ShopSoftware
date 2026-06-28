@@ -21,6 +21,13 @@ from database import (
 # Reuse the unified report export engine (reportlab PDF + csv, folder picker,
 # <ReportName>_DDMMYYYY.<ext>) so ledger exports match every other report.
 from reports import _do_export_pdf, _do_export_csv, _table_to_rows
+from edit_vouchers import (
+    SaleEditDialog, PurchaseEditDialog, SimpleReturnEditDialog,
+    PaymentEditDialog, BankTransactionEditDialog, JVEditDialog,
+    db_lookup_payment, db_lookup_journal_entry,
+    db_lookup_bank_transaction,
+    db_load_sr_for_edit, db_load_pr_for_edit,
+)
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -189,9 +196,9 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
             parts = [f"{qty}x{model}@{price}" for (model, price), qty in counts.items()]
             desc = ", ".join(parts) if parts else "Purchase"
             raw.append({"date": r[1], "voucher": r[2], "desc": desc,
-                        "dr": float(r[3] or 0), "cr": 0.0})
+                        "dr": 0.0, "cr": float(r[3] or 0)})   # Credit: liability ↑
 
-        # Sales to this supplier — CREDIT (reduces balance / they owe us)
+        # Sales to this supplier — Debit (Dr AP: reduces payable, they owe us)
         for r in conn.execute(
             "SELECT sv.id, sv.date, sv.sv_number, sv.total_amount "
             "FROM sale_vouchers sv WHERE sv.supplier_as_customer_id=?",
@@ -208,11 +215,11 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
             parts = [f"{qty}x{model}@{price}" for (model, price), qty in counts.items()]
             desc = "Sale: " + ", ".join(parts) if parts else "Sale to Supplier"
             raw.append({"date": r[1], "voucher": r[2], "desc": desc,
-                        "dr": 0.0, "cr": float(r[3] or 0)})
+                        "dr": float(r[3] or 0), "cr": 0.0})   # Debit: reduces payable
 
-        # Supplier payment directions — DO NOT CHANGE:
-        #   CP (you pay supplier)          → CREDIT  (reduces what you owe them)
-        #   CR (supplier pays / refunds you) → DEBIT  (increases the DR side of their account)
+        # Standard double-entry: Supplier is a Liability.
+        #   CP (pay supplier) → Debit  (liability ↓)
+        #   CR (receive from supplier) → Credit (per convention)
         for r in conn.execute(
             "SELECT date, voucher_number, notes, amount, type "
             "FROM payments WHERE party_type='supplier' AND party_id=?",
@@ -220,10 +227,10 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         ):
             desc = r[2] if r[2] else _payment_default_desc(r[4], "supplier")
             amt  = float(r[3] or 0)
-            if r[4] == "CR":          # cash received FROM supplier → DEBIT
+            if r[4] == "CP":          # cash paid TO supplier → Debit (liability ↓)
                 raw.append({"date": r[0], "voucher": r[1], "desc": desc,
                             "dr": amt, "cr": 0.0})
-            else:                     # CP cash paid TO supplier → CREDIT
+            else:                     # CR received FROM supplier → Credit
                 raw.append({"date": r[0], "voucher": r[1], "desc": desc,
                             "dr": 0.0, "cr": amt})
 
@@ -273,14 +280,21 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
                 raw.append({"date": r[0], "voucher": r[1], "desc": desc,
                             "dr": 0.0, "cr": amt})
 
-    # Legacy journal_entries
+    # Legacy journal_entries.
+    # The old _jv_side() stored type='debit' for what was the "increases balance"
+    # side for suppliers.  Under standard double-entry that side is now Credit
+    # (liability ↑), so invert the mapping for suppliers only.
     for r in conn.execute(
         "SELECT date, jv_number, COALESCE(notes,'Journal Entry'), type, amount "
         "FROM journal_entries WHERE party_type=? AND party_id=?",
         (party_type, party_id),
     ):
-        dr = float(r[4] or 0) if r[3] == "debit" else 0.0
-        cr = float(r[4] or 0) if r[3] == "credit" else 0.0
+        if party_type == "supplier":
+            dr = float(r[4] or 0) if r[3] == "credit" else 0.0
+            cr = float(r[4] or 0) if r[3] == "debit" else 0.0
+        else:
+            dr = float(r[4] or 0) if r[3] == "debit" else 0.0
+            cr = float(r[4] or 0) if r[3] == "credit" else 0.0
         raw.append({"date": r[0], "voucher": r[1], "desc": r[2], "dr": dr, "cr": cr})
 
     # New-style journal_voucher_lines
@@ -300,6 +314,12 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
     # Sort by ISO date then voucher number
     raw.sort(key=lambda e: (_to_iso(e["date"]), e["voucher"]))
 
+    # Supplier is a Liability: positive opening balance = we owe them = Credit.
+    # Negate so the running total is negative when we owe (CR) and positive when
+    # they owe us (DR), consistent with the closing-label logic "DR if > 0 else CR".
+    # Customer/Other keep original sign (positive = they owe us = DR).
+    eff_ob = -ob if party_type == "supplier" else ob
+
     # Build final list with running balance
     if from_iso or to_iso:
         before = [e for e in raw
@@ -308,7 +328,7 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
                     if (not from_iso or _to_iso(e["date"]) >= from_iso)
                     and (not to_iso or _to_iso(e["date"]) <= to_iso)]
 
-        bf = ob + sum(e["dr"] - e["cr"] for e in before)
+        bf = eff_ob + sum(e["dr"] - e["cr"] for e in before)
         result = [{"date": "", "voucher": "", "desc": "Balance B/F",
                    "dr": 0.0, "cr": 0.0, "balance": bf, "is_header": True}]
         running = bf
@@ -316,11 +336,16 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
             running += e["dr"] - e["cr"]
             result.append({**e, "balance": running, "is_header": False})
     else:
+        if party_type == "supplier":
+            ob_dr = 0.0 if ob >= 0 else -ob   # negative ob (they owe us) → DR
+            ob_cr = ob  if ob >= 0 else 0.0   # positive ob (we owe them)  → CR
+        else:
+            ob_dr = ob  if ob >= 0 else 0.0
+            ob_cr = 0.0 if ob >= 0 else -ob
         result = [{"date": "", "voucher": "OB", "desc": "Opening Balance",
-                   "dr": ob if ob >= 0 else 0.0,
-                   "cr": 0.0 if ob >= 0 else -ob,
-                   "balance": ob, "is_header": True}]
-        running = ob
+                   "dr": ob_dr, "cr": ob_cr,
+                   "balance": eff_ob, "is_header": True}]
+        running = eff_ob
         for e in raw:
             running += e["dr"] - e["cr"]
             result.append({**e, "balance": running, "is_header": False})
@@ -1359,14 +1384,35 @@ class BankLedgerWidget(QWidget):
         self.table.doubleClicked.connect(self._edit_bank_entry)
         layout.addWidget(self.table, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
-        footer = QHBoxLayout()
-        footer.addStretch()
+        # ── Totals footer ─────────────────────────────────────────────────────
+        self._bank_footer = QFrame()
+        self._bank_footer.setStyleSheet(
+            "QFrame{border-top:1px solid #e2e8f0; background:transparent;}"
+        )
+        bfl = QHBoxLayout(self._bank_footer)
+        bfl.setContentsMargins(0, 6, 0, 0)
+        bfl.setSpacing(0)
+        _bft = QLabel("Totals:")
+        _bft.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        _bft.setStyleSheet("color:#1e293b;")
+        bfl.addWidget(_bft)
+        bfl.addStretch()
+        self._bank_total_dr = QLabel("")
+        self._bank_total_dr.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._bank_total_dr.setStyleSheet("color:#1e293b;")
+        self._bank_total_dr.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bfl.addWidget(self._bank_total_dr)
+        self._bank_total_cr = QLabel("")
+        self._bank_total_cr.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._bank_total_cr.setStyleSheet("color:#1e293b;")
+        self._bank_total_cr.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bfl.addWidget(self._bank_total_cr)
         self._closing_lbl = QLabel("")
-        self._closing_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._closing_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._closing_lbl.setStyleSheet("color:#1e293b;")
-        footer.addWidget(self._closing_lbl)
-        layout.addLayout(footer)
+        self._closing_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bfl.addWidget(self._closing_lbl)
+        layout.addWidget(self._bank_footer)
 
         self._reload_bank_combo()
 
@@ -1390,6 +1436,8 @@ class BankLedgerWidget(QWidget):
         self.bal_card.setVisible(acc_id is not None)
         self.table.setRowCount(0)
         self._closing_lbl.setText("")
+        self._bank_total_dr.setText("")
+        self._bank_total_cr.setText("")
         if acc_id is not None:
             self._load(acc_id)
 
@@ -1485,6 +1533,35 @@ class BankLedgerWidget(QWidget):
             )
         else:
             self._closing_lbl.setText("")
+        self._update_bank_totals()
+
+    def _update_bank_totals(self):
+        total_dr = 0.0
+        total_cr = 0.0
+        for r in range(self.table.rowCount()):
+            for col in (3, 4):
+                item = self.table.item(r, col)
+                if item and item.text():
+                    try:
+                        v = float(item.text().replace(",", ""))
+                        if col == 3:
+                            total_dr += v
+                        else:
+                            total_cr += v
+                    except ValueError:
+                        pass
+        w3 = max(self.table.columnWidth(3), 110)
+        w4 = max(self.table.columnWidth(4), 110)
+        w5 = max(self.table.columnWidth(5), 180)
+        self._bank_total_dr.setFixedWidth(w3)
+        self._bank_total_cr.setFixedWidth(w4)
+        self._closing_lbl.setFixedWidth(w5)
+        if self.table.rowCount() > 0:
+            self._bank_total_dr.setText(fmt_pkr(total_dr))
+            self._bank_total_cr.setText(fmt_pkr(total_cr))
+        else:
+            self._bank_total_dr.setText("")
+            self._bank_total_cr.setText("")
 
     def _edit_bank_entry(self):
         """Double-click on a bank ledger row — opens edit dialog for CP/CR entries."""
@@ -1498,10 +1575,6 @@ class BankLedgerWidget(QWidget):
         if not voucher or voucher in ("OB", ""):
             return
 
-        from edit_vouchers import (
-            BankTransactionEditDialog, db_lookup_bank_transaction,
-        )
-
         if voucher.startswith("CP-") or voucher.startswith("CR-"):
             tx = db_lookup_bank_transaction(voucher)
             if not tx:
@@ -1511,20 +1584,41 @@ class BankLedgerWidget(QWidget):
             if tx.get("source") == "jv":
                 QMessageBox.information(self, "Journal Entry",
                     f"{voucher} was created as part of a Journal Voucher.\n"
-                    "Edit it from the Journal Voucher (JV) dialog on the Ledger page.")
+                    "Edit it via the JV row in this ledger.")
                 return
             dlg = BankTransactionEditDialog(tx, self)
             result = dlg.exec()
             if result in (QDialog.DialogCode.Accepted, BankTransactionEditDialog.DELETED):
                 self._reload_bank_combo()
+
         elif voucher.startswith("JV-"):
-            QMessageBox.information(self, "Journal Voucher",
-                f"{voucher} is a Journal Voucher entry.\n"
-                "Use the + Journal Voucher button to create new entries.")
+            conn = get_connection()
+            jv_row = conn.execute(
+                "SELECT id FROM journal_vouchers WHERE jv_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if jv_row:
+                dlg = JVEditDialog(jv_row["id"], False, voucher, self)
+                result = dlg.exec()
+                if result in (QDialog.DialogCode.Accepted, JVEditDialog.DELETED):
+                    self._reload_bank_combo()
+            else:
+                QMessageBox.information(self, "Not Found",
+                    f"Journal voucher {voucher} not found.")
+
         elif voucher.startswith("SV-"):
-            QMessageBox.information(self, "Sale Record",
-                f"{voucher} is a sale payment. Edit it from the Sales page.")
-        # Other prefixes: silently ignore
+            conn = get_connection()
+            sv_row = conn.execute(
+                "SELECT id FROM sale_vouchers WHERE sv_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if not sv_row:
+                QMessageBox.information(self, "Not Found", f"Sale {voucher} not found.")
+                return
+            dlg = SaleEditDialog(sv_row["id"], self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._reload_bank_combo()
+        # PV/PR/SR rows are not expected in bank ledger — silently ignore
 
     def refresh(self):
         """Called when switching to bank view — re-loads bank accounts list."""
@@ -1833,13 +1927,35 @@ class LedgerPage(QWidget):
         self.table.doubleClicked.connect(self._edit_ledger_entry)
         layout.addWidget(self.table, stretch=1)
 
-        footer = QHBoxLayout()
-        footer.addStretch()
+        # ── Totals footer ─────────────────────────────────────────────────────
+        self._footer_frame = QFrame()
+        self._footer_frame.setStyleSheet(
+            "QFrame{border-top:1px solid #e2e8f0; background:transparent;}"
+        )
+        fl = QHBoxLayout(self._footer_frame)
+        fl.setContentsMargins(0, 6, 0, 0)
+        fl.setSpacing(0)
+        _ft = QLabel("Totals:")
+        _ft.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        _ft.setStyleSheet("color:#1e293b;")
+        fl.addWidget(_ft)
+        fl.addStretch()
+        self._lbl_total_dr = QLabel("")
+        self._lbl_total_dr.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._lbl_total_dr.setStyleSheet("color:#1e293b;")
+        self._lbl_total_dr.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        fl.addWidget(self._lbl_total_dr)
+        self._lbl_total_cr = QLabel("")
+        self._lbl_total_cr.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._lbl_total_cr.setStyleSheet("color:#1e293b;")
+        self._lbl_total_cr.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        fl.addWidget(self._lbl_total_cr)
         self.closing_label = QLabel("")
-        self.closing_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.closing_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.closing_label.setStyleSheet("color:#1e293b;")
-        footer.addWidget(self.closing_label)
-        layout.addLayout(footer)
+        self.closing_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        fl.addWidget(self.closing_label)
+        layout.addWidget(self._footer_frame)
 
         # ── Bank ledger widget (shown instead of party table when Bank) ───────
         self._bank_widget = BankLedgerWidget(self)
@@ -1863,7 +1979,7 @@ class LedgerPage(QWidget):
         self.ctrl_card.setVisible(is_party)
         self.info_card.setVisible(False)
         self.table.setVisible(is_party)
-        self.closing_label.setVisible(is_party)
+        self._footer_frame.setVisible(is_party)
         self._bank_widget.setVisible(is_bank)
 
         if is_bank:
@@ -1887,6 +2003,8 @@ class LedgerPage(QWidget):
         self._party_name = ""
         self.info_card.setVisible(False)
         self.table.setRowCount(0)
+        self._lbl_total_dr.setText("")
+        self._lbl_total_cr.setText("")
         self.closing_label.setText("")
 
     # ── Party selection ───────────────────────────────────────────────────────
@@ -1897,6 +2015,8 @@ class LedgerPage(QWidget):
             self._party_id = None
             self.info_card.setVisible(False)
             self.table.setRowCount(0)
+            self._lbl_total_dr.setText("")
+            self._lbl_total_cr.setText("")
             self.closing_label.setText("")
             return
         self._party_id   = pid
@@ -1977,8 +2097,6 @@ class LedgerPage(QWidget):
         if not voucher or voucher in ("OB", ""):
             return  # header / opening balance row
 
-        from edit_vouchers import PaymentEditDialog, JVEditDialog, db_lookup_payment, db_lookup_journal_entry
-
         if voucher.startswith("CP-") or voucher.startswith("CR-"):
             pay = db_lookup_payment(voucher)
             if not pay:
@@ -1992,19 +2110,18 @@ class LedgerPage(QWidget):
                 self._load_ledger()
 
         elif voucher.startswith("JV-"):
-            # Check if this is a new-style JV in journal_vouchers first
-            from edit_vouchers import JVEditDialog as _JVEditDialog
             conn = get_connection()
             jv_row = conn.execute(
                 "SELECT id FROM journal_vouchers WHERE jv_number=?", (voucher,)
             ).fetchone()
             conn.close()
             if jv_row:
-                dlg = _JVEditDialog(jv_row["id"], False, voucher, self)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
+                dlg = JVEditDialog(jv_row["id"], False, voucher, self)
+                result = dlg.exec()
+                if result in (QDialog.DialogCode.Accepted, JVEditDialog.DELETED):
+                    self._update_info_card()
                     self._load_ledger()
             else:
-                # Legacy journal_entry
                 je = db_lookup_journal_entry(
                     voucher,
                     party_type=self._party_type,
@@ -2012,19 +2129,80 @@ class LedgerPage(QWidget):
                 )
                 if not je:
                     QMessageBox.information(self, "Not Found",
-                        f"Journal entry {voucher} not found for this party.\n"
-                        "System-generated JVs (from sale/purchase returns) cannot be edited here.")
+                        f"Journal entry {voucher} not found for this party.")
                     return
-                dlg = _JVEditDialog(None, True, voucher, self)
+                dlg = JVEditDialog(None, True, voucher, self)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self._update_info_card()
                     self._load_ledger()
 
-        else:
-            # SV / PV / SR / PR rows — tell user to go to the relevant page
-            QMessageBox.information(self, "Edit Voucher",
-                f"To edit {voucher}, open the "
-                f"{'Sales' if voucher.startswith('SV') else 'Purchase'} page "
-                f"and use the ✏ Edit button.")
+        elif voucher.startswith("SV-"):
+            conn = get_connection()
+            sv_row = conn.execute(
+                "SELECT id FROM sale_vouchers WHERE sv_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if not sv_row:
+                QMessageBox.information(self, "Not Found", f"Sale {voucher} not found.")
+                return
+            dlg = SaleEditDialog(sv_row["id"], self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._update_info_card()
+                self._load_ledger()
+
+        elif voucher.startswith("PV-"):
+            conn = get_connection()
+            pv_row = conn.execute(
+                "SELECT id FROM purchase_vouchers WHERE pv_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if not pv_row:
+                QMessageBox.information(self, "Not Found", f"Purchase {voucher} not found.")
+                return
+            dlg = PurchaseEditDialog(pv_row["id"], self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._update_info_card()
+                self._load_ledger()
+
+        elif voucher.startswith("SR-"):
+            conn = get_connection()
+            sr_row = conn.execute(
+                "SELECT id FROM sale_returns WHERE sr_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if not sr_row:
+                QMessageBox.information(self, "Not Found", f"Sale return {voucher} not found.")
+                return
+            rec = db_load_sr_for_edit(sr_row["id"])
+            if not rec:
+                return
+            dlg = SimpleReturnEditDialog(
+                "sale_return", rec["id"], rec["sr_number"],
+                rec["date"], rec.get("notes", ""), self
+            )
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._update_info_card()
+                self._load_ledger()
+
+        elif voucher.startswith("PR-"):
+            conn = get_connection()
+            pr_row = conn.execute(
+                "SELECT id FROM purchase_returns WHERE pr_number=?", (voucher,)
+            ).fetchone()
+            conn.close()
+            if not pr_row:
+                QMessageBox.information(self, "Not Found", f"Purchase return {voucher} not found.")
+                return
+            rec = db_load_pr_for_edit(pr_row["id"])
+            if not rec:
+                return
+            dlg = SimpleReturnEditDialog(
+                "purchase_return", rec["id"], rec["pr_number"],
+                rec["date"], rec.get("notes", ""), self
+            )
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._update_info_card()
+                self._load_ledger()
 
     def _populate_table(self, entries):
         self._entries_asc = list(entries)   # kept in ascending order for export
@@ -2076,6 +2254,35 @@ class LedgerPage(QWidget):
             )
         else:
             self.closing_label.setText("")
+        self._update_totals()
+
+    def _update_totals(self):
+        total_dr = 0.0
+        total_cr = 0.0
+        for r in range(self.table.rowCount()):
+            for col in (3, 4):
+                item = self.table.item(r, col)
+                if item and item.text():
+                    try:
+                        v = float(item.text().replace(",", ""))
+                        if col == 3:
+                            total_dr += v
+                        else:
+                            total_cr += v
+                    except ValueError:
+                        pass
+        w3 = max(self.table.columnWidth(3), 110)
+        w4 = max(self.table.columnWidth(4), 110)
+        w5 = max(self.table.columnWidth(5), 180)
+        self._lbl_total_dr.setFixedWidth(w3)
+        self._lbl_total_cr.setFixedWidth(w4)
+        self.closing_label.setFixedWidth(w5)
+        if self.table.rowCount() > 0:
+            self._lbl_total_dr.setText(fmt_pkr(total_dr))
+            self._lbl_total_cr.setText(fmt_pkr(total_cr))
+        else:
+            self._lbl_total_dr.setText("")
+            self._lbl_total_cr.setText("")
 
     # ── Inline payment / journal for specific party ───────────────────────────
 

@@ -570,16 +570,6 @@ def _migrate_v5(conn) -> None:
             value REAL NOT NULL DEFAULT 0
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS committees (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            name                TEXT NOT NULL,
-            total_amount        REAL NOT NULL DEFAULT 0,
-            monthly_installment REAL NOT NULL DEFAULT 0,
-            start_date          TEXT NOT NULL,
-            months_paid         INTEGER NOT NULL DEFAULT 0
-        )
-    """)
 
 
 def _migrate_v6(conn) -> None:
@@ -1155,7 +1145,7 @@ def db_all_expenses_combined(from_iso: str = '', to_iso: str = '',
     new_cp = conn.execute(f"""
         SELECT p.voucher_number, p.date,
                COALESCE(ec.name, '?') category,
-               COALESCE(p.notes,'') description,
+               COALESCE(p.reference, p.notes, '') description,
                p.amount, COALESCE(p.payment_method,'cash') payment_method,
                '' bank_name
         FROM payments p
@@ -1494,6 +1484,8 @@ def db_bank_total_balance() -> float:
     + bank portion of sales (bank_amount on sale_vouchers)
     + CP bank transactions  (cash deposited into bank)
     - CR bank transactions  (cash withdrawn from bank)
+    + JVL debit  (money IN via journal voucher)
+    - JVL credit (money OUT via journal voucher)
     """
     conn = get_connection()
     result = conn.execute("""
@@ -1503,6 +1495,16 @@ def db_bank_total_balance() -> float:
                         WHERE bank_account_id IS NOT NULL AND bank_amount > 0), 0)
             + COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE type='CP'), 0)
             - COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE type='CR'), 0)
+            + COALESCE((
+                SELECT SUM(jvl.debit)
+                FROM journal_voucher_lines jvl
+                WHERE jvl.party_type = 'bank'
+            ), 0)
+            - COALESCE((
+                SELECT SUM(jvl.credit)
+                FROM journal_voucher_lines jvl
+                WHERE jvl.party_type = 'bank'
+            ), 0)
     """).fetchone()[0]
     conn.close()
     return float(result or 0.0)
@@ -1887,7 +1889,10 @@ def db_incentives_income_total() -> float:
         "FROM journal_voucher_lines WHERE party_type='incentive_income'"
     ).fetchone()
     conn.close()
-    return base + float(row[0] or 0)
+    # Negate: JVL entries are recorded on the debit side of incentive_income
+    # (Dr Incentive Income in the JV form), so the raw SUM(credit)-SUM(debit)
+    # is negative. Negating produces the correct positive income figure.
+    return -(base + float(row[0] or 0))
 
 
 def db_cash_in_hand() -> float:
