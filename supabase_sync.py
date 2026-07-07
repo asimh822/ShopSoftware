@@ -138,7 +138,19 @@ def run_sync():
             print(f"[Supabase Sync] Error syncing {table}: {e}")
             errors.append(f"{table}: {e}")
 
-    update_last_sync_time(sync_time)
+    # Only advance the watermark when every table succeeded. Advancing it
+    # unconditionally would mean a table that errored this run (e.g. a
+    # missing column, a transient network failure) has its changed rows
+    # permanently skipped on every future sync, since fetch_changed_rows
+    # only picks up rows newer than the watermark. Re-upserting already-
+    # synced tables on the next run is harmless (merge-duplicates).
+    if errors:
+        print(
+            f"[Supabase Sync] {len(errors)} table(s) failed — watermark NOT "
+            f"advanced, all tables will be retried next sync."
+        )
+    else:
+        update_last_sync_time(sync_time)
     summary = ', '.join(synced_tables) if synced_tables else 'none'
     if errors:
         summary += " | ERRORS: " + "; ".join(errors)
