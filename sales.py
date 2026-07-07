@@ -10,7 +10,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate, QTimer, QPoint, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QBrush, QColor, QPainter, QPixmap, QShortcut, QKeySequence
 
-from database import get_connection, db_bank_accounts, db_active_salesmen
+from database import (
+    get_connection, db_bank_accounts, db_active_salesmen,
+    _insert_party_journal_line,
+)
 from widgets import SearchableComboBox
 
 
@@ -285,6 +288,16 @@ def db_load_sales(from_iso=None, to_iso=None, sale_type=None):
         SELECT sv.id, sv.sv_number, sv.date, sv.type,
                COALESCE(c.name, sup_c.name, sv.cash_customer_name) AS customer_name,
                COUNT(sl.id) AS item_count,
+               (SELECT GROUP_CONCAT(x.label, ', ')
+                FROM (
+                    SELECT m2.name || ' (' || COUNT(*) || ')' AS label
+                    FROM sale_lines sl2
+                    JOIN models m2 ON m2.id = sl2.model_id
+                    WHERE sl2.sv_id = sv.id
+                    GROUP BY sl2.model_id
+                    ORDER BY MIN(sl2.id)
+                ) x
+               ) AS models_qty,
                sv.total_amount, sv.discount, sv.note
         FROM sale_vouchers sv
         LEFT JOIN customers c ON c.id = sv.customer_id
@@ -421,20 +434,10 @@ def db_save_sale_return(date_str, customer_id, lines, notes):
 
         # Credit customer: reduce their ledger balance via a journal credit entry
         if customer_id:
-            jv_row = c.execute(
-                "SELECT value FROM settings WHERE key='last_jv_number'"
-            ).fetchone()
-            jv_n = int(jv_row["value"]) + 1 if jv_row else 1
-            c.execute(
-                "UPDATE settings SET value=? WHERE key='last_jv_number'", (str(jv_n),)
-            )
-            jv_number = f"JV-{jv_n:04d}"
-            c.execute(
-                "INSERT INTO journal_entries "
-                "(jv_number, party_type, party_id, date, amount, type, notes) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (jv_number, "customer", customer_id, date_str, total_return,
-                 "credit", f"Sales Return — {sr_number}"),
+            _insert_party_journal_line(
+                c, "customer", customer_id, date_str,
+                debit=0, credit=total_return,
+                notes=f"Sales Return — {sr_number}",
             )
 
         conn.commit()
@@ -1816,17 +1819,20 @@ class SaleListView(QWidget):
         layout.addWidget(filter_card)
 
         self.table = _make_table(
-            ["SV Number", "Date", "Type", "Customer", "Items", "Total (PKR)", "Discount (PKR)"]
+            ["SV Number", "Date", "Type", "Customer", "Model(s)", "Items",
+             "Total (PKR)", "Discount (PKR)"]
         )
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)   # Customer stretches
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)      # Items
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Total (PKR)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)      # Discount (PKR)
-        self.table.setColumnWidth(4, 55)
-        self.table.setColumnWidth(5, 130)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)       # Customer
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)     # Model(s) stretches
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)       # Items
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)       # Total (PKR)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)       # Discount (PKR)
+        self.table.setColumnWidth(3, 150)
+        self.table.setColumnWidth(5, 55)
         self.table.setColumnWidth(6, 130)
+        self.table.setColumnWidth(7, 130)
         self.table.doubleClicked.connect(self._edit_selected)
         self.table.itemSelectionChanged.connect(
             lambda: self.btn_edit.setEnabled(self.table.currentRow() >= 0)
@@ -1874,10 +1880,11 @@ class SaleListView(QWidget):
             type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 2, type_item)
             self.table.setItem(row, 3, QTableWidgetItem(r["customer_name"] or "—"))
+            self.table.setItem(row, 4, QTableWidgetItem(r["models_qty"] or "—"))
             cnt = QTableWidgetItem(str(r["item_count"]))
             cnt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 4, cnt)
-            for col, val in [(5, r["total_amount"]), (6, r["discount"])]:
+            self.table.setItem(row, 5, cnt)
+            for col, val in [(6, r["total_amount"]), (7, r["discount"])]:
                 item = QTableWidgetItem(fmt_pkr(val))
                 item.setTextAlignment(
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter

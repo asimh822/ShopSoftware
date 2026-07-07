@@ -36,6 +36,13 @@ WHATSAPP
 - WhatsApp must be installed on this PC or linked via WhatsApp Web
 - Scan the QR code once from Settings > WhatsApp
 
+SUPABASE SYNC (owner mobile screens)
+--------------------------------------
+- Requires an environment variable: SUPABASE_SERVICE_KEY
+  Windows: System Properties > Advanced > Environment Variables > New (User variable)
+  Get the current key from the Supabase project dashboard (Settings > API > service_role key)
+- Without this variable set, sync silently disables (desktop app still works normally)
+
 MOBILE APP (salesmen)
 ----------------------
 - The API server runs automatically on port 5000 when the app starts

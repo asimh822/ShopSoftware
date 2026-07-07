@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate, QPoint, QTimer, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QBrush, QColor, QShortcut, QKeySequence
 
-from database import get_connection
+from database import get_connection, _insert_party_journal_line
 from widgets import SearchableComboBox
 
 # ── Shared styles (mirrors masters.py) ───────────────────────────────────────
@@ -388,20 +388,10 @@ def db_save_purchase_return(date_str, supplier_id, lines, notes):
             total_return += return_price
 
         # Reduce supplier balance — journal credit means we owe them less
-        jv_row = c.execute(
-            "SELECT value FROM settings WHERE key='last_jv_number'"
-        ).fetchone()
-        jv_n = int(jv_row["value"]) + 1 if jv_row else 1
-        c.execute(
-            "UPDATE settings SET value=? WHERE key='last_jv_number'", (str(jv_n),)
-        )
-        jv_number = f"JV-{jv_n:04d}"
-        c.execute(
-            "INSERT INTO journal_entries "
-            "(jv_number, party_type, party_id, date, amount, type, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, "supplier", supplier_id, date_str, total_return,
-             "credit", f"Purchase Return — {pr_number}"),
+        _insert_party_journal_line(
+            c, "supplier", supplier_id, date_str,
+            debit=total_return, credit=0,
+            notes=f"Purchase Return — {pr_number}",
         )
 
         conn.commit()

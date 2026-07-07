@@ -4,11 +4,25 @@
  *
  * Cash formula matches db_cash_in_hand() in database.py exactly.
  * Bank formula matches db_bank_account_closing_balance() in database.py.
- *   Supplier : opening_balance + Σ purchase_vouchers - Σ payments(CP)
- *   Customer : opening_balance + Σ credit sale_vouchers - Σ payments(CR)
+ * Supplier/customer formulas match _party_closing_balance() in database.py.
+ *   Supplier : opening_balance + Σ purchase_vouchers + Σ payments(CR) - Σ payments(CP)
+ *              + Σ journal_entries(debit) - Σ journal_entries(credit)
+ *              - Σ journal_voucher_lines(debit) + Σ journal_voucher_lines(credit)
+ *              (JVL is INVERTED vs journal_entries for suppliers — Debit reduces
+ *              a liability, Credit increases it; the opposite of journal_entries'
+ *              legacy debit/credit convention)
+ *              - Σ sale_vouchers.total_amount where supplier_as_customer_id = this supplier
+ *   Customer : opening_balance + Σ credit sale_vouchers + Σ payments(CP) - Σ payments(CR)
+ *              + Σ journal_entries(debit) - Σ journal_entries(credit)
+ *              + Σ journal_voucher_lines(debit) - Σ journal_voucher_lines(credit)
+ *              - Σ purchase_vouchers.total_amount where customer_as_supplier_id = this customer
  *   Bank     : opening_balance + Σ sale_vouchers.bank_amount
  *              + Σ bank_transactions.CP - Σ bank_transactions.CR
- *              (CR already includes bank expenses and JV credits)
+ *              + Σ journal_voucher_lines(debit) - Σ journal_voucher_lines(credit)
+ *              (no payments-table term — CP/CR to suppliers/customers is always cash;
+ *              direct bank transfers go through journal_voucher_lines instead)
+ *   Cash     : payments(CR) - payments(CP), regardless of payment_method, plus
+ *              journal_voucher_lines(party_type='cash')
  */
 
 import React, {useState, useEffect, useCallback} from 'react';
@@ -78,17 +92,21 @@ export default function OwnerBalancesScreen() {
         cashJournalLines,
         expensesRows,
         settingsRows,
+        journalEntries,
+        journalVoucherLines,
       ] = await Promise.all([
-        sbGet('suppliers?select=id,name,opening_balance&limit=1000'),
+        sbGet('suppliers?select=id,name,opening_balance&id=neq.0&limit=1000'),
         sbGet('customers?select=id,name,opening_balance&type=eq.credit&limit=1000'),
         sbGet('bank_accounts?select=id,name,opening_balance&limit=200'),
-        sbGet('purchase_vouchers?select=supplier_id,total_amount,purchase_type,cash_amount&limit=10000'),
-        sbGet('sale_vouchers?select=customer_id,total_amount,bank_account_id,bank_amount,cash_paid&limit=10000'),
+        sbGet('purchase_vouchers?select=supplier_id,total_amount,purchase_type,cash_amount,customer_as_supplier_id&limit=10000'),
+        sbGet('sale_vouchers?select=customer_id,total_amount,bank_account_id,bank_amount,cash_paid,supplier_as_customer_id&limit=10000'),
         sbGet('payments?select=party_type,party_id,amount,type&limit=10000'),
         sbGet('bank_transactions?select=type,source,bank_account_id,amount&limit=10000'),
         sbGet('cash_journal_lines?select=direction,amount&limit=10000'),
         sbGet('expenses?select=payment_method,amount&limit=10000'),
         sbGet('settings?select=key,value&key=eq.cash_opening_balance'),
+        sbGet('journal_entries?select=party_type,party_id,amount,type&limit=10000'),
+        sbGet('journal_voucher_lines?select=party_type,party_id,debit,credit&limit=10000'),
       ]);
 
       // Aggregates for supplier/customer balances
@@ -106,13 +124,49 @@ export default function OwnerBalancesScreen() {
         }
       });
 
+      const svBySupplierAsCustomer = {};
+      arr(saleVouchers).forEach(sv => {
+        if (sv.supplier_as_customer_id != null) {
+          svBySupplierAsCustomer[sv.supplier_as_customer_id] =
+            (svBySupplierAsCustomer[sv.supplier_as_customer_id] || 0) + (sv.total_amount || 0);
+        }
+      });
+
+      const pvByCustomerAsSupplier = {};
+      arr(purchaseVouchers).forEach(pv => {
+        if (pv.customer_as_supplier_id != null) {
+          pvByCustomerAsSupplier[pv.customer_as_supplier_id] =
+            (pvByCustomerAsSupplier[pv.customer_as_supplier_id] || 0) + (pv.total_amount || 0);
+        }
+      });
+
       // Supplier balances
       const supplierBalances = arr(suppliers)
         .map(s => {
           const ob = s.opening_balance || 0;
           const pv = pvBySupplier[s.id] || 0;
           const cp = sumPayments(payments, 'supplier', s.id, 'CP');
-          const balance = Math.round((ob + pv - cp) * 100) / 100;
+          const cr = sumPayments(payments, 'supplier', s.id, 'CR');
+          const sac = svBySupplierAsCustomer[s.id] || 0;
+          const jeDebit = arr(journalEntries)
+            .filter(je => je.party_type === 'supplier' && je.party_id === s.id && je.type === 'debit')
+            .reduce((sum, je) => sum + (je.amount || 0), 0);
+          const jeCredit = arr(journalEntries)
+            .filter(je => je.party_type === 'supplier' && je.party_id === s.id && je.type === 'credit')
+            .reduce((sum, je) => sum + (je.amount || 0), 0);
+          const jvlDebit = arr(journalVoucherLines)
+            .filter(jvl => jvl.party_type === 'supplier' && jvl.party_id === s.id)
+            .reduce((sum, jvl) => sum + (jvl.debit || 0), 0);
+          const jvlCredit = arr(journalVoucherLines)
+            .filter(jvl => jvl.party_type === 'supplier' && jvl.party_id === s.id)
+            .reduce((sum, jvl) => sum + (jvl.credit || 0), 0);
+          // NOTE: journal_voucher_lines Dr/Cr is the opposite direction from
+          // jeDebit/jeCredit above for a supplier (liability) — Debit reduces
+          // the balance, Credit increases it. Matches _party_closing_balance()
+          // in database.py exactly.
+          const balance = Math.round(
+            (ob + pv + cr - cp + jeDebit - jeCredit - jvlDebit + jvlCredit - sac) * 100,
+          ) / 100;
           return {id: s.id, name: s.name, balance};
         })
         .filter(s => Math.abs(s.balance) >= 0.01);
@@ -123,7 +177,23 @@ export default function OwnerBalancesScreen() {
           const ob = c.opening_balance || 0;
           const sv = svByCustomer[c.id] || 0;
           const cr = sumPayments(payments, 'customer', c.id, 'CR');
-          const balance = Math.round((ob + sv - cr) * 100) / 100;
+          const cp = sumPayments(payments, 'customer', c.id, 'CP');
+          const cas = pvByCustomerAsSupplier[c.id] || 0;
+          const jeDebit = arr(journalEntries)
+            .filter(je => je.party_type === 'customer' && je.party_id === c.id && je.type === 'debit')
+            .reduce((sum, je) => sum + (je.amount || 0), 0);
+          const jeCredit = arr(journalEntries)
+            .filter(je => je.party_type === 'customer' && je.party_id === c.id && je.type === 'credit')
+            .reduce((sum, je) => sum + (je.amount || 0), 0);
+          const jvlDebit = arr(journalVoucherLines)
+            .filter(jvl => jvl.party_type === 'customer' && jvl.party_id === c.id)
+            .reduce((sum, jvl) => sum + (jvl.debit || 0), 0);
+          const jvlCredit = arr(journalVoucherLines)
+            .filter(jvl => jvl.party_type === 'customer' && jvl.party_id === c.id)
+            .reduce((sum, jvl) => sum + (jvl.credit || 0), 0);
+          const balance = Math.round(
+            (ob + sv + cp - cr + jeDebit - jeCredit + jvlDebit - jvlCredit - cas) * 100,
+          ) / 100;
           return {id: c.id, name: c.name, balance};
         })
         .filter(c => Math.abs(c.balance) >= 0.01);
@@ -146,7 +216,15 @@ export default function OwnerBalancesScreen() {
         const btCR = arr(bankTransactions)
           .filter(bt => bt.bank_account_id === ba.id && bt.type === 'CR')
           .reduce((s, bt) => s + (bt.amount || 0), 0);
-        const balance = Math.round((ob + sales + btCP - btCR) * 100) / 100;
+        const jvlDr = arr(journalVoucherLines)
+          .filter(jvl => jvl.party_type === 'bank' && jvl.party_id === ba.id)
+          .reduce((s, jvl) => s + (jvl.debit || 0), 0);
+        const jvlCr = arr(journalVoucherLines)
+          .filter(jvl => jvl.party_type === 'bank' && jvl.party_id === ba.id)
+          .reduce((s, jvl) => s + (jvl.credit || 0), 0);
+        const balance = Math.round(
+          (ob + sales + btCP - btCR + jvlDr - jvlCr) * 100,
+        ) / 100;
         return {id: ba.id, name: ba.name, balance};
       });
 
@@ -181,12 +259,19 @@ export default function OwnerBalancesScreen() {
       const cashExpenses = arr(expensesRows)
         .filter(e => e.payment_method === 'cash')
         .reduce((s, e) => s + (e.amount || 0), 0);
+      const jvlCashDr = arr(journalVoucherLines)
+        .filter(jvl => jvl.party_type === 'cash')
+        .reduce((s, jvl) => s + (jvl.debit || 0), 0);
+      const jvlCashCr = arr(journalVoucherLines)
+        .filter(jvl => jvl.party_type === 'cash')
+        .reduce((s, jvl) => s + (jvl.credit || 0), 0);
 
       const cashInHand =
         cashOB + cashFromSales + cashPayIn - cashPayOut
         + btCashIn - btCashOut
         + cjlIn - cjlOut
-        - cashPurchases - cashExpenses;
+        - cashPurchases - cashExpenses
+        + jvlCashDr - jvlCashCr;
 
       setBalances({
         suppliers: supplierBalances,

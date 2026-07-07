@@ -518,6 +518,45 @@ def db_profit_report(from_iso=None, to_iso=None):
     return rows
 
 
+def db_brand_profit_report(brand_id=None, from_iso=None, to_iso=None):
+    """
+    Per-IMEI profit for sold stock, filtered by brand and sale date range.
+    Profit = sale_lines.final_price - stock_items.purchase_price.
+
+    Joins from sale_lines -> stock_items via sl.stock_item_id (not the reverse
+    stock_items.sold_line_id) so sales written by older app versions — where
+    sold_line_id was never backfilled — are still included; see the identical
+    note on db_sold_imei_lookup() in sales.py.
+    """
+    de = _date_expr("sv.date")
+    conds, params = [], []
+    if brand_id:
+        conds.append("b.id=?")
+        params.append(brand_id)
+    if from_iso:
+        conds.append(f"{de} >= ?")
+        params.append(from_iso)
+    if to_iso:
+        conds.append(f"{de} <= ?")
+        params.append(to_iso)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    conn = get_connection()
+    rows = conn.execute(f"""
+        SELECT sv.sv_number, sv.date, m.name model, TRIM(si.imei) imei,
+               sl.final_price sold_price, si.purchase_price,
+               (sl.final_price - si.purchase_price) profit
+        FROM sale_lines sl
+        JOIN stock_items si ON si.id = sl.stock_item_id
+        JOIN models m ON m.id = si.model_id
+        JOIN brands b ON b.id = m.brand_id
+        JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        {where}
+        ORDER BY {de}, sv.sv_number
+    """, params).fetchall()
+    conn.close()
+    return rows
+
+
 def db_expenses_by_category(from_iso: str, to_iso: str, category: str = "") -> dict:
     """
     Returns expense totals grouped by category for a date range.
@@ -1489,7 +1528,11 @@ class SalesReportTab(QWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, col, item)
             grand_total += r["total_amount"] or 0
-        self.table.setSortingEnabled(True)
+        # NOTE: deliberately left disabled — re-enabling sorting here makes Qt
+        # immediately re-sort by column 0 (Date) using a raw string compare on
+        # "DD/MM/YYYY", which is not chronological (e.g. "04/07/2026" sorts
+        # before "28/06/2026"). Rows already arrive in correct date order from
+        # the query; leave that order intact.
         n = len(rows)
         self.footer.setText(
             f"{n} sale{'s' if n != 1 else ''}    |    Grand Total: PKR {fmt_pkr(grand_total)}"
@@ -1608,7 +1651,11 @@ class PurchaseReportTab(QWidget):
             amt.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 4, amt)
             grand_total += r["total_amount"] or 0
-        self.table.setSortingEnabled(True)
+        # NOTE: deliberately left disabled — re-enabling sorting here makes Qt
+        # immediately re-sort by column 0 (Date) using a raw string compare on
+        # "DD/MM/YYYY", which is not chronological (e.g. "04/07/2026" sorts
+        # before "28/06/2026"). Rows already arrive in correct date order from
+        # the query; leave that order intact.
         n = len(rows)
         self.footer.setText(
             f"{n} purchase{'s' if n != 1 else ''}    |    Grand Total: PKR {fmt_pkr(grand_total)}"
@@ -1778,7 +1825,10 @@ class ProfitReportTab(QWidget):
             total_cost    += float(r["purchase_price"] or 0)
             total_profit  += float(r["profit"]         or 0)
 
-        self.table.setSortingEnabled(True)
+        # NOTE: deliberately left disabled — re-enabling sorting here makes Qt
+        # immediately re-sort by column 0 (Date Sold) using a raw string compare
+        # on "DD/MM/YYYY", which is not chronological. Rows already arrive in
+        # correct date order from the query; leave that order intact.
 
         # ── Daily breakdown table ─────────────────────────────────────────
         from collections import defaultdict
@@ -1811,7 +1861,10 @@ class ProfitReportTab(QWidget):
             margin_item = QTableWidgetItem(f"{margin:.1f}%")
             margin_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.daily_table.setItem(drow, 5, margin_item)
-        self.daily_table.setSortingEnabled(True)
+        # NOTE: deliberately left disabled — re-enabling sorting here makes Qt
+        # immediately re-sort by column 0 (Date) using a raw string compare on
+        # "DD/MM/YYYY", which is not chronological. Rows already arrive in
+        # correct date order from the query; leave that order intact.
 
         # ── Expenses for the same date range (legacy + new CP payments) ──────
         conn = get_connection()
@@ -2016,6 +2069,139 @@ class _UseButtonDelegate(QStyledItemDelegate):
                 self.clicked.emit(index)
                 return True
         return False
+
+
+class BrandProfitReportTab(QWidget):
+    """
+    Brand-wise Profit report — per-IMEI profit for a selected brand and date
+    range. Profit = sale_lines.final_price - stock_items.purchase_price.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.brand_combo = QComboBox()
+        self.brand_combo.setMinimumWidth(160)
+        self.brand_combo.addItem("All Brands", None)
+        for b in db_brands_list():
+            self.brand_combo.addItem(b["name"], b["id"])
+
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date.setDisplayFormat("dd/MM/yyyy")
+        self.from_date.setCalendarPopup(True)
+
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setDisplayFormat("dd/MM/yyyy")
+        self.to_date.setCalendarPopup(True)
+
+        btn_last_month = QPushButton("Last Month")
+        btn_last_month.setStyleSheet(BTN_SECONDARY)
+        btn_last_month.clicked.connect(self._set_last_month)
+
+        btn_search = QPushButton("Search")
+        btn_search.setStyleSheet(BTN_SECONDARY)
+        btn_search.clicked.connect(self.refresh)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setStyleSheet(BTN_SECONDARY)
+        btn_clear.clicked.connect(self._clear_filters)
+
+        btn_pdf, btn_csv = _make_export_buttons(self)
+        layout.addWidget(_filter_card(
+            QLabel("Brand:"), self.brand_combo,
+            QLabel("From:"), self.from_date,
+            QLabel("To:"), self.to_date,
+            btn_last_month, btn_search, btn_clear, None, btn_pdf, btn_csv,
+        ))
+
+        self.table = _make_table(
+            ["SV Number", "Date", "Model", "IMEI", "Sold Price (PKR)", "Profit (PKR)"]
+        )
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)   # Model stretches
+        layout.addWidget(self.table, stretch=1)
+
+        # Footer summary — same style as SaleListView's footer (sales.py)
+        footer_row = QHBoxLayout()
+        footer_row.addStretch()
+        self._footer_qty_lbl = QLabel("")
+        self._footer_qty_lbl.setStyleSheet(
+            "color:#475569; font-size:10pt; font-weight:bold; padding:4px 16px;"
+        )
+        self._footer_val_lbl = QLabel("")
+        self._footer_val_lbl.setStyleSheet(
+            "color:#1e293b; font-size:11pt; font-weight:bold; padding:4px 16px;"
+        )
+        footer_row.addWidget(self._footer_qty_lbl)
+        footer_row.addWidget(self._footer_val_lbl)
+        layout.addLayout(footer_row)
+
+    def ensure_loaded(self):
+        if not self._loaded:
+            self.refresh()
+            self._loaded = True
+
+    def _set_last_month(self):
+        last_month_date = QDate.currentDate().addMonths(-1)
+        last_month_start = QDate(last_month_date.year(), last_month_date.month(), 1)
+        last_month_end = last_month_start.addDays(last_month_start.daysInMonth() - 1)
+        self.from_date.setDate(last_month_start)
+        self.to_date.setDate(last_month_end)
+        self.refresh()
+
+    def _clear_filters(self):
+        self.brand_combo.setCurrentIndex(0)
+        self.from_date.setDate(QDate.currentDate().addMonths(-1))
+        self.to_date.setDate(QDate.currentDate())
+        self.refresh()
+
+    def refresh(self):
+        brand_id = self.brand_combo.currentData()
+        from_iso = self.from_date.date().toString("yyyy-MM-dd")
+        to_iso   = self.to_date.date().toString("yyyy-MM-dd")
+        rows = db_brand_profit_report(brand_id, from_iso, to_iso)
+
+        self.table.setRowCount(0)
+        total_profit = 0.0
+        for r in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(r["sv_number"]))
+            self.table.setItem(row, 1, QTableWidgetItem(r["date"]))
+            self.table.setItem(row, 2, QTableWidgetItem(r["model"]))
+            self.table.setItem(row, 3, QTableWidgetItem(r["imei"]))
+
+            sold_item = QTableWidgetItem(fmt_pkr(r["sold_price"]))
+            sold_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 4, sold_item)
+
+            profit = float(r["profit"] or 0)
+            profit_item = QTableWidgetItem(fmt_pkr(profit))
+            profit_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            profit_item.setForeground(
+                QBrush(QColor("#16a34a") if profit >= 0 else QColor("#dc2626"))
+            )
+            profit_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            self.table.setItem(row, 5, profit_item)
+
+            total_profit += profit
+
+        n = len(rows)
+        self._footer_qty_lbl.setText(f"{n} item{'s' if n != 1 else ''}")
+        self._footer_val_lbl.setText(f"Total Profit: Rs. {fmt_pkr(total_profit)}")
+
+    def _export_payload(self):
+        headers, rows = _table_to_rows(self.table)
+        brand_name = self.brand_combo.currentText().replace(" ", "_")
+        name = f"Brand_Profit_{brand_name}"
+        title = f"Brand Profit — {self.brand_combo.currentText()}"
+        return (name, title, headers, rows, {4, 5})
 
 
 class ImeiStockTab(QWidget):
@@ -2831,7 +3017,12 @@ class ExpensesReportTab(QWidget):
             ))
             self.detail_table.setItem(row, 6, QTableWidgetItem(d["bank_name"]))
 
-        self.detail_table.setSortingEnabled(True)
+        # NOTE: deliberately left disabled — re-enabling sorting here makes Qt
+        # immediately re-sort by column 0 (Date) using a raw string compare on
+        # "DD/MM/YYYY", which is not chronological (e.g. "04/07/2026" sorts
+        # before "28/06/2026", scattering that day's expenses out of order).
+        # The `detail` list is already sorted chronologically in
+        # db_all_expenses_combined() via an ISO-date sort key; leave it intact.
 
     def _export(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
@@ -2957,7 +3148,7 @@ def db_fifo_aging() -> dict:
     today = datetime.date.today()
 
     fy_row = conn.execute(
-        "SELECT value FROM settings WHERE key='financial_year_start'"
+        "SELECT value FROM settings WHERE key='year_start_date'"
     ).fetchone()
     fy_start = today
     if fy_row and fy_row[0]:
@@ -3038,12 +3229,37 @@ def db_fifo_aging() -> dict:
             else:
                 stream.append([_to_date(r[0]), 0.0, amt])
 
+        # New-style journal_voucher_lines. Standard double-entry Dr/Cr — for a
+        # supplier (liability) Debit REDUCES the balance and Credit INCREASES
+        # it, the opposite of the legacy journal_entries convention above, so
+        # supplier is inverted here. Customer/other use it directly.
+        for r in conn.execute("""
+            SELECT jv.date, jvl.debit, jvl.credit
+            FROM journal_voucher_lines jvl
+            JOIN journal_vouchers jv ON jv.id = jvl.jv_id
+            WHERE jvl.party_type=? AND jvl.party_id=?
+        """, (party_type, party_id)):
+            debit, credit = float(r[1] or 0), float(r[2] or 0)
+            if party_type == "supplier":
+                debit, credit = credit, debit
+            stream.append([_to_date(r[0]), debit, credit])
+
         stream.sort(key=lambda x: x[0])
         return stream
 
     def _fifo_buckets(stream: list):
         open_debits: list = []
+        # A credit/payment with no open debit to apply against yet (e.g. it was
+        # entered before the debit it actually covers, or the party is simply
+        # in advance) is carried forward and offsets the next debit(s) instead
+        # of being discarded — otherwise bucket totals overstate the real
+        # outstanding balance whenever entries arrive slightly out of order.
+        advance_credit = 0.0
         for date, dr, cr in stream:
+            if dr > 0.001 and advance_credit > 0.001:
+                applied = min(dr, advance_credit)
+                dr -= applied
+                advance_credit -= applied
             if dr > 0.001:
                 open_debits.append([date, dr])
             if cr > 0.001:
@@ -3054,6 +3270,8 @@ def db_fifo_aging() -> dict:
                     pay -= applied
                     if open_debits[0][1] < 0.001:
                         open_debits.pop(0)
+                if pay > 0.001:
+                    advance_credit += pay
 
         b0_30 = b31_60 = b61_90 = b90plus = 0.0
         for d0, amt in open_debits:
@@ -4452,6 +4670,7 @@ class ReportsPage(QWidget):
         self._tab_sales        = SalesReportTab()
         self._tab_purchases    = PurchaseReportTab()
         self._tab_profit       = ProfitReportTab()
+        self._tab_brand_profit = BrandProfitReportTab()
         self._tab_cashbook     = CashBookTab()
         self._tab_digest       = DailyDigestTab()
         self._tab_customers    = CustomerInsightsTab()
@@ -4470,6 +4689,7 @@ class ReportsPage(QWidget):
         self.tabs.addTab(self._tab_sales,        "Sales")
         self.tabs.addTab(self._tab_purchases,    "Purchases")
         self.tabs.addTab(self._tab_profit,       "Profit")
+        self.tabs.addTab(self._tab_brand_profit, "Brand Profit")
         self.tabs.addTab(self._tab_cashbook,     "Cash Book")
         self.tabs.addTab(self._tab_digest,       "Daily Digest")
         self.tabs.addTab(self._tab_customers,    "Customer Insights")

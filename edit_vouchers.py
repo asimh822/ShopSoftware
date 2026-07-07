@@ -170,6 +170,17 @@ def db_lookup_payment(voucher_number):
     return dict(row) if row else None
 
 
+def db_lookup_payment_by_id(payment_id):
+    """Look up a payments row by its own primary key — unambiguous even when
+    several parties share the same voucher_number on a multi-line CP/CR."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM payments WHERE id=?", (payment_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def db_lookup_journal_entry(jv_number, party_type=None, party_id=None):
     """Return journal_entries row for this jv_number (optionally filtered by party)."""
     conn = get_connection()

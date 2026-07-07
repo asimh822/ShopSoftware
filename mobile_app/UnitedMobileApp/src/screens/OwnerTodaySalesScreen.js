@@ -1,5 +1,6 @@
 /**
- * OwnerTodaySalesScreen — today's sold items grouped by brand then model.
+ * OwnerTodaySalesScreen — sold items grouped by brand then model, for a
+ * date range and sale-type filter (defaults to today, all types).
  * Data fetched from Supabase: sale_vouchers → sale_lines → models → brands.
  * Pull to refresh.
  */
@@ -10,6 +11,8 @@ import {
   Text,
   StyleSheet,
   FlatList,
+  TextInput,
+  Pressable,
   RefreshControl,
   ActivityIndicator,
 } from 'react-native';
@@ -26,6 +29,13 @@ const COLORS = {
   subtext: '#757575',
   border: '#E0E0E0',
   footerBg: '#263238',
+  chipBg: '#ECEFF1',
+  chipText: '#455A64',
+  chipActiveBg: '#37474F',
+  chipActiveText: '#FFFFFF',
+  inputBg: '#FFFFFF',
+  inputBorder: '#CFD8DC',
+  errorText: '#B71C1C',
 };
 
 const SB_HEADERS = {
@@ -33,13 +43,6 @@ const SB_HEADERS = {
   Authorization: `Bearer ${SUPABASE_KEY}`,
   'Content-Type': 'application/json',
 };
-
-function getTodayDDMMYYYY() {
-  const d = new Date();
-  const dd = String(d.getDate()).padStart(2, '0');
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  return `${dd}/${mm}/${d.getFullYear()}`;
-}
 
 function arr(x) {
   return Array.isArray(x) ? x : [];
@@ -52,6 +55,60 @@ async function sbGet(path) {
   return res.json();
 }
 
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function formatDMY(d) {
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
+
+function formatDM(d) {
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}`;
+}
+
+// sale_vouchers.date is stored/mirrored as DD/MM/YYYY text — parse to a
+// comparable Date rather than doing a raw string gte/lte (which sorts wrong
+// across month boundaries, e.g. "05/07/2026" vs "28/06/2026").
+function parseDDMMYYYY(s) {
+  const [dd, mm, yyyy] = s.split('/').map(Number);
+  return new Date(yyyy, mm - 1, dd);
+}
+
+function startOfDay(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+}
+
+function endOfDay(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+}
+
+function isSameYMD(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function computeRangeLabel(fromDate, toDate) {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+
+  if (isSameYMD(fromDate, today) && isSameYMD(toDate, today)) {
+    return 'Today';
+  }
+  if (isSameYMD(fromDate, yesterday) && isSameYMD(toDate, yesterday)) {
+    return 'Yesterday';
+  }
+  if (isSameYMD(fromDate, monthStart) && isSameYMD(toDate, today)) {
+    return 'This Month';
+  }
+  return `${formatDM(fromDate)} – ${formatDM(toDate)}`;
+}
+
 export default function OwnerTodaySalesScreen({navigation}) {
   const [brands, setBrands] = useState([]);
   const [grandQty, setGrandQty] = useState(0);
@@ -60,19 +117,30 @@ export default function OwnerTodaySalesScreen({navigation}) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
 
+  const [fromDate, setFromDate] = useState(new Date());
+  const [toDate, setToDate] = useState(new Date());
+  const [saleType, setSaleType] = useState('all'); // 'all' | 'cash' | 'credit'
+
+  const [fromText, setFromText] = useState(formatDMY(new Date()));
+  const [toText, setToText] = useState(formatDMY(new Date()));
+  const [dateError, setDateError] = useState('');
+
   const loadData = useCallback(async () => {
     setError('');
     try {
-      const today = getTodayDDMMYYYY();
-      const todayEncoded = encodeURIComponent(today);
-
-      // 1. Today's sale vouchers → sv_ids
-      const svRows = await sbGet(
-        `sale_vouchers?date=eq.${todayEncoded}&select=id`,
-      );
-      const svIds = arr(svRows)
-        .map(r => r.id)
-        .filter(Boolean);
+      // 1. All sale vouchers, filtered client-side by date range + type
+      const allSvRows = await sbGet('sale_vouchers?select=id,date,type&limit=20000');
+      const fromStart = startOfDay(fromDate);
+      const toEnd = endOfDay(toDate);
+      const svRows = arr(allSvRows).filter(r => {
+        if (!r.date) return false;
+        const d = parseDDMMYYYY(r.date);
+        if (isNaN(d.getTime())) return false;
+        const inRange = d >= fromStart && d <= toEnd;
+        const typeOk = saleType === 'all' || r.type === saleType;
+        return inRange && typeOk;
+      });
+      const svIds = svRows.map(r => r.id).filter(Boolean);
 
       if (svIds.length === 0) {
         setBrands([]);
@@ -170,16 +238,73 @@ export default function OwnerTodaySalesScreen({navigation}) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [fromDate, toDate, saleType]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
+  useEffect(() => {
+    if (navigation && navigation.setOptions) {
+      navigation.setOptions({title: computeRangeLabel(fromDate, toDate)});
+    }
+  }, [navigation, fromDate, toDate]);
+
   const onRefresh = () => {
     setRefreshing(true);
     loadData();
   };
+
+  const applyRange = (from, to) => {
+    setDateError('');
+    setFromDate(from);
+    setToDate(to);
+    setFromText(formatDMY(from));
+    setToText(formatDMY(to));
+  };
+
+  const setQuickToday = () => {
+    const t = new Date();
+    applyRange(t, t);
+  };
+
+  const setQuickYesterday = () => {
+    const y = new Date();
+    y.setDate(y.getDate() - 1);
+    applyRange(y, y);
+  };
+
+  const setQuickThisMonth = () => {
+    const now = new Date();
+    const first = new Date(now.getFullYear(), now.getMonth(), 1);
+    applyRange(first, now);
+  };
+
+  const applyManualDates = () => {
+    const from = parseDDMMYYYY(fromText.trim());
+    const to = parseDDMMYYYY(toText.trim());
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+      setDateError('Enter valid dates as DD/MM/YYYY');
+      return;
+    }
+    if (from > to) {
+      setDateError('"From" date must not be after "To" date');
+      return;
+    }
+    setDateError('');
+    setFromDate(from);
+    setToDate(to);
+  };
+
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+  const isToday = isSameYMD(fromDate, today) && isSameYMD(toDate, today);
+  const isYesterday =
+    isSameYMD(fromDate, yesterday) && isSameYMD(toDate, yesterday);
+  const isThisMonth =
+    isSameYMD(fromDate, monthStart) && isSameYMD(toDate, today);
 
   // Flatten brands → [brand_header, model_row, model_row, ...]
   const listData = [];
@@ -211,6 +336,83 @@ export default function OwnerTodaySalesScreen({navigation}) {
     );
   };
 
+  const filterHeader = (
+    <View style={styles.filterCard}>
+      <View style={styles.chipRow}>
+        <Pressable
+          style={[styles.chip, isToday && styles.chipActive]}
+          onPress={setQuickToday}>
+          <Text style={[styles.chipText, isToday && styles.chipTextActive]}>
+            Today
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.chip, isYesterday && styles.chipActive]}
+          onPress={setQuickYesterday}>
+          <Text style={[styles.chipText, isYesterday && styles.chipTextActive]}>
+            Yesterday
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.chip, isThisMonth && styles.chipActive]}
+          onPress={setQuickThisMonth}>
+          <Text
+            style={[styles.chipText, isThisMonth && styles.chipTextActive]}>
+            This Month
+          </Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.dateRow}>
+        <View style={styles.dateField}>
+          <Text style={styles.dateLabel}>From</Text>
+          <TextInput
+            style={styles.dateInput}
+            value={fromText}
+            onChangeText={setFromText}
+            placeholder="DD/MM/YYYY"
+            placeholderTextColor={COLORS.subtext}
+          />
+        </View>
+        <View style={styles.dateField}>
+          <Text style={styles.dateLabel}>To</Text>
+          <TextInput
+            style={styles.dateInput}
+            value={toText}
+            onChangeText={setToText}
+            placeholder="DD/MM/YYYY"
+            placeholderTextColor={COLORS.subtext}
+          />
+        </View>
+        <Pressable style={styles.searchBtn} onPress={applyManualDates}>
+          <Text style={styles.searchBtnText}>Search</Text>
+        </Pressable>
+      </View>
+      {dateError ? <Text style={styles.dateError}>{dateError}</Text> : null}
+
+      <View style={styles.typeRow}>
+        {[
+          {key: 'all', label: 'All'},
+          {key: 'cash', label: 'Cash'},
+          {key: 'credit', label: 'Credit'},
+        ].map(t => (
+          <Pressable
+            key={t.key}
+            style={[styles.typeChip, saleType === t.key && styles.chipActive]}
+            onPress={() => setSaleType(t.key)}>
+            <Text
+              style={[
+                styles.chipText,
+                saleType === t.key && styles.chipTextActive,
+              ]}>
+              {t.label}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+
   if (loading) {
     return (
       <View style={styles.center}>
@@ -237,6 +439,7 @@ export default function OwnerTodaySalesScreen({navigation}) {
             : `model-${item.brand}-${item.model}-${idx}`
         }
         renderItem={renderItem}
+        ListHeaderComponent={filterHeader}
         contentContainerStyle={styles.content}
         refreshControl={
           <RefreshControl
@@ -248,7 +451,7 @@ export default function OwnerTodaySalesScreen({navigation}) {
         ListEmptyComponent={
           <View style={styles.empty}>
             <Text style={styles.emptyIcon}>📋</Text>
-            <Text style={styles.emptyText}>No sales recorded today</Text>
+            <Text style={styles.emptyText}>No sales recorded for this period</Text>
           </View>
         }
       />
@@ -269,6 +472,89 @@ const styles = StyleSheet.create({
   center: {flex: 1, justifyContent: 'center', alignItems: 'center'},
   errorText: {fontSize: 15, color: '#B71C1C'},
   content: {padding: 12, paddingBottom: 80},
+  filterCard: {
+    backgroundColor: COLORS.card,
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 4,
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.06,
+    shadowRadius: 3,
+    shadowOffset: {width: 0, height: 1},
+  },
+  chipRow: {
+    flexDirection: 'row',
+    marginBottom: 10,
+  },
+  chip: {
+    backgroundColor: COLORS.chipBg,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginRight: 8,
+  },
+  chipActive: {
+    backgroundColor: COLORS.chipActiveBg,
+  },
+  chipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.chipText,
+  },
+  chipTextActive: {
+    color: COLORS.chipActiveText,
+  },
+  dateRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+  },
+  dateField: {
+    flex: 1,
+    marginRight: 8,
+  },
+  dateLabel: {
+    fontSize: 11,
+    color: COLORS.subtext,
+    marginBottom: 4,
+  },
+  dateInput: {
+    borderWidth: 1,
+    borderColor: COLORS.inputBorder,
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    fontSize: 13,
+    color: COLORS.brandText,
+    backgroundColor: COLORS.inputBg,
+  },
+  searchBtn: {
+    backgroundColor: COLORS.primary,
+    borderRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  searchBtnText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  dateError: {
+    color: COLORS.errorText,
+    fontSize: 11,
+    marginTop: 6,
+  },
+  typeRow: {
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  typeChip: {
+    backgroundColor: COLORS.chipBg,
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginRight: 8,
+  },
   brandRow: {
     backgroundColor: COLORS.brandBg,
     flexDirection: 'row',

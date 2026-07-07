@@ -1,7 +1,0 @@
-PyQt6
-flask
-flask-cors
-python-escpos
-pillow
-pywhatkit
-pywin32

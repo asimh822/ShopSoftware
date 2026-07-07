@@ -38,7 +38,7 @@ def get_conn():
 
 
 # ── Bootstrap: run all DB migrations, then ensure sessions table exists ──────
-from database import init_db as _init_db
+from database import init_db as _init_db, db_jvl_legacy_equivalent
 _init_db()
 
 
@@ -293,7 +293,8 @@ def api_customers_search():
                 AS balance
             FROM customers c WHERE c.id=?
         """, (customer["id"],)).fetchone()
-        balance = _fmt_pkr(bal_row["balance"]) if bal_row else 0.0
+        jvl_dr, jvl_cr = db_jvl_legacy_equivalent("customer", customer["id"])
+        balance = _fmt_pkr((bal_row["balance"] if bal_row else 0.0) + jvl_dr - jvl_cr)
 
         # Last purchase for this credit customer
         last = conn.execute("""
@@ -376,6 +377,8 @@ def api_suppliers():
                - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='supplier' AND p.party_id=s.id AND p.type='CP'), 0)
                + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='supplier' AND je.party_id=s.id AND je.type='debit'), 0)
                - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='supplier' AND je.party_id=s.id AND je.type='credit'), 0)
+               + COALESCE((SELECT SUM(jvl.credit) FROM journal_voucher_lines jvl WHERE jvl.party_type='supplier' AND jvl.party_id=s.id), 0)
+               - COALESCE((SELECT SUM(jvl.debit) FROM journal_voucher_lines jvl WHERE jvl.party_type='supplier' AND jvl.party_id=s.id), 0)
                AS balance
         FROM suppliers s
         ORDER BY s.name
@@ -407,6 +410,8 @@ def api_customers_list():
                - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
                + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
                - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
+               + COALESCE((SELECT SUM(jvl.debit) FROM journal_voucher_lines jvl WHERE jvl.party_type='customer' AND jvl.party_id=c.id), 0)
+               - COALESCE((SELECT SUM(jvl.credit) FROM journal_voucher_lines jvl WHERE jvl.party_type='customer' AND jvl.party_id=c.id), 0)
                AS balance
         FROM customers c
         WHERE c.type = 'credit'
@@ -934,8 +939,8 @@ def _calc_bank_account_balance(conn, account_id: int) -> float:
       + sale_vouchers.bank_amount  (bank/split sales paid into this account)
       + payments CP (party=bank)   (cash deposited to bank via ledger)
       - payments CR (party=bank)   (cash withdrawn from bank via ledger)
-      + journal_entries debit      (bank DR in JV = bank receives)
-      - journal_entries credit     (bank CR in JV = bank pays)
+      + journal_voucher_lines debit   (bank DR in JV = bank receives)
+      - journal_voucher_lines credit  (bank CR in JV = bank pays)
     """
     ba = conn.execute(
         "SELECT opening_balance FROM bank_accounts WHERE id=?", (account_id,)
@@ -960,19 +965,24 @@ def _calc_bank_account_balance(conn, account_id: int) -> float:
         (account_id,)
     ).fetchone()[0] or 0)
 
-    jv_dr = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
-        "WHERE party_type='bank' AND party_id=? AND type='debit'",
+    # NOTE: 'bank' has never been a legal party_type in journal_entries (its
+    # CHECK constraint only allows supplier/customer/other/expense) — all bank
+    # JV postings live in journal_voucher_lines, standard double-entry (Debit
+    # increases the bank balance, Credit decreases it), matching
+    # db_bank_account_closing_balance in database.py.
+    jvl_dr = float(conn.execute(
+        "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
+        "WHERE party_type='bank' AND party_id=?",
         (account_id,)
     ).fetchone()[0] or 0)
 
-    jv_cr = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM journal_entries "
-        "WHERE party_type='bank' AND party_id=? AND type='credit'",
+    jvl_cr = float(conn.execute(
+        "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
+        "WHERE party_type='bank' AND party_id=?",
         (account_id,)
     ).fetchone()[0] or 0)
 
-    return ob + sales + cp - cr + jv_dr - jv_cr
+    return ob + sales + cp - cr + jvl_dr - jvl_cr
 
 
 def _date_iso_to_dmy(iso_date):
@@ -1183,14 +1193,15 @@ def api_owner_balances():
         bank_accounts_list = []
         for ba in bank_rows:
             balance = _calc_bank_account_balance(conn, ba["id"])
-            # Last transaction: payments + direct bank sales + journal entries
+            # Last transaction: payments + direct bank sales + journal vouchers
             last_iso = conn.execute(f"""
                 SELECT MAX({_DATE_TO_ISO}) FROM (
                     SELECT date FROM payments WHERE party_type='bank' AND party_id=?
                     UNION ALL SELECT date FROM sale_vouchers
                               WHERE bank_account_id=? AND bank_amount > 0
-                    UNION ALL SELECT date FROM journal_entries
-                              WHERE party_type='bank' AND party_id=?
+                    UNION ALL SELECT jv.date FROM journal_voucher_lines jvl
+                              JOIN journal_vouchers jv ON jv.id = jvl.jv_id
+                              WHERE jvl.party_type='bank' AND jvl.party_id=?
                 )
             """, (ba["id"], ba["id"], ba["id"])).fetchone()[0]
             bank_accounts_list.append({

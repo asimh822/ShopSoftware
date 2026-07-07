@@ -80,6 +80,7 @@ export default function OwnerDashboardScreen() {
         payments,
         bankTransactions,
         cashJournalLines,
+        journalVoucherLines,
         bankAccounts,
         expensesRows,
         settingsRows,
@@ -91,6 +92,7 @@ export default function OwnerDashboardScreen() {
         sbGet('payments?select=amount,type&limit=10000'),
         sbGet('bank_transactions?select=type,source,bank_account_id,amount&limit=10000'),
         sbGet('cash_journal_lines?select=direction,amount&limit=10000'),
+        sbGet('journal_voucher_lines?select=party_type,party_id,debit,credit&limit=10000'),
         sbGet('bank_accounts?select=id,opening_balance&limit=100'),
         sbGet('expenses?select=payment_method,amount&limit=10000'),
         sbGet('settings?select=key,value&key=eq.cash_opening_balance'),
@@ -152,16 +154,32 @@ export default function OwnerDashboardScreen() {
       const cashExpenses = arr(expensesRows)
         .filter(e => e.payment_method === 'cash')
         .reduce((s, e) => s + (e.amount || 0), 0);
+      // JV redesign — Dr Cash / Cr Cash lines in journal_voucher_lines
+      const jvlCashDr = arr(journalVoucherLines)
+        .filter(jvl => jvl.party_type === 'cash')
+        .reduce((s, jvl) => s + (jvl.debit || 0), 0);
+      const jvlCashCr = arr(journalVoucherLines)
+        .filter(jvl => jvl.party_type === 'cash')
+        .reduce((s, jvl) => s + (jvl.credit || 0), 0);
 
       const cashInHand =
         cashOB + cashFromSales + cashPayIn - cashPayOut
         + btCashIn - btCashOut
         + cjlIn - cjlOut
-        - cashPurchases - cashExpenses;
+        - cashPurchases - cashExpenses
+        + jvlCashDr - jvlCashCr;
 
-      // ── Bank total — matches db_bank_account_closing_balance() ───────────────
-      // bank_transactions.CP = money into bank ↑, CR = money out of bank ↓
-      // btCR already includes expense bank payments (source='expense') + JV credits
+      // ── Bank total — matches db_bank_account_closing_balance() in database.py ──
+      // opening_balance
+      // + bank sales (sale_vouchers.bank_amount)
+      // + bank_transactions type='CP' (cash deposits into bank, JV debits)
+      // - bank_transactions type='CR' (cash withdrawals, expenses, JV credits)
+      // + journal_voucher_lines debit/credit where party_type='bank' (JV redesign —
+      //   e.g. "Bank transfer to supplier -> Dr Supplier / Cr Bank")
+      // NOTE: the payments table has no bank_account_id/payment_method term in
+      // the desktop formula at all — CP/CR to suppliers/customers are always
+      // cash; direct bank transfers go through journal_voucher_lines instead.
+
       const bankSalesByAcct = {};
       arr(allSaleVouchers).forEach(sv => {
         if (sv.bank_account_id && (sv.bank_amount || 0) > 0) {
@@ -169,6 +187,7 @@ export default function OwnerDashboardScreen() {
             (bankSalesByAcct[sv.bank_account_id] || 0) + (sv.bank_amount || 0);
         }
       });
+
       const bankTotal = arr(bankAccounts).reduce((total, ba) => {
         const ob = ba.opening_balance || 0;
         const sales = bankSalesByAcct[ba.id] || 0;
@@ -178,7 +197,13 @@ export default function OwnerDashboardScreen() {
         const btCR = arr(bankTransactions)
           .filter(bt => bt.bank_account_id === ba.id && bt.type === 'CR')
           .reduce((s, bt) => s + (bt.amount || 0), 0);
-        return total + ob + sales + btCP - btCR;
+        const jvlDr = arr(journalVoucherLines)
+          .filter(jvl => jvl.party_type === 'bank' && jvl.party_id === ba.id)
+          .reduce((s, jvl) => s + (jvl.debit || 0), 0);
+        const jvlCr = arr(journalVoucherLines)
+          .filter(jvl => jvl.party_type === 'bank' && jvl.party_id === ba.id)
+          .reduce((s, jvl) => s + (jvl.credit || 0), 0);
+        return total + ob + sales + btCP - btCR + jvlDr - jvlCr;
       }, 0);
 
       setData({

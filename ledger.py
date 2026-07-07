@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont, QColor, QBrush, QShortcut, QKeySequence
 
 from database import (
     get_connection, db_bank_accounts,
-    db_save_bank_cp_cr, db_save_double_entry_jv,
+    db_save_bank_cp_cr,
     db_income_account,
     db_save_journal_voucher, db_load_journal_voucher,
     db_update_journal_voucher, db_delete_journal_voucher,
@@ -24,7 +24,7 @@ from reports import _do_export_pdf, _do_export_csv, _table_to_rows
 from edit_vouchers import (
     SaleEditDialog, PurchaseEditDialog, SimpleReturnEditDialog,
     PaymentEditDialog, BankTransactionEditDialog, JVEditDialog,
-    db_lookup_payment, db_lookup_journal_entry,
+    db_lookup_payment, db_lookup_payment_by_id, db_lookup_journal_entry,
     db_lookup_bank_transaction,
     db_load_sr_for_edit, db_load_pr_for_edit,
 )
@@ -166,18 +166,18 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CR (cash received from them)  → DEBIT  (you owe them more)
         #   CP (cash paid to them)        → CREDIT (you owe them less)
         for r in conn.execute(
-            "SELECT date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type "
             "FROM payments WHERE party_type='other' AND party_id=?",
             (party_id,),
         ):
-            desc = r[2] if r[2] else _payment_default_desc(r[4], "other")
-            amt  = float(r[3] or 0)
-            if r[4] == "CR":
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": amt, "cr": 0.0})
+            desc = r[3] if r[3] else _payment_default_desc(r[5], "other")
+            amt  = float(r[4] or 0)
+            if r[5] == "CR":
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": amt, "cr": 0.0, "row_id": r[0]})
             else:
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": 0.0, "cr": amt})
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": 0.0, "cr": amt, "row_id": r[0]})
 
     elif party_type == "supplier":
         for r in conn.execute(
@@ -221,18 +221,18 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CP (pay supplier) → Debit  (liability ↓)
         #   CR (receive from supplier) → Credit (per convention)
         for r in conn.execute(
-            "SELECT date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type "
             "FROM payments WHERE party_type='supplier' AND party_id=?",
             (party_id,),
         ):
-            desc = r[2] if r[2] else _payment_default_desc(r[4], "supplier")
-            amt  = float(r[3] or 0)
-            if r[4] == "CP":          # cash paid TO supplier → Debit (liability ↓)
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": amt, "cr": 0.0})
+            desc = r[3] if r[3] else _payment_default_desc(r[5], "supplier")
+            amt  = float(r[4] or 0)
+            if r[5] == "CP":          # cash paid TO supplier → Debit (liability ↓)
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": amt, "cr": 0.0, "row_id": r[0]})
             else:                     # CR received FROM supplier → Credit
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": 0.0, "cr": amt})
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": 0.0, "cr": amt, "row_id": r[0]})
 
     else:  # customer
         for r in conn.execute(
@@ -267,39 +267,41 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CR (cash received FROM customer)  → CREDIT  (reduces what they owe you)
         #   CP (cash paid TO customer)        → DEBIT   (increases what they owe you)
         for r in conn.execute(
-            "SELECT date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type "
             "FROM payments WHERE party_type='customer' AND party_id=?",
             (party_id,),
         ):
-            desc = r[2] if r[2] else _payment_default_desc(r[4], "customer")
-            amt  = float(r[3] or 0)
-            if r[4] == "CP":      # cash paid TO customer → DEBIT
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": amt, "cr": 0.0})
+            desc = r[3] if r[3] else _payment_default_desc(r[5], "customer")
+            amt  = float(r[4] or 0)
+            if r[5] == "CP":      # cash paid TO customer → DEBIT
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": amt, "cr": 0.0, "row_id": r[0]})
             else:                 # CR cash received FROM customer → CREDIT
-                raw.append({"date": r[0], "voucher": r[1], "desc": desc,
-                            "dr": 0.0, "cr": amt})
+                raw.append({"date": r[1], "voucher": r[2], "desc": desc,
+                            "dr": 0.0, "cr": amt, "row_id": r[0]})
 
     # Legacy journal_entries.
     # The old _jv_side() stored type='debit' for what was the "increases balance"
     # side for suppliers.  Under standard double-entry that side is now Credit
     # (liability ↑), so invert the mapping for suppliers only.
     for r in conn.execute(
-        "SELECT date, jv_number, COALESCE(notes,'Journal Entry'), type, amount "
+        "SELECT id, date, jv_number, COALESCE(notes,'Journal Entry'), type, amount "
         "FROM journal_entries WHERE party_type=? AND party_id=?",
         (party_type, party_id),
     ):
         if party_type == "supplier":
-            dr = float(r[4] or 0) if r[3] == "credit" else 0.0
-            cr = float(r[4] or 0) if r[3] == "debit" else 0.0
+            dr = float(r[5] or 0) if r[4] == "credit" else 0.0
+            cr = float(r[5] or 0) if r[4] == "debit" else 0.0
         else:
-            dr = float(r[4] or 0) if r[3] == "debit" else 0.0
-            cr = float(r[4] or 0) if r[3] == "credit" else 0.0
-        raw.append({"date": r[0], "voucher": r[1], "desc": r[2], "dr": dr, "cr": cr})
+            dr = float(r[5] or 0) if r[4] == "debit" else 0.0
+            cr = float(r[5] or 0) if r[4] == "credit" else 0.0
+        raw.append({"date": r[1], "voucher": r[2], "desc": r[3], "dr": dr, "cr": cr,
+                    "row_id": r[0]})
 
     # New-style journal_voucher_lines
     for r in conn.execute("""
-        SELECT jv.date, jv.jv_number, COALESCE(jv.notes,'Journal Entry') AS notes,
+        SELECT jvl.id AS line_id, jv.date, jv.jv_number,
+               COALESCE(jv.notes,'Journal Entry') AS notes,
                jvl.debit, jvl.credit
         FROM journal_voucher_lines jvl
         JOIN journal_vouchers jv ON jv.id = jvl.jv_id
@@ -307,7 +309,8 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
     """, (party_type, party_id)):
         raw.append({"date": r["date"], "voucher": r["jv_number"],
                     "desc": r["notes"],
-                    "dr": float(r["debit"] or 0), "cr": float(r["credit"] or 0)})
+                    "dr": float(r["debit"] or 0), "cr": float(r["credit"] or 0),
+                    "row_id": r["line_id"]})
 
     conn.close()
 
@@ -427,32 +430,6 @@ def db_save_multi_cp_cr(ptype: str, date_str: str, lines: list) -> str:
         raise
     conn.close()
     return voucher
-
-
-def db_save_journal(party_type, party_id, date_str, amount, entry_type, notes):
-    """entry_type = 'debit' or 'credit'."""
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        row = c.execute(
-            "SELECT value FROM settings WHERE key='last_jv_number'"
-        ).fetchone()
-        n = int(row["value"]) + 1 if row else 1
-        c.execute("UPDATE settings SET value=? WHERE key='last_jv_number'", (str(n),))
-        jv_number = f"JV-{n:04d}"
-        c.execute(
-            "INSERT INTO journal_entries "
-            "(jv_number, party_type, party_id, date, amount, type, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, party_type, party_id, date_str, amount, entry_type, notes or ""),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        conn.close()
-        raise
-    conn.close()
-    return jv_number
 
 
 def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
@@ -634,78 +611,6 @@ class PaymentDialog(QDialog):
         )
 
 
-# ── Journal Dialog ────────────────────────────────────────────────────────────
-
-class JournalDialog(QDialog):
-    def __init__(self, party_type, party_name, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Journal Entry — {party_name}")
-        self.setFixedWidth(400)
-
-        form = QFormLayout(self)
-        form.setSpacing(12)
-        form.setContentsMargins(20, 20, 20, 20)
-
-        self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.setDisplayFormat("dd/MM/yyyy")
-        self.date_edit.setCalendarPopup(True)
-        form.addRow("Date:", self.date_edit)
-
-        # Direction radio buttons
-        if party_type == "supplier":
-            dr_label = "Debit (increases what you owe)"
-            cr_label = "Credit (e.g. rebate — reduces what you owe)"
-        elif party_type == "other":
-            dr_label = "Debit (increases what you owe them)"
-            cr_label = "Credit (reduces what you owe them)"
-        else:
-            dr_label = "Debit (increases what they owe)"
-            cr_label = "Credit (reduces what they owe)"
-
-        self.radio_dr = QRadioButton(dr_label)
-        self.radio_cr = QRadioButton(cr_label)
-        self.radio_cr.setChecked(True)
-        form.addRow("Direction:", self.radio_dr)
-        form.addRow("", self.radio_cr)
-
-        self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setRange(0.01, 99_999_999)
-        self.amount_spin.setDecimals(0)
-        self.amount_spin.setSingleStep(500)
-        self.amount_spin.setGroupSeparatorShown(True)
-        self.amount_spin.setPrefix("PKR ")
-        self.amount_spin.lineEdit().returnPressed.connect(
-            lambda: self.amount_spin.focusNextChild())
-        form.addRow("Amount:", self.amount_spin)
-
-        self.notes_edit = QLineEdit()
-        self.notes_edit.setPlaceholderText("Reason / description")
-        self.notes_edit.returnPressed.connect(lambda: self.notes_edit.focusNextChild())
-        form.addRow("Notes:", self.notes_edit)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(self._accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
-
-    def _accept(self):
-        if self.amount_spin.value() <= 0:
-            QMessageBox.warning(self, "Validation", "Amount must be greater than zero.")
-            return
-        self.accept()
-
-    def get_data(self):
-        entry_type = "debit" if self.radio_dr.isChecked() else "credit"
-        return (
-            self.date_edit.date().toString("dd/MM/yyyy"),
-            self.amount_spin.value(),
-            entry_type,
-            self.notes_edit.text().strip(),
-        )
-
-
 # ── Standalone Voucher Dialogs ────────────────────────────────────────────────
 
 def _style_toggle(btn, active: bool, pos: str):
@@ -750,6 +655,10 @@ class _AmountSpinBox(QDoubleSpinBox):
       2nd Enter — emits new_row_requested so the dialog adds another line
     """
     new_row_requested = pyqtSignal()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        QTimer.singleShot(0, self.selectAll)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -1158,7 +1067,7 @@ class DoubleEntryJournalDialog(QDialog):
         self.dr_combo.setMinimumWidth(200)
         _build_accounts_combo(self.dr_combo)
         dr_col.addWidget(self.dr_combo)
-        self.dr_spin = QDoubleSpinBox()
+        self.dr_spin = _AmountSpinBox()
         self.dr_spin.setRange(0, 99_999_999)
         self.dr_spin.setDecimals(0)
         self.dr_spin.setSingleStep(1000)
@@ -1193,7 +1102,7 @@ class DoubleEntryJournalDialog(QDialog):
         self.cr_combo.setMinimumWidth(200)
         _build_accounts_combo(self.cr_combo)
         cr_col.addWidget(self.cr_combo)
-        self.cr_spin = QDoubleSpinBox()
+        self.cr_spin = _AmountSpinBox()
         self.cr_spin.setRange(0, 99_999_999)
         self.cr_spin.setDecimals(0)
         self.cr_spin.setSingleStep(1000)
@@ -2098,7 +2007,8 @@ class LedgerPage(QWidget):
             return  # header / opening balance row
 
         if voucher.startswith("CP-") or voucher.startswith("CR-"):
-            pay = db_lookup_payment(voucher)
+            row_id = voucher_item.data(Qt.ItemDataRole.UserRole)
+            pay = db_lookup_payment_by_id(row_id) if row_id is not None else None
             if not pay:
                 QMessageBox.information(self, "Not Found",
                     f"Payment record {voucher} not found.")
@@ -2214,7 +2124,7 @@ class LedgerPage(QWidget):
         CR_COLOR  = QColor("#16a34a")
         BAL_FONT  = QFont("Segoe UI", 10, QFont.Weight.Bold)
         closing_balance = entries[-1]["balance"] if entries else 0.0
-        for e in reversed(entries):   # display newest first
+        for e in entries:   # Opening Balance first, most recent last — matches BankLedgerWidget._load
             row = self.table.rowCount()
             self.table.insertRow(row)
             is_hdr = e.get("is_header", False)
@@ -2224,7 +2134,10 @@ class LedgerPage(QWidget):
                 e.get("desc", ""),
                 fmt_pkr(e["dr"]) if e["dr"] else "",
                 fmt_pkr(e["cr"]) if e["cr"] else "",
-                fmt_pkr(e["balance"]),
+                # Magnitude only — direction is already conveyed by the
+                # DR_COLOR/CR_COLOR coloring below, so a running balance never
+                # needs a literal minus sign to read correctly.
+                fmt_pkr(abs(e["balance"])),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -2245,12 +2158,23 @@ class LedgerPage(QWidget):
                     item.setForeground(QBrush(
                         DR_COLOR if bal > 0 else (CR_COLOR if bal < 0 else QColor("#475569"))
                     ))
+                if col == 1:
+                    item.setData(Qt.ItemDataRole.UserRole, e.get("row_id"))
                 self.table.setItem(row, col, item)
         self.table.resizeRowsToContents()
         if entries:
-            dr_cr = "DR" if closing_balance > 0 else "CR"
+            # Suppliers/customers: speak in plain business terms (Payable/
+            # Receivable) instead of raw DR/CR accounting jargon. Note the
+            # value shown is already abs(closing_balance) — never negative —
+            # this only changes the direction WORD, not the number's sign.
+            if self._party_type == "supplier":
+                label = "Payable" if closing_balance <= 0 else "Receivable"
+            elif self._party_type == "customer":
+                label = "Receivable" if closing_balance >= 0 else "Payable"
+            else:
+                label = "DR" if closing_balance > 0 else "CR"
             self.closing_label.setText(
-                f"Closing Balance:  PKR {fmt_pkr(abs(closing_balance))}  {dr_cr}"
+                f"Closing Balance:  PKR {fmt_pkr(abs(closing_balance))}  {label}"
             )
         else:
             self.closing_label.setText("")
@@ -2302,23 +2226,6 @@ class LedgerPage(QWidget):
             return
         QMessageBox.information(self, "Saved", f"Payment recorded as {voucher}.")
         self._update_info_card()
-        self._load_ledger()
-
-    def _add_journal(self):
-        if self._party_id is None:
-            return
-        dlg = JournalDialog(self._party_type, self._party_name, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        date_str, amount, entry_type, notes = dlg.get_data()
-        try:
-            jv = db_save_journal(
-                self._party_type, self._party_id, date_str, amount, entry_type, notes
-            )
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
-            return
-        QMessageBox.information(self, "Saved", f"Journal entry recorded as {jv}.")
         self._load_ledger()
 
     # ── Standalone voucher actions ────────────────────────────────────────────

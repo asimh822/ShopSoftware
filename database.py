@@ -284,6 +284,7 @@ def _run_migrations(conn) -> None:
         15: _migrate_v15,
         16: _migrate_v16,
         17: _migrate_v17,
+        18: _migrate_v18,
     }
 
     current = _get_db_version(conn)
@@ -933,6 +934,54 @@ def _migrate_v17(conn) -> None:
         pass  # column already exists
 
 
+def _migrate_v18(conn) -> None:
+    """
+    Version 18 — Supabase sync support for journal_vouchers / journal_voucher_lines.
+    These tables were added in v16 (JV redesign) but never got the last_modified
+    column + triggers that every other Supabase-synced table has, so
+    supabase_sync.py's "WHERE last_modified > ?" query silently failed for them
+    on every sync (caught by run_sync()'s per-table try/except) — meaning JVs
+    that move money to/from a bank account, supplier, customer, or cash never
+    reached Supabase, and mobile owner balances drifted from desktop.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    for table in ["journal_vouchers", "journal_voucher_lines"]:
+        try:
+            c.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                f"last_modified TEXT DEFAULT '2000-01-01 00:00:01'"
+            )
+        except Exception:
+            pass  # column already exists
+
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_update
+            AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_last_modified_insert
+            AFTER INSERT ON {table}
+            BEGIN
+                UPDATE {table} SET last_modified = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+        """)
+
+        # Backfill existing rows so the next sync pushes all past JVs too
+        c.execute(
+            f"UPDATE {table} SET last_modified = CURRENT_TIMESTAMP "
+            f"WHERE last_modified IS NULL "
+            f"   OR last_modified = '2000-01-01 00:00:01'"
+        )
+
+
 _SUPABASE_SYNC_TABLES = [
     "suppliers", "customers", "bank_accounts", "purchase_vouchers",
     "sale_vouchers", "sale_lines", "stock_items", "models", "brands",
@@ -1544,87 +1593,77 @@ def db_save_bank_cp_cr(tx_type: str, bank_account_id: int,
     return voucher_number
 
 
-def _jv_side(c, jv_number: str, date_str: str, notes: str,
-             acct_type: str, acct_id, amount: float, is_debit: bool):
-    """Insert one side of a double-entry JV into the appropriate table."""
-    if acct_type == "supplier":
-        # Dr Supplier → credit entry (liability ↓)
-        # Cr Supplier → debit entry  (liability ↑)
-        jt = "credit" if is_debit else "debit"
-        c.execute(
-            "INSERT INTO journal_entries "
-            "(jv_number, party_type, party_id, date, amount, type, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, "supplier", acct_id, date_str, amount, jt, notes),
-        )
-    elif acct_type == "customer":
-        # Dr Customer → debit entry  (receivable ↑ — unusual)
-        # Cr Customer → credit entry (receivable ↓ — customer pays)
-        jt = "debit" if is_debit else "credit"
-        c.execute(
-            "INSERT INTO journal_entries "
-            "(jv_number, party_type, party_id, date, amount, type, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, "customer", acct_id, date_str, amount, jt, notes),
-        )
-    elif acct_type == "bank":
-        # Dr Bank → CP (bank ↑)
-        # Cr Bank → CR (bank ↓)
-        bt = "CP" if is_debit else "CR"
-        c.execute(
-            "INSERT INTO bank_transactions "
-            "(voucher_number, type, bank_account_id, source, date, amount, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, bt, acct_id, "jv", date_str, amount, notes),
-        )
-    elif acct_type == "cash":
-        direction = "in" if is_debit else "out"
-        c.execute(
-            "INSERT INTO cash_journal_lines (jv_number, date, amount, direction, notes) "
-            "VALUES (?,?,?,?,?)",
-            (jv_number, date_str, amount, direction, notes),
-        )
-    elif acct_type == "expense":
-        # Dr Expense → expense incurred; Cr Expense → expense reversed/refunded.
-        # Stored in journal_entries so the Expense Report can pick it up.
-        # JV expenses are excluded from the Cash Book (as per system rules).
-        jt = "debit" if is_debit else "credit"
-        c.execute(
-            "INSERT INTO journal_entries "
-            "(jv_number, party_type, party_id, date, amount, type, notes) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (jv_number, "expense", acct_id, date_str, amount, jt, notes),
-        )
-    elif acct_type == "income":
-        # Cr Income → income earned (balance ↑); Dr Income → reversal (balance ↓).
-        # Income has no dated ledger of its own — only a running balance.
-        delta = -amount if is_debit else amount
-        c.execute(
-            "UPDATE income_accounts SET balance = COALESCE(balance, 0) + ? WHERE id=?",
-            (delta, acct_id),
-        )
-
-
-def db_save_double_entry_jv(date_str: str, notes: str,
-                              dr_type: str, dr_id,
-                              cr_type: str, cr_id,
-                              amount: float) -> str:
+def db_jvl_legacy_equivalent(party_type: str, party_id) -> tuple:
     """
-    Save a double-entry Journal Voucher. Both sides recorded atomically.
-    acct_type: 'supplier' | 'customer' | 'bank' | 'cash'
-    Returns the JV number.
+    Sum this party's journal_voucher_lines (the multi-line JV system) and
+    translate the result into the legacy journal_entries sign convention
+    (type='debit'/'credit'), so callers already doing `+ jv_dr - jv_cr` against
+    journal_entries can add this in directly: jv_dr += dr; jv_cr += cr.
+
+    journal_voucher_lines uses standard double-entry Dr/Cr. For a supplier
+    (liability) Debit REDUCES the balance and Credit INCREASES it — the
+    opposite of the legacy convention, so supplier is inverted here.
+    Customer/other use the legacy convention directly (Debit increases what
+    they owe, Credit decreases it), so no inversion.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(debit),0), COALESCE(SUM(credit),0) "
+        "FROM journal_voucher_lines WHERE party_type=? AND party_id=?",
+        (party_type, party_id),
+    ).fetchone()
+    conn.close()
+    jvl_debit, jvl_credit = float(row[0] or 0), float(row[1] or 0)
+    if party_type == "supplier":
+        return jvl_credit, jvl_debit
+    return jvl_debit, jvl_credit
+
+
+def _insert_party_journal_line(c, party_type: str, party_id, date_str: str,
+                                debit: float, credit: float, notes: str) -> str:
+    """
+    Core of db_save_party_journal_line, taking an existing cursor `c` so the
+    caller can include this in its own transaction. See db_save_party_journal_line.
+    """
+    row = c.execute(
+        "SELECT value FROM settings WHERE key='last_jv_number'"
+    ).fetchone()
+    n = int(row["value"]) + 1 if row else 1
+    c.execute("UPDATE settings SET value=? WHERE key='last_jv_number'", (str(n),))
+    jv_number = f"JV-{n:04d}"
+    c.execute(
+        "INSERT INTO journal_vouchers (jv_number, date, notes) VALUES (?,?,?)",
+        (jv_number, date_str, notes or ""),
+    )
+    jv_id = c.lastrowid
+    c.execute(
+        "INSERT INTO journal_voucher_lines "
+        "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+        (jv_id, party_type, party_id, float(debit or 0), float(credit or 0)),
+    )
+    return jv_number
+
+
+def db_save_party_journal_line(party_type: str, party_id, date_str: str,
+                                debit: float, credit: float, notes: str) -> str:
+    """
+    Record a single-sided subsidiary-ledger adjustment (e.g. a sales/purchase
+    return's balance write-down) as a one-line entry in the new JV tables.
+    Unlike db_save_journal_voucher, this does NOT require Dr == Cr — there is
+    no natural contra account for these adjustments, matching the legacy
+    journal_entries behaviour they replace.
+
+    Standalone wrapper (own connection/commit). Call sites that already have
+    an open cursor as part of a larger transaction should use
+    _insert_party_journal_line(c, ...) directly instead, to keep the
+    adjustment atomic with the rest of their save.
     """
     conn = get_connection()
     try:
         c = conn.cursor()
-        row = c.execute(
-            "SELECT value FROM settings WHERE key='last_jv_number'"
-        ).fetchone()
-        n = int(row["value"]) + 1 if row else 1
-        c.execute("UPDATE settings SET value=? WHERE key='last_jv_number'", (str(n),))
-        jv_number = f"JV-{n:04d}"
-        _jv_side(c, jv_number, date_str, notes, dr_type, dr_id, amount, is_debit=True)
-        _jv_side(c, jv_number, date_str, notes, cr_type, cr_id, amount, is_debit=False)
+        jv_number = _insert_party_journal_line(
+            c, party_type, party_id, date_str, debit, credit, notes
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2023,7 +2062,12 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE supplier_as_customer_id=?",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) + float(jvl_dr) - float(jvl_cr) - float(sac)
+        # NOTE: journal_voucher_lines uses standard double-entry Dr/Cr, where for a
+        # supplier (liability) Debit REDUCES the balance and Credit INCREASES it —
+        # the opposite of jv_dr/jv_cr above, which store the legacy convention
+        # directly. See the JV form's own hint text: "Supplier: Debit = reduces
+        # balance, Credit = increases balance".
+        return ob + float(dr) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr) - float(jvl_dr) + float(jvl_cr) - float(sac)
 
     else:  # customer
         # Credit sales → DR (customer owes more)

@@ -15,6 +15,8 @@ import os
 import sqlite3
 from datetime import date
 
+from database import db_jvl_legacy_equivalent, _insert_party_journal_line
+
 # Resolve the DB next to this script (consistent with database.py), so capital
 # works regardless of the process working directory.
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
@@ -496,7 +498,8 @@ class OpeningStockAdjustDialog(QDialog):
                 "WHERE party_type='supplier' AND party_id=? AND type='credit'",
                 (self.supplier_id,)
             ).fetchone()[0])
-            balance = s_ob + pv_total + cr - cp + jv_dr - jv_cr
+            jvl_dr, jvl_cr = db_jvl_legacy_equivalent("supplier", self.supplier_id)
+            balance = s_ob + pv_total + cr - cp + jv_dr + jvl_dr - jv_cr - jvl_cr
 
             if balance <= 0:
                 QMessageBox.information(self, "Already Done",
@@ -549,12 +552,18 @@ class OpeningStockAdjustDialog(QDialog):
 
             # ── Supplier: zero via journal entry (visible in supplier ledger) ──
             jv_num = next_voucher(conn, "last_jv_number", "JV")
+            jv_notes = "Opening stock written off — transferred to investor capital accounts"
             conn.execute(
-                "INSERT INTO journal_entries "
-                "(jv_number, party_type, party_id, date, amount, type, notes) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (jv_num, "supplier", self.supplier_id, today, balance, "credit",
-                 "Opening stock written off — transferred to investor capital accounts")
+                "INSERT INTO journal_vouchers (jv_number, date, notes) VALUES (?,?,?)",
+                (jv_num, today, jv_notes),
+            )
+            jv_id = conn.execute(
+                "SELECT id FROM journal_vouchers WHERE jv_number=?", (jv_num,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO journal_voucher_lines "
+                "(jv_id, party_type, party_id, debit, credit) VALUES (?,?,?,?,?)",
+                (jv_id, "supplier", self.supplier_id, balance, 0),
             )
 
             conn.commit()
@@ -766,8 +775,9 @@ class CapitalPage(QWidget):
                 (sup_id,)
             ).fetchone()[0])
             conn2.close()
+            _jvl_dr, jvl_cr = db_jvl_legacy_equivalent("supplier", sup_id)
             ob = float(supplier["opening_balance"] or 0)
-            sup_balance = ob + pv_total - cp - jv_cr
+            sup_balance = ob + pv_total - cp - jv_cr - jvl_cr
         else:
             sup_balance = 0.0
 

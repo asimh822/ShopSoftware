@@ -9,6 +9,7 @@ import datetime
 from database import (
     get_connection, db_cash_in_hand, db_bank_total_balance, get_setting,
     db_incentives_income_total, db_bank_account_closing_balance,
+    db_jvl_legacy_equivalent,
 )
 
 
@@ -47,7 +48,8 @@ def _party_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='other' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
+        jvl_dr, jvl_cr = db_jvl_legacy_equivalent("other", party_id)
+        return ob + float(cr) - float(cp) + float(jv_dr) + jvl_dr - float(jv_cr) - jvl_cr
 
     if party_type == "supplier":
         purchases = conn.execute(
@@ -74,7 +76,8 @@ def _party_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='supplier' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(purchases) + float(cr) - float(cp) + float(jv_dr) - float(jv_cr)
+        jvl_dr, jvl_cr = db_jvl_legacy_equivalent("supplier", party_id)
+        return ob + float(purchases) + float(cr) - float(cp) + float(jv_dr) + jvl_dr - float(jv_cr) - jvl_cr
     else:
         sales = conn.execute(
             "SELECT COALESCE(SUM(total_amount),0) FROM sale_vouchers "
@@ -101,7 +104,8 @@ def _party_balance(conn, party_type: str, party_id: int) -> float:
             "WHERE party_type='customer' AND party_id=? AND type='credit'",
             (party_id,)
         ).fetchone()[0]
-        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) - float(jv_cr)
+        jvl_dr, jvl_cr = db_jvl_legacy_equivalent("customer", party_id)
+        return ob + float(sales) + float(cp) - float(cr) + float(jv_dr) + jvl_dr - float(jv_cr) - jvl_cr
 
 
 def bs_data() -> dict:

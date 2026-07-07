@@ -1,11 +1,17 @@
 import os
+import sys
 import sqlite3
 import requests
 import json
 from datetime import datetime
 
+# SUPABASE_SERVICE_KEY must be set as a Windows environment variable on the
+# shop PC (System Properties > Environment Variables) — it grants full admin
+# access to the Supabase project and must never be committed to source control.
+# A key was previously hardcoded here; treat it as compromised and rotate it
+# in the Supabase dashboard, then set the env var to the new value.
 SUPABASE_URL = "https://amoojyfprkxlfonfokuq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFtb29qeWZwcmt4bGZvbmZva3VxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTYyNjc1MSwiZXhwIjoyMDk3MjAyNzUxfQ.FOAxKG7bGn1qDaNG7xrKnw-m1O0XCCkw2uUpug7wwEs"
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
@@ -86,11 +92,9 @@ def upsert_to_supabase(table, rows):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     response = requests.post(url, headers=headers, data=json.dumps(rows))
     if response.status_code not in (200, 201):
-        print(
-            f"[Supabase Sync] Upsert error on {table}: "
-            f"{response.status_code} {response.text}"
+        raise RuntimeError(
+            f"Upsert failed ({response.status_code}): {response.text[:200]}"
         )
-        return 0
     return len(rows)
 
 
@@ -113,11 +117,15 @@ def log_sync_to_supabase(tables_synced, rows_pushed):
 
 
 def run_sync():
+    if not SUPABASE_KEY:
+        print("[Supabase Sync] SUPABASE_SERVICE_KEY env var not set — sync skipped.")
+        return
     print(f"[Supabase Sync] Starting sync at {datetime.now().strftime('%H:%M:%S')}")
     since = get_last_sync_time()
     sync_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     total_rows = 0
     synced_tables = []
+    errors = []
 
     for table in TABLES:
         try:
@@ -128,13 +136,21 @@ def run_sync():
                 total_rows += pushed
         except Exception as e:
             print(f"[Supabase Sync] Error syncing {table}: {e}")
+            errors.append(f"{table}: {e}")
 
     update_last_sync_time(sync_time)
-    log_sync_to_supabase(
-        ', '.join(synced_tables) if synced_tables else 'none',
-        total_rows,
-    )
+    summary = ', '.join(synced_tables) if synced_tables else 'none'
+    if errors:
+        summary += " | ERRORS: " + "; ".join(errors)
+    log_sync_to_supabase(summary, total_rows)
     print(
         f"[Supabase Sync] Done. {total_rows} rows pushed "
         f"across {len(synced_tables)} tables."
     )
+    return {"total_rows": total_rows, "tables_synced": synced_tables, "errors": errors}
+
+
+if __name__ == "__main__":
+    _result = run_sync()
+    print("SYNC_RESULT:" + json.dumps(_result))
+    sys.exit(1 if _result["errors"] else 0)

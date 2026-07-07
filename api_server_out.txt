@@ -1,9 +1,0 @@
-Database is up to date - version 13
-======================================================
-  United Mobile EPOS — API Server
-  Database : E:\ShopSoftware\united_mobile.db
-  Listening: http://0.0.0.0:5000
-======================================================
-  Supabase : sync thread started (first run in 30 s)
- * Serving Flask app 'api_server'
- * Debug mode: off

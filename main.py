@@ -3,7 +3,9 @@ import os
 import socket
 import subprocess
 import threading
+import json
 from datetime import date as _date
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QMainWindow,
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
@@ -12,7 +14,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QMessageBox, QTextEdit,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QRegularExpression, QDate
+from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QRegularExpression, QDate, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QRegularExpressionValidator
 
 from database import init_db, check_pin, check_owner_pin
@@ -260,6 +262,10 @@ class Sidebar(QWidget):
         self.lock_btn.setCheckable(False)
         layout.addWidget(self.lock_btn)
 
+        self.sync_btn = NavButton("☁ Sync to Cloud")
+        self.sync_btn.setCheckable(False)
+        layout.addWidget(self.sync_btn)
+
         layout.addStretch()
 
         version = QLabel("v1.0")
@@ -469,7 +475,9 @@ class DashboardPage(QWidget):
                     COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.type='credit'), 0) -
                     COALESCE((SELECT SUM(amount) FROM payments WHERE party_type='customer' AND type='CR'), 0) +
                     COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='debit'), 0) -
-                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='credit'), 0)
+                    COALESCE((SELECT SUM(amount) FROM journal_entries WHERE party_type='customer' AND type='credit'), 0) +
+                    COALESCE((SELECT SUM(debit) FROM journal_voucher_lines WHERE party_type='customer'), 0) -
+                    COALESCE((SELECT SUM(credit) FROM journal_voucher_lines WHERE party_type='customer'), 0)
             """).fetchone()[0]
 
             conn.close()
@@ -1387,6 +1395,11 @@ class VouchersPage(QWidget):
 
 
 class MainWindow(QMainWindow):
+    # Emitted from the sync worker thread — pyqtSignal is thread-safe (queued
+    # connection back to the GUI thread); QTimer.singleShot is NOT, since a
+    # QTimer created on a plain threading.Thread has no event loop to fire it.
+    _sync_finished = pyqtSignal(bool, str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("United Mobile EPOS")
@@ -1443,6 +1456,8 @@ class MainWindow(QMainWindow):
         self.sidebar.duplicate_print_btn.clicked.connect(self._open_duplicate_print)
         self.sidebar.imei_lookup_btn.clicked.connect(self._open_imei_lookup)
         self.sidebar.lock_btn.clicked.connect(self._lock)
+        self.sidebar.sync_btn.clicked.connect(self._run_sync)
+        self._sync_finished.connect(self._on_sync_done)
 
         # Lock overlay — child of central so it can cover sidebar + content.
         # Created last so it sits on top of all siblings; hidden until locked.
@@ -1508,6 +1523,47 @@ class MainWindow(QMainWindow):
         self._notif_bar.show()
         QTimer.singleShot(5000, self._notif_bar.hide)
 
+    def _run_sync(self):
+        self.sidebar.sync_btn.setEnabled(False)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "supabase_sync.py")
+
+        def _worker():
+            try:
+                result = subprocess.run(
+                    [sys.executable, script],
+                    capture_output=True, text=True, timeout=120,
+                )
+                summary = ""
+                for line in result.stdout.splitlines():
+                    if line.startswith("SYNC_RESULT:"):
+                        summary = line[len("SYNC_RESULT:"):]
+                        break
+                if result.returncode == 0 and summary:
+                    data = json.loads(summary)
+                    n_tables = len(data.get("tables_synced", []))
+                    self._sync_finished.emit(True, f"{n_tables} tables")
+                else:
+                    err = result.stderr.strip() or result.stdout.strip() or \
+                        f"sync script exited with code {result.returncode}"
+                    self._sync_finished.emit(False, err)
+            except Exception as ex:
+                self._sync_finished.emit(False, str(ex))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_done(self, success: bool, detail: str):
+        self.sidebar.sync_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(
+                self, "Sync Complete",
+                f"Synced {detail} to Supabase at {datetime.now().strftime('%H:%M')}."
+            )
+        else:
+            QMessageBox.warning(
+                self, "Sync Failed",
+                f"Cloud sync failed:\n\n{detail}"
+            )
+
     def _make_header_bar(self) -> QFrame:
         bar = QFrame()
         bar.setFixedHeight(56)
@@ -1537,7 +1593,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(page)
 
     # Sidebar pages that require the owner PIN before opening.
-    _OWNER_PROTECTED = {"capital", "settings"}
+    _OWNER_PROTECTED = {"capital", "settings", "balance_sheet"}
 
     def _navigate(self, key: str):
         label = dict(NAV_ITEMS).get(key, key.capitalize())

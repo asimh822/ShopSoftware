@@ -19,6 +19,11 @@ import requests
 # Read credentials from supabase_sync.py — key is stored there, not repeated here
 from supabase_sync import SUPABASE_URL, SUPABASE_KEY
 
+if not SUPABASE_KEY:
+    raise SystemExit(
+        "SUPABASE_SERVICE_KEY environment variable is not set — see SETUP.txt."
+    )
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
 HEADERS = {
@@ -31,10 +36,13 @@ ID_TABLES = [
     "sale_vouchers",
     "sale_lines",
     "purchase_vouchers",
-    "purchase_lines",
     "stock_items",
     "payments",
     "journal_entries",
+    "journal_vouchers",
+    "journal_voucher_lines",
+    "purchase_returns",
+    "sale_returns",
     "expenses",
     "bank_transactions",
     "cash_journal_lines",
