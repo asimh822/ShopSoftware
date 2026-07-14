@@ -645,7 +645,7 @@ def db_cash_book(date_str: str) -> dict:
     de_sv  = _de("sv.date")
     de_p   = _de("p.date")
     de_bt  = _de("bt.date")
-    de_cjl = _de("cjl.date")
+    de_jv  = _de("jv.date")
 
     # ── Opening Cash — all cash movements BEFORE iso ──────────────────────
     ob_row = conn.execute(
@@ -666,10 +666,12 @@ def db_cash_book(date_str: str) -> dict:
              f" WHERE bt.type='CP' AND bt.source='cash_transfer' AND {de_bt}<?", (iso,))
         + _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
              f" WHERE bt.type='CR' AND bt.source='cash_transfer' AND {de_bt}<?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(cjl.amount),0) FROM cash_journal_lines cjl"
-             f" WHERE cjl.direction='in' AND {de_cjl}<?", (iso,))
-        - _q(f"SELECT COALESCE(SUM(cjl.amount),0) FROM cash_journal_lines cjl"
-             f" WHERE cjl.direction='out' AND {de_cjl}<?", (iso,))
+        + _q(f"SELECT COALESCE(SUM(jvl.debit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='cash' AND {de_jv}<?", (iso,))
+        - _q(f"SELECT COALESCE(SUM(jvl.credit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='cash' AND {de_jv}<?", (iso,))
         - _q(f"SELECT COALESCE(SUM(pv.cash_amount),0) FROM purchase_vouchers pv"
              f" WHERE pv.purchase_type='cash' AND pv.cash_amount>0 AND {de_pv}<?", (iso,))
         - _q(f"SELECT COALESCE(SUM(e.amount),0) FROM expenses e"

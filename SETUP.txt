@@ -38,10 +38,11 @@ WHATSAPP
 
 SUPABASE SYNC (owner mobile screens)
 --------------------------------------
-- Requires an environment variable: SUPABASE_SERVICE_KEY
-  Windows: System Properties > Advanced > Environment Variables > New (User variable)
-  Get the current key from the Supabase project dashboard (Settings > API > service_role key)
-- Without this variable set, sync silently disables (desktop app still works normally)
+- The Supabase key lives in supabase_key.txt next to the app files.
+  Keep that file in this folder — sync is disabled without it.
+- If the key is ever rotated in the Supabase dashboard, paste the new
+  key into supabase_key.txt (one line, nothing else).
+- Sync runs automatically when the app starts.
 
 MOBILE APP (salesmen)
 ----------------------

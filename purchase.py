@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate, QPoint, QTimer, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QBrush, QColor, QShortcut, QKeySequence
 
-from database import get_connection, _insert_party_journal_line
+from database import get_connection, _insert_party_journal_line, db_remove_stock_item
 from widgets import SearchableComboBox
 
 # ── Shared styles (mirrors masters.py) ───────────────────────────────────────
@@ -383,8 +383,9 @@ def db_save_purchase_return(date_str, supplier_id, lines, notes):
                 "(pr_id, stock_item_id, model_id, imei, return_price) VALUES (?,?,?,?,?)",
                 (pr_id, None, model_id, imei, return_price),
             )
-            # Remove the phone from stock permanently
-            c.execute("DELETE FROM stock_items WHERE id=?", (stock_item_id,))
+            # Remove the phone from stock (reverts to 'sold' state if it has
+            # sale history — see db_remove_stock_item)
+            db_remove_stock_item(c, stock_item_id)
             total_return += return_price
 
         # Reduce supplier balance — journal credit means we owe them less

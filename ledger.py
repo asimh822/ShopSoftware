@@ -166,11 +166,11 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CR (cash received from them)  → DEBIT  (you owe them more)
         #   CP (cash paid to them)        → CREDIT (you owe them less)
         for r in conn.execute(
-            "SELECT id, date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type, reference "
             "FROM payments WHERE party_type='other' AND party_id=?",
             (party_id,),
         ):
-            desc = r[3] if r[3] else _payment_default_desc(r[5], "other")
+            desc = r[3] or r[6] or _payment_default_desc(r[5], "other")
             amt  = float(r[4] or 0)
             if r[5] == "CR":
                 raw.append({"date": r[1], "voucher": r[2], "desc": desc,
@@ -221,11 +221,11 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CP (pay supplier) → Debit  (liability ↓)
         #   CR (receive from supplier) → Credit (per convention)
         for r in conn.execute(
-            "SELECT id, date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type, reference "
             "FROM payments WHERE party_type='supplier' AND party_id=?",
             (party_id,),
         ):
-            desc = r[3] if r[3] else _payment_default_desc(r[5], "supplier")
+            desc = r[3] or r[6] or _payment_default_desc(r[5], "supplier")
             amt  = float(r[4] or 0)
             if r[5] == "CP":          # cash paid TO supplier → Debit (liability ↓)
                 raw.append({"date": r[1], "voucher": r[2], "desc": desc,
@@ -267,11 +267,11 @@ def db_ledger_entries(party_type: str, party_id: int, from_iso=None, to_iso=None
         #   CR (cash received FROM customer)  → CREDIT  (reduces what they owe you)
         #   CP (cash paid TO customer)        → DEBIT   (increases what they owe you)
         for r in conn.execute(
-            "SELECT id, date, voucher_number, notes, amount, type "
+            "SELECT id, date, voucher_number, notes, amount, type, reference "
             "FROM payments WHERE party_type='customer' AND party_id=?",
             (party_id,),
         ):
-            desc = r[3] if r[3] else _payment_default_desc(r[5], "customer")
+            desc = r[3] or r[6] or _payment_default_desc(r[5], "customer")
             amt  = float(r[4] or 0)
             if r[5] == "CP":      # cash paid TO customer → DEBIT
                 raw.append({"date": r[1], "voucher": r[2], "desc": desc,
@@ -749,7 +749,67 @@ class MultiLineCpCrDialog(QDialog):
 
         layout.addWidget(hdr)
 
-        # ── Lines table ──────────────────────────────────────────────────────
+        # ── Entry bar — one line at a time, like the sales/purchase forms ────
+        entry_card = QFrame()
+        entry_card.setStyleSheet(CARD_STYLE)
+        ec = QVBoxLayout(entry_card)
+        ec.setContentsMargins(12, 8, 12, 10)
+        ec.setSpacing(2)
+
+        lbl_row = QHBoxLayout()
+        lbl_row.setSpacing(6)
+        for txt, w in [("Party Type", 128), ("Party Name", None),
+                       ("Reference No.", 150), ("Amount (PKR)", 140)]:
+            lbl = QLabel(txt)
+            lbl.setStyleSheet("color:#475569; font-weight:bold; font-size:9pt;")
+            if w:
+                lbl.setFixedWidth(w)
+            lbl_row.addWidget(lbl, 0 if w else 1)
+        lbl_row.addSpacing(104)      # over the Add Line button
+        ec.addLayout(lbl_row)
+
+        fld_row = QHBoxLayout()
+        fld_row.setSpacing(6)
+
+        self.type_combo = QComboBox()
+        self.type_combo.setFixedWidth(128)
+        for label, key in self._PARTY_LABELS:
+            self.type_combo.addItem(label, key)
+
+        self.name_combo = QComboBox()
+        self.name_combo.setMinimumWidth(180)
+
+        self.ref_edit = QLineEdit()
+        self.ref_edit.setPlaceholderText("Optional")
+        self.ref_edit.setFixedWidth(150)
+
+        self.amount_spin = _AmountSpinBox()
+        self.amount_spin.setRange(0, 99_999_999)
+        self.amount_spin.setDecimals(0)
+        self.amount_spin.setSingleStep(1000)
+        self.amount_spin.setGroupSeparatorShown(True)
+        self.amount_spin.setValue(0)
+        self.amount_spin.setFixedWidth(140)
+        self.amount_spin.new_row_requested.connect(self._add_line)
+
+        btn_add = QPushButton("Add Line  ↵")
+        btn_add.setStyleSheet(BTN_PRIMARY)
+        btn_add.setFixedWidth(104)
+        btn_add.clicked.connect(self._add_line)
+
+        fld_row.addWidget(self.type_combo)
+        fld_row.addWidget(self.name_combo, stretch=1)
+        fld_row.addWidget(self.ref_edit)
+        fld_row.addWidget(self.amount_spin)
+        fld_row.addWidget(btn_add)
+        ec.addLayout(fld_row)
+        layout.addWidget(entry_card)
+
+        self.type_combo.currentIndexChanged.connect(
+            lambda _: self._refresh_names(self.type_combo, self.name_combo)
+        )
+
+        # ── Lines grid — entered lines land here (read-only) ─────────────────
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["#", "Party Type", "Party Name", "Reference No.", "Amount (PKR)", ""]
@@ -771,18 +831,14 @@ class MultiLineCpCrDialog(QDialog):
         self.table.setColumnWidth(1, 128)
         self.table.setColumnWidth(3, 160)
         self.table.setColumnWidth(4, 160)
-        self.table.setColumnWidth(5, 56)
-        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setColumnWidth(5, 40)
         layout.addWidget(self.table, stretch=1)
+        self.table.cellDoubleClicked.connect(self._edit_line)
 
-        # ── Add line button ───────────────────────────────────────────────────
-        add_row = QHBoxLayout()
-        btn_add = QPushButton("+ Add Line")
-        btn_add.setStyleSheet(BTN_SECONDARY)
-        btn_add.clicked.connect(self._add_row)
-        add_row.addWidget(btn_add)
-        add_row.addStretch()
-        layout.addLayout(add_row)
+        hint = QLabel("Enter the line above, press Enter to add it to the grid. "
+                      "Double-click a line to edit it.")
+        hint.setStyleSheet("color:#94a3b8; font-size:9pt;")
+        layout.addWidget(hint)
 
         # ── Footer ───────────────────────────────────────────────────────────
         foot = QHBoxLayout()
@@ -802,68 +858,89 @@ class MultiLineCpCrDialog(QDialog):
         foot.addWidget(btn_save)
         layout.addLayout(foot)
 
-        # Internal state: (type_combo, name_combo, amount_spin) per row
-        self._rows: list[tuple] = []
+        # Internal state: plain line dicts — the grid is rebuilt from this list
+        self._lines: list[dict] = []
 
-        self._add_row()   # start with one empty line
+        self._refresh_names(self.type_combo, self.name_combo)
         # CR defaults to Customer as the most common receipt scenario
-        if ptype == "CR" and self._rows:
-            tc, nc, _, _ = self._rows[0]
-            tc.setCurrentIndex(1)  # Customer is index 1
-            self._refresh_names(tc, nc)
+        if ptype == "CR":
+            self.type_combo.setCurrentIndex(1)  # Customer is index 1
 
-    # ── Row helpers ───────────────────────────────────────────────────────────
+    # ── Line helpers ──────────────────────────────────────────────────────────
 
-    def _add_row(self):
-        r = self.table.rowCount()
-        self.table.insertRow(r)
+    def _add_line(self):
+        party_id = self.name_combo.currentData()
+        amount = self.amount_spin.value()
+        if party_id is None:
+            QMessageBox.warning(self, "Missing", "Select a party first.")
+            self.name_combo.setFocus()
+            return
+        if amount <= 0:
+            QMessageBox.warning(self, "Missing",
+                                "Enter an amount greater than zero.")
+            self.amount_spin.setFocus()
+            return
+        self._lines.append({
+            "party_type": self.type_combo.currentData(),
+            "party_id":   party_id,
+            "party_name": self.name_combo.currentText(),
+            "reference":  self.ref_edit.text().strip(),
+            "amount":     amount,
+        })
+        self._refresh_table()
+        self.name_combo.setCurrentIndex(0)
+        self.ref_edit.clear()
+        self.amount_spin.setValue(0)
+        self.name_combo.setFocus()
 
-        num = QTableWidgetItem(str(r + 1))
-        num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        num.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        self.table.setItem(r, 0, num)
+    def _edit_line(self, row, _col):
+        if not (0 <= row < len(self._lines)):
+            return
+        ln = self._lines.pop(row)
+        self._refresh_table()
+        for i in range(self.type_combo.count()):
+            if self.type_combo.itemData(i) == ln["party_type"]:
+                self.type_combo.setCurrentIndex(i)
+                break
+        self._refresh_names(self.type_combo, self.name_combo)
+        for i in range(self.name_combo.count()):
+            if self.name_combo.itemData(i) == ln["party_id"]:
+                self.name_combo.setCurrentIndex(i)
+                break
+        self.ref_edit.setText(ln["reference"])
+        self.amount_spin.setValue(ln["amount"])
+        self.amount_spin.setFocus()
 
-        type_combo = QComboBox()
-        for label, key in self._PARTY_LABELS:
-            type_combo.addItem(label, key)
+    def _remove_line(self, idx):
+        if 0 <= idx < len(self._lines):
+            self._lines.pop(idx)
+            self._refresh_table()
 
-        name_combo = QComboBox()
-
-        ref_edit = QLineEdit()
-        ref_edit.setPlaceholderText("Optional")
-        ref_edit.returnPressed.connect(lambda re=ref_edit: re.focusNextChild())
-
-        amount_spin = _AmountSpinBox()
-        amount_spin.setRange(0.01, 99_999_999)
-        amount_spin.setDecimals(0)
-        amount_spin.setSingleStep(1000)
-        amount_spin.setGroupSeparatorShown(True)
-        amount_spin.setValue(0)
-        amount_spin.valueChanged.connect(self._update_total)
-        amount_spin.new_row_requested.connect(self._add_row)
-
-        rem_btn = QPushButton("✕")
-        rem_btn.setStyleSheet(
-            "QPushButton{background:#fee2e2;color:#dc2626;border:none;"
-            "border-radius:4px;padding:2px 10px;font-size:11pt;font-weight:bold;}"
-            "QPushButton:hover{background:#fecaca;}"
-        )
-
-        self.table.setCellWidget(r, 1, type_combo)
-        self.table.setCellWidget(r, 2, name_combo)
-        self.table.setCellWidget(r, 3, ref_edit)
-        self.table.setCellWidget(r, 4, amount_spin)
-        self.table.setCellWidget(r, 5, rem_btn)
-
-        self._rows.append((type_combo, name_combo, ref_edit, amount_spin))
-
-        # Use widget identity in closures — avoids stale index captures
-        type_combo.currentIndexChanged.connect(
-            lambda _: self._refresh_names(type_combo, name_combo)
-        )
-        rem_btn.clicked.connect(lambda: self._remove_row(type_combo))
-
-        self._refresh_names(type_combo, name_combo)
+    def _refresh_table(self):
+        self.table.setRowCount(0)
+        for idx, ln in enumerate(self._lines):
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            num = QTableWidgetItem(str(idx + 1))
+            num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 0, num)
+            tlabel = next((lbl for lbl, key in self._PARTY_LABELS
+                           if key == ln["party_type"]), ln["party_type"])
+            self.table.setItem(r, 1, QTableWidgetItem(tlabel))
+            self.table.setItem(r, 2, QTableWidgetItem(ln["party_name"]))
+            self.table.setItem(r, 3, QTableWidgetItem(ln["reference"]))
+            amt = QTableWidgetItem(fmt_pkr(ln["amount"]))
+            amt.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(r, 4, amt)
+            rem_btn = QPushButton("✕")
+            rem_btn.setStyleSheet(
+                "QPushButton{background:#fee2e2;color:#dc2626;border:none;"
+                "border-radius:4px;} QPushButton:hover{background:#fecaca;}"
+            )
+            rem_btn.clicked.connect(lambda _, i=idx: self._remove_line(i))
+            self.table.setCellWidget(r, 5, rem_btn)
+        self._update_total()
 
     def _refresh_names(self, type_combo: QComboBox, name_combo: QComboBox):
         ptype   = type_combo.currentData()
@@ -895,52 +972,25 @@ class MultiLineCpCrDialog(QDialog):
                 name_combo.addItem(f"— No {lbl.lower()}s found —", None)
         name_combo.blockSignals(False)
 
-    def _remove_row(self, type_combo: QComboBox):
-        if len(self._rows) <= 1:
-            QMessageBox.information(self, "Info", "At least one line is required.")
-            return
-        idx = next(
-            (i for i, (tc, _, _, _) in enumerate(self._rows) if tc is type_combo), -1
-        )
-        if idx == -1:
-            return
-        for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 1) is type_combo:
-                self.table.removeRow(r)
-                break
-        self._rows.pop(idx)
-        for i in range(self.table.rowCount()):
-            item = self.table.item(i, 0)
-            if item:
-                item.setText(str(i + 1))
-        self._update_total()
-
     def _update_total(self):
-        total = sum(s.value() for _, _, _, s in self._rows)
+        total = sum(l["amount"] for l in self._lines)
         self._total_lbl.setText(f"Total: PKR {fmt_pkr(total)}")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
     def _save(self):
+        # If a filled-in line is still sitting in the entry bar, add it first
+        # so an Enter-Enter-F9 flow never silently drops the last line.
+        if self.amount_spin.value() > 0 and self.name_combo.currentData() is not None:
+            self._add_line()
+        if not self._lines:
+            QMessageBox.warning(self, "Validation", "Add at least one line first.")
+            return
         date_str = self.date_edit.date().toString("dd/MM/yyyy")
-        lines: list = []
-        for i, (tc, nc, ref_edit, spin) in enumerate(self._rows):
-            party_id = nc.currentData()
-            amount   = spin.value()
-            reference = ref_edit.text().strip()
-            if party_id is None:
-                QMessageBox.warning(
-                    self, "Validation", f"Row {i + 1}: please select a party."
-                )
-                return
-            if amount <= 0:
-                QMessageBox.warning(
-                    self, "Validation",
-                    f"Row {i + 1}: amount must be greater than zero."
-                )
-                return
-            lines.append((tc.currentData(), party_id, amount, reference))
-
+        lines = [
+            (l["party_type"], l["party_id"], l["amount"], l["reference"])
+            for l in self._lines
+        ]
         try:
             self._voucher = db_save_multi_cp_cr(self._ptype, date_str, lines)
         except Exception as ex:
@@ -1016,8 +1066,8 @@ class DoubleEntryJournalDialog(QDialog):
       Cr Customer  → reduces customer balance   (credit entry in customer ledger)
       Dr Bank      → bank balance increases     (bank_transactions CP)
       Cr Bank      → bank balance decreases     (bank_transactions CR)
-      Dr Cash      → cash in hand increases     (cash_journal_lines 'in')
-      Cr Cash      → cash in hand decreases     (cash_journal_lines 'out')
+      Dr Cash      → cash in hand increases     (journal_voucher_lines party_type='cash' debit)
+      Cr Cash      → cash in hand decreases     (journal_voucher_lines party_type='cash' credit)
     """
 
     def __init__(self, parent=None):

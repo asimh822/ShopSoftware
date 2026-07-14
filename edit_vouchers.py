@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QFont, QBrush, QColor, QDoubleValidator
 
-from database import get_connection, db_bank_accounts
+from database import get_connection, db_bank_accounts, db_remove_stock_item
 
 # ── Shared styles ──────────────────────────────────────────────────────────────
 
@@ -319,7 +319,7 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines, customer_as_s
                         "Process a Sales Return first."
                     )
                 if old["stock_item_id"]:
-                    c.execute("DELETE FROM stock_items WHERE id=?", (old["stock_item_id"],))
+                    db_remove_stock_item(c, old["stock_item_id"])
                 c.execute("DELETE FROM purchase_lines WHERE id=?", (old["pl_id"],))
 
         # Add or update lines
@@ -363,11 +363,50 @@ def db_update_purchase(pv_id, date_str, supplier_id, notes, lines, customer_as_s
 
         total = sum(p for _, _, p in lines)
         new_ptype = "supplier" if (supplier_id or customer_as_supplier_id) else "cash"
-        c.execute(
-            "UPDATE purchase_vouchers SET date=?, supplier_id=?, notes=?, total_amount=?, "
-            "customer_as_supplier_id=?, purchase_type=? WHERE id=?",
-            (date_str, supplier_id, notes or "", total, customer_as_supplier_id, new_ptype, pv_id),
-        )
+        if new_ptype == "supplier":
+            # A supplier/credit purchase carries no direct payment on the
+            # voucher. Stale cash/bank fields left over from a former cash
+            # purchase would inflate BOTH cash-in-hand and the supplier's
+            # balance, so clear them and drop the bank outflow row (if any).
+            c.execute(
+                "UPDATE purchase_vouchers SET date=?, supplier_id=?, notes=?, total_amount=?, "
+                "customer_as_supplier_id=?, purchase_type=?, payment_method='', "
+                "cash_amount=0, bank_amount=0, bank_account_id=NULL, bank_ref='' WHERE id=?",
+                (date_str, supplier_id, notes or "", total, customer_as_supplier_id, new_ptype, pv_id),
+            )
+            c.execute(
+                "DELETE FROM bank_transactions WHERE source='cash_purchase' AND "
+                "voucher_number=(SELECT pv_number FROM purchase_vouchers WHERE id=?)",
+                (pv_id,),
+            )
+        else:
+            # Cash purchase: keep the payment method but re-align the paid
+            # amounts with the (possibly changed) voucher total.
+            pv_row = c.execute(
+                "SELECT pv_number, payment_method, bank_amount FROM purchase_vouchers WHERE id=?",
+                (pv_id,),
+            ).fetchone()
+            pm = (pv_row["payment_method"] or "cash").strip() or "cash"
+            if pm == "bank":
+                new_cash, new_bank = 0.0, total
+            elif pm == "split":
+                new_bank = min(float(pv_row["bank_amount"] or 0), total)
+                new_cash = total - new_bank
+            else:
+                new_cash, new_bank = total, 0.0
+            c.execute(
+                "UPDATE purchase_vouchers SET date=?, supplier_id=?, notes=?, total_amount=?, "
+                "customer_as_supplier_id=?, purchase_type=?, cash_amount=?, bank_amount=? "
+                "WHERE id=?",
+                (date_str, supplier_id, notes or "", total, customer_as_supplier_id,
+                 new_ptype, new_cash, new_bank, pv_id),
+            )
+            if new_bank > 0:
+                c.execute(
+                    "UPDATE bank_transactions SET amount=?, date=? "
+                    "WHERE source='cash_purchase' AND voucher_number=?",
+                    (new_bank, date_str, pv_row["pv_number"]),
+                )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1990,13 +2029,81 @@ def _fill_jv_party_combo(party_combo: QComboBox, type_key: str, selected_id=None
     party_combo.blockSignals(False)
 
 
-def _build_jv_row(rows_layout, line_rows, on_balance_update,
-                  party_type=None, party_id=None, debit=0.0, credit=0.0, reference=""):
-    """Build one JV line row, append it to rows_layout and line_rows list."""
-    row_w = QFrame()
-    row_l = QHBoxLayout(row_w)
-    row_l.setContentsMargins(0, 2, 0, 2)
-    row_l.setSpacing(4)
+_JV_TYPE_LABELS = {key: label for label, key in _JV_PARTY_TYPES}
+
+
+def _jv_balance_text(lines):
+    """Return (text, style) for the balance indicator from line dicts."""
+    total_dr = sum(float(l["debit"] or 0) for l in lines)
+    total_cr = sum(float(l["credit"] or 0) for l in lines)
+    if total_dr == 0 and total_cr == 0:
+        return "Add journal lines above", "color:#94a3b8;"
+    if abs(total_dr - total_cr) < 0.01:
+        return (f"✓ Balanced   Dr = Cr = PKR {total_dr:,.0f}",
+                "color:#16a34a; font-weight:bold;")
+    diff = total_dr - total_cr
+    side = "Dr" if diff > 0 else "Cr"
+    return (
+        f"✗ Not Balanced   Dr {total_dr:,.0f}  Cr {total_cr:,.0f}  "
+        f"({side} over by {abs(diff):,.0f})",
+        "color:#dc2626; font-weight:bold;"
+    )
+
+
+def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lines=None):
+    """
+    Builds the shared JV form body into `outer` (QVBoxLayout) — sales-style
+    entry: fill the entry bar at the top, Enter moves through the fields to
+    the Add Line button, and the line drops into the grid below. Double-click
+    a grid row to load it back into the bar for correction.
+    Returns (date_edit, jv_lines, bal_lbl, refresh_fn). jv_lines is a plain
+    list of line dicts (party_type, party_id, party_name, debit, credit,
+    reference) — mutate it and call refresh_fn to update the grid.
+    """
+    title_lbl = QLabel(title_text)
+    title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+    title_lbl.setStyleSheet("color:#1e293b;")
+    outer.addWidget(title_lbl)
+
+    top = QHBoxLayout()
+    top.addWidget(QLabel("Date:"))
+    date_edit = QDateEdit(QDate.currentDate())
+    date_edit.setDisplayFormat("dd/MM/yyyy")
+    date_edit.setCalendarPopup(True)
+    date_edit.setMinimumWidth(130)
+    if prefill_hdr and prefill_hdr.get("date"):
+        d = prefill_hdr["date"].split("/")
+        date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
+    top.addWidget(date_edit)
+    top.addStretch()
+    outer.addLayout(top)
+
+    # ── Entry bar — one line at a time, like the sales/purchase forms ────────
+    entry_card = QFrame()
+    entry_card.setStyleSheet(CARD_STYLE)
+    ec = QVBoxLayout(entry_card)
+    ec.setContentsMargins(12, 8, 12, 10)
+    ec.setSpacing(2)
+
+    lbl_row = QHBoxLayout()
+    lbl_row.setSpacing(6)
+    for txt, w, style in [
+        ("Party Type",      120,  "color:#475569; font-weight:bold; font-size:9pt;"),
+        ("Party / Account", None, "color:#475569; font-weight:bold; font-size:9pt;"),
+        ("Debit (PKR)",     110,  "color:#dc2626; font-weight:bold; font-size:9pt;"),
+        ("Credit (PKR)",    110,  "color:#16a34a; font-weight:bold; font-size:9pt;"),
+        ("Reference",       150,  "color:#475569; font-weight:bold; font-size:9pt;"),
+    ]:
+        lbl = QLabel(txt)
+        lbl.setStyleSheet(style)
+        if w:
+            lbl.setFixedWidth(w)
+        lbl_row.addWidget(lbl, 0 if w else 1)
+    lbl_row.addSpacing(104)          # over the Add Line button
+    ec.addLayout(lbl_row)
+
+    fld_row = QHBoxLayout()
+    fld_row.setSpacing(6)
 
     type_combo = QComboBox()
     type_combo.setFixedWidth(120)
@@ -2018,216 +2125,180 @@ def _build_jv_row(rows_layout, line_rows, on_balance_update,
 
     ref_edit = QLineEdit()
     ref_edit.setPlaceholderText("Optional")
-    ref_edit.setMinimumWidth(160)
-    if reference:
-        ref_edit.setText(reference)
+    ref_edit.setFixedWidth(150)
 
-    btn_remove = QPushButton("✕")
-    btn_remove.setFixedWidth(28)
-    btn_remove.setStyleSheet(
-        "QPushButton { background:#fee2e2; color:#dc2626; border:none; "
-        "border-radius:4px; padding:2px 6px; } "
-        "QPushButton:hover { background:#fecaca; }"
-    )
+    btn_add = QPushButton("Add Line  ↵")
+    btn_add.setStyleSheet(BTN_PRIMARY)
+    btn_add.setFixedWidth(104)
 
-    row_l.addWidget(type_combo)
-    row_l.addWidget(party_combo, stretch=1)
-    row_l.addWidget(dr_edit)
-    row_l.addWidget(cr_edit)
-    row_l.addWidget(ref_edit)
-    row_l.addWidget(btn_remove)
-    rows_layout.addWidget(row_w)
+    fld_row.addWidget(type_combo)
+    fld_row.addWidget(party_combo, stretch=1)
+    fld_row.addWidget(dr_edit)
+    fld_row.addWidget(cr_edit)
+    fld_row.addWidget(ref_edit)
+    fld_row.addWidget(btn_add)
+    ec.addLayout(fld_row)
+    outer.addWidget(entry_card)
 
-    entry = (type_combo, party_combo, dr_edit, cr_edit, ref_edit, row_w)
-    line_rows.append(entry)
-
-    init_type = party_type or "supplier"
-    for i in range(type_combo.count()):
-        if type_combo.itemData(i) == init_type:
-            type_combo.setCurrentIndex(i)
-            break
-    _fill_jv_party_combo(party_combo, init_type, party_id)
-
+    _fill_jv_party_combo(party_combo, type_combo.currentData())
     type_combo.currentIndexChanged.connect(
-        lambda _, tc=type_combo, pc=party_combo: _fill_jv_party_combo(pc, tc.currentData())
+        lambda _: _fill_jv_party_combo(party_combo, type_combo.currentData())
     )
 
-    if debit:
-        dr_edit.setText(str(int(debit)))
-        cr_edit.setEnabled(False)
-    elif credit:
-        cr_edit.setText(str(int(credit)))
-        dr_edit.setEnabled(False)
-
-    def _on_dr_changed(text, cr=cr_edit):
+    # Dr and Cr are mutually exclusive on a line
+    def _on_dr_changed(text):
         if text.strip() and text.strip() != "0":
-            cr.blockSignals(True)
-            cr.clear()
-            cr.setEnabled(False)
-            cr.blockSignals(False)
+            cr_edit.blockSignals(True)
+            cr_edit.clear()
+            cr_edit.setEnabled(False)
+            cr_edit.blockSignals(False)
         else:
-            cr.setEnabled(True)
-        on_balance_update()
+            cr_edit.setEnabled(True)
 
-    def _on_cr_changed(text, dr=dr_edit):
+    def _on_cr_changed(text):
         if text.strip() and text.strip() != "0":
-            dr.blockSignals(True)
-            dr.clear()
-            dr.setEnabled(False)
-            dr.blockSignals(False)
+            dr_edit.blockSignals(True)
+            dr_edit.clear()
+            dr_edit.setEnabled(False)
+            dr_edit.blockSignals(False)
         else:
-            dr.setEnabled(True)
-        on_balance_update()
+            dr_edit.setEnabled(True)
 
     dr_edit.textChanged.connect(_on_dr_changed)
     cr_edit.textChanged.connect(_on_cr_changed)
 
-    def _remove(_checked, rw=row_w, e=entry):
-        if len(line_rows) <= 1:
-            return
-        line_rows.remove(e)
-        rw.setParent(None)
-        rw.deleteLater()
-        on_balance_update()
+    # ── Lines grid ────────────────────────────────────────────────────────────
+    table = QTableWidget(0, 7)
+    table.setHorizontalHeaderLabels(
+        ["#", "Party Type", "Party / Account", "Debit (PKR)",
+         "Credit (PKR)", "Reference", ""])
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.setStyleSheet(TABLE_STYLE)
+    th = table.horizontalHeader()
+    th.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+    th.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+    th.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    th.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+    th.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+    th.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+    th.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+    table.setColumnWidth(0, 35)
+    table.setColumnWidth(1, 120)
+    table.setColumnWidth(3, 110)
+    table.setColumnWidth(4, 110)
+    table.setColumnWidth(6, 40)
+    table.setMinimumHeight(180)
+    outer.addWidget(table, stretch=1)
 
-    btn_remove.clicked.connect(_remove)
+    jv_lines = []
 
-
-def _jv_balance_text(line_rows):
-    """Return (text, style) for the balance indicator."""
-    total_dr = total_cr = 0.0
-    for _tc, _pc, dr_e, cr_e, _re, _rw in line_rows:
-        try:
-            total_dr += float(dr_e.text() or 0)
-        except ValueError:
-            pass
-        try:
-            total_cr += float(cr_e.text() or 0)
-        except ValueError:
-            pass
-    if total_dr == 0 and total_cr == 0:
-        return "Enter debit / credit amounts above", "color:#94a3b8;"
-    if abs(total_dr - total_cr) < 0.01:
-        return (f"✓ Balanced   Dr = Cr = PKR {total_dr:,.0f}",
-                "color:#16a34a; font-weight:bold;")
-    diff = total_dr - total_cr
-    side = "Dr" if diff > 0 else "Cr"
-    return (
-        f"✗ Not Balanced   Dr {total_dr:,.0f}  Cr {total_cr:,.0f}  "
-        f"({side} over by {abs(diff):,.0f})",
-        "color:#dc2626; font-weight:bold;"
-    )
-
-
-def _jv_collect_lines(line_rows):
-    """Validate and return line dicts. Raises ValueError on bad input."""
-    _no_party_types = ("cash", "incentive_income")
-    lines = []
-    for i, (tc, pc, dr_e, cr_e, ref_e, _rw) in enumerate(line_rows):
-        type_key = tc.currentData()
-        party_id = pc.currentData()
-        try:
-            dr = float(dr_e.text() or 0)
-        except ValueError:
-            dr = 0.0
-        try:
-            cr = float(cr_e.text() or 0)
-        except ValueError:
-            cr = 0.0
-        if type_key not in _no_party_types and party_id is None:
-            raise ValueError(f"Row {i + 1}: please select a party / account.")
-        if dr == 0 and cr == 0:
-            raise ValueError(f"Row {i + 1}: enter either a Debit or Credit amount.")
-        if dr > 0 and cr > 0:
-            raise ValueError(
-                f"Row {i + 1}: a line can have either Debit OR Credit, not both."
-            )
-        lines.append({
-            "party_type": type_key,
-            "party_id": None if type_key in _no_party_types else party_id,
-            "debit": dr,
-            "credit": cr,
-            "reference": ref_e.text().strip(),
-        })
-    return lines
-
-
-def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lines=None):
-    """
-    Builds the shared JV form body into `outer` (QVBoxLayout).
-    Returns (date_edit, line_rows, bal_lbl, rows_layout).
-    """
-    title_lbl = QLabel(title_text)
-    title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-    title_lbl.setStyleSheet("color:#1e293b;")
-    outer.addWidget(title_lbl)
-
-    top = QHBoxLayout()
-    top.addWidget(QLabel("Date:"))
-    date_edit = QDateEdit(QDate.currentDate())
-    date_edit.setDisplayFormat("dd/MM/yyyy")
-    date_edit.setCalendarPopup(True)
-    date_edit.setMinimumWidth(130)
-    if prefill_hdr and prefill_hdr.get("date"):
-        d = prefill_hdr["date"].split("/")
-        date_edit.setDate(QDate(int(d[2]), int(d[1]), int(d[0])))
-    top.addWidget(date_edit)
-    top.addStretch()
-    outer.addLayout(top)
-
-    # Column headers
-    hdr_row = QHBoxLayout()
-    hdr_row.setSpacing(4)
-    for txt, w, style in [
-        ("Party Type",    120,  "color:#475569; font-weight:bold; font-size:9pt;"),
-        ("Party / Account", None, "color:#475569; font-weight:bold; font-size:9pt;"),
-        ("Debit (PKR)",   110,  "color:#dc2626; font-weight:bold; font-size:9pt;"),
-        ("Credit (PKR)",  110,  "color:#16a34a; font-weight:bold; font-size:9pt;"),
-        ("Reference",     160,  "color:#475569; font-weight:bold; font-size:9pt;"),
-    ]:
-        lbl = QLabel(txt)
-        lbl.setStyleSheet(style)
-        if w:
-            lbl.setFixedWidth(w)
-        hdr_row.addWidget(lbl, 0 if w else 1)
-    hdr_row.addSpacing(32)
-    outer.addLayout(hdr_row)
-
-    # Scroll area for rows
-    rows_container = QFrame()
-    rows_layout = QVBoxLayout(rows_container)
-    rows_layout.setContentsMargins(0, 0, 0, 0)
-    rows_layout.setSpacing(2)
-
-    scroll = QScrollArea()
-    scroll.setWidget(rows_container)
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setMinimumHeight(160)
-    outer.addWidget(scroll, stretch=1)
-
-    line_rows = []
-
-    bal_lbl = QLabel("Enter debit / credit amounts above")
+    bal_lbl = QLabel("Add journal lines above")
     bal_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
     bal_lbl.setStyleSheet("color:#94a3b8;")
 
-    def _update_balance():
-        txt, style = _jv_balance_text(line_rows)
+    def _refresh():
+        table.setRowCount(0)
+        for idx, ln in enumerate(jv_lines):
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(str(idx + 1)))
+            table.setItem(r, 1, QTableWidgetItem(
+                _JV_TYPE_LABELS.get(ln["party_type"], ln["party_type"])))
+            table.setItem(r, 2, QTableWidgetItem(ln.get("party_name") or ""))
+            dr_item = QTableWidgetItem(f"{ln['debit']:,.0f}" if ln["debit"] else "")
+            dr_item.setForeground(QColor("#dc2626"))
+            table.setItem(r, 3, dr_item)
+            cr_item = QTableWidgetItem(f"{ln['credit']:,.0f}" if ln["credit"] else "")
+            cr_item.setForeground(QColor("#16a34a"))
+            table.setItem(r, 4, cr_item)
+            table.setItem(r, 5, QTableWidgetItem(ln.get("reference") or ""))
+            btn_rm = QPushButton("✕")
+            btn_rm.setStyleSheet(
+                "QPushButton { background:#fee2e2; color:#dc2626; border:none; "
+                "border-radius:4px; } QPushButton:hover { background:#fecaca; }")
+            btn_rm.clicked.connect(lambda _, i=idx: _remove_line(i))
+            table.setCellWidget(r, 6, btn_rm)
+        txt, style = _jv_balance_text(jv_lines)
         bal_lbl.setText(txt)
         bal_lbl.setStyleSheet(style)
 
-    # Add Row button
-    btn_add = QPushButton("+ Add Row")
-    btn_add.setStyleSheet(BTN_SECONDARY)
-    btn_add.setFixedWidth(120)
-    btn_add.clicked.connect(
-        lambda: _build_jv_row(rows_layout, line_rows, _update_balance)
-    )
-    outer.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
+    def _remove_line(idx):
+        if 0 <= idx < len(jv_lines):
+            jv_lines.pop(idx)
+            _refresh()
+
+    def _reset_entry():
+        party_combo.setCurrentIndex(0)
+        dr_edit.blockSignals(True)
+        cr_edit.blockSignals(True)
+        dr_edit.clear()
+        cr_edit.clear()
+        dr_edit.setEnabled(True)
+        cr_edit.setEnabled(True)
+        dr_edit.blockSignals(False)
+        cr_edit.blockSignals(False)
+        ref_edit.clear()
+
+    _no_party_types = ("cash", "incentive_income")
+
+    def _add_line():
+        type_key = type_combo.currentData()
+        party_id = party_combo.currentData()
+        try:
+            dr = float(dr_edit.text() or 0)
+        except ValueError:
+            dr = 0.0
+        try:
+            cr = float(cr_edit.text() or 0)
+        except ValueError:
+            cr = 0.0
+        if type_key not in _no_party_types and party_id is None:
+            QMessageBox.warning(dialog, "Missing", "Select a party / account first.")
+            party_combo.setFocus()
+            return
+        if dr == 0 and cr == 0:
+            QMessageBox.warning(dialog, "Missing",
+                                "Enter either a Debit or a Credit amount.")
+            dr_edit.setFocus()
+            return
+        jv_lines.append({
+            "party_type": type_key,
+            "party_id": None if type_key in _no_party_types else party_id,
+            "party_name": party_combo.currentText(),
+            "debit": dr,
+            "credit": cr,
+            "reference": ref_edit.text().strip(),
+        })
+        _refresh()
+        _reset_entry()
+        party_combo.setFocus()
+
+    btn_add.clicked.connect(_add_line)
+
+    def _edit_line(row, _col):
+        if not (0 <= row < len(jv_lines)):
+            return
+        ln = jv_lines.pop(row)
+        _refresh()
+        for i in range(type_combo.count()):
+            if type_combo.itemData(i) == ln["party_type"]:
+                type_combo.setCurrentIndex(i)
+                break
+        _fill_jv_party_combo(party_combo, ln["party_type"], ln["party_id"])
+        dr_edit.setText(str(int(ln["debit"])) if ln["debit"] else "")
+        cr_edit.setText(str(int(ln["credit"])) if ln["credit"] else "")
+        ref_edit.setText(ln.get("reference") or "")
+        (cr_edit if ln["credit"] else dr_edit).setFocus()
+
+    table.cellDoubleClicked.connect(_edit_line)
+
     outer.addWidget(bal_lbl)
 
     hint_lbl = QLabel(
+        "Double-click a line to edit it.   |   "
         "Supplier: Debit = reduces balance (you pay them) ↓, Credit = increases balance (you owe more) ↑   |   "
         "Customer: Debit = increases balance (they owe more) ↑, Credit = reduces balance (they pay you) ↓   |   "
         "Bank: Debit = money IN ↑, Credit = money OUT ↓"
@@ -2236,17 +2307,19 @@ def _build_jv_form_body(dialog, outer, title_text, prefill_hdr=None, prefill_lin
     hint_lbl.setWordWrap(True)
     outer.addWidget(hint_lbl)
 
-    # Seed rows
     if prefill_lines:
         for ln in prefill_lines:
-            _build_jv_row(rows_layout, line_rows, _update_balance,
-                          ln["party_type"], ln["party_id"],
-                          ln["debit"], ln["credit"], ln.get("reference", ""))
-    else:
-        _build_jv_row(rows_layout, line_rows, _update_balance)
-        _build_jv_row(rows_layout, line_rows, _update_balance)
+            jv_lines.append({
+                "party_type": ln["party_type"],
+                "party_id": ln["party_id"],
+                "party_name": ln.get("party_name") or "",
+                "debit": float(ln["debit"] or 0),
+                "credit": float(ln["credit"] or 0),
+                "reference": ln.get("reference") or "",
+            })
+    _refresh()
 
-    return date_edit, line_rows, bal_lbl, rows_layout
+    return date_edit, jv_lines, bal_lbl, _refresh
 
 
 class JVFormDialog(QDialog):
@@ -2263,7 +2336,7 @@ class JVFormDialog(QDialog):
         outer.setContentsMargins(20, 16, 20, 16)
         outer.setSpacing(10)
 
-        self._date_edit, self._line_rows, self._bal_lbl, _ = \
+        self._date_edit, self._jv_lines, self._bal_lbl, _ = \
             _build_jv_form_body(self, outer, "New Journal Voucher")
 
         btns = QDialogButtonBox(
@@ -2275,15 +2348,17 @@ class JVFormDialog(QDialog):
         outer.addWidget(btns)
 
     def _save(self):
-        try:
-            lines = _jv_collect_lines(self._line_rows)
-        except ValueError as ex:
-            QMessageBox.warning(self, "Validation", str(ex))
+        if not self._jv_lines:
+            QMessageBox.warning(self, "Validation",
+                                "Add at least one journal line first.")
             return
         date_str = self._date_edit.date().toString("dd/MM/yyyy")
         try:
             from database import db_save_journal_voucher
-            jv_num = db_save_journal_voucher(date_str, "", lines)
+            jv_num = db_save_journal_voucher(date_str, "", list(self._jv_lines))
+        except ValueError as ex:
+            QMessageBox.warning(self, "Validation", str(ex))
+            return
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
@@ -2353,7 +2428,7 @@ class JVEditDialog(QDialog):
         outer.setContentsMargins(20, 16, 20, 16)
         outer.setSpacing(10)
 
-        self._date_edit, self._line_rows, self._bal_lbl, _ = \
+        self._date_edit, self._jv_lines, self._bal_lbl, _ = \
             _build_jv_form_body(
                 self, outer,
                 f"Edit — {self._jv_number}",
@@ -2381,15 +2456,18 @@ class JVEditDialog(QDialog):
         outer.addLayout(btn_row)
 
     def _save(self):
-        try:
-            lines = _jv_collect_lines(self._line_rows)
-        except ValueError as ex:
-            QMessageBox.warning(self, "Validation", str(ex))
+        if not self._jv_lines:
+            QMessageBox.warning(self, "Validation",
+                                "Add at least one journal line first.")
             return
         date_str = self._date_edit.date().toString("dd/MM/yyyy")
         try:
             from database import db_update_journal_voucher
-            db_update_journal_voucher(self._jv_id, date_str, "", lines)
+            db_update_journal_voucher(self._jv_id, date_str, "",
+                                      list(self._jv_lines))
+        except ValueError as ex:
+            QMessageBox.warning(self, "Validation", str(ex))
+            return
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return

@@ -10,6 +10,13 @@ build/
 dist/
 *.spec
 
+# ── Secrets — never commit ────────────────────────────────────────────────────
+supabase_key.txt
+
+# ── Shop deployment staging (contains DB, key, APK) ───────────────────────────
+Shop/
+Shop.rar
+
 # ── Database — never commit live data ────────────────────────────────────────
 united_mobile.db
 backups/

@@ -32,20 +32,22 @@ HEADERS = {
     "Prefer": "return=minimal",
 }
 
+# Child tables must come before the parents they reference — Supabase
+# enforces the journal_voucher_lines.jv_id → journal_vouchers.id FK, so
+# deleting vouchers before their lines fails with a 409.
 ID_TABLES = [
-    "sale_vouchers",
     "sale_lines",
-    "purchase_vouchers",
+    "sale_vouchers",
     "stock_items",
+    "purchase_vouchers",
     "payments",
-    "journal_entries",
-    "journal_vouchers",
     "journal_voucher_lines",
+    "journal_vouchers",
+    "journal_entries",
     "purchase_returns",
     "sale_returns",
     "expenses",
     "bank_transactions",
-    "cash_journal_lines",
 ]
 
 print("=" * 55)
@@ -98,6 +100,11 @@ print("=" * 55)
 conn.execute(
     "UPDATE settings SET value = '2000-01-01 00:00:00' WHERE key = 'last_supabase_sync'"
 )
+# Remote was just truncated — queued deletion tombstones are now pointless.
+try:
+    conn.execute("DELETE FROM sync_deletions")
+except Exception:
+    pass  # table absent on pre-v21 databases
 conn.commit()
 conn.close()
 print("  last_supabase_sync reset to 2000-01-01 00:00:00")

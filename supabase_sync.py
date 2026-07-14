@@ -5,15 +5,32 @@ import requests
 import json
 from datetime import datetime
 
-# SUPABASE_SERVICE_KEY must be set as a Windows environment variable on the
-# shop PC (System Properties > Environment Variables) — it grants full admin
-# access to the Supabase project and must never be committed to source control.
-# A key was previously hardcoded here; treat it as compromised and rotate it
-# in the Supabase dashboard, then set the env var to the new value.
 SUPABASE_URL = "https://amoojyfprkxlfonfokuq.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_key() -> str:
+    """
+    The service key grants full admin access to the Supabase project, so it
+    is never committed to source control. It is read from supabase_key.txt
+    next to this script (gitignored; copy it along when deploying), falling
+    back to the SUPABASE_SERVICE_KEY environment variable.
+    """
+    key_file = os.path.join(_BASE_DIR, "supabase_key.txt")
+    try:
+        with open(key_file, encoding="utf-8") as f:
+            key = f.read().strip()
+            if key:
+                return key
+    except OSError:
+        pass
+    return os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+
+SUPABASE_KEY = _load_key()
+
+DB_PATH = os.path.join(_BASE_DIR, "united_mobile.db")
 
 
 def _get_conn():
@@ -43,9 +60,94 @@ TABLES = [
     "purchase_returns",
     "sale_returns",
     "bank_transactions",
-    "cash_journal_lines",
     "expenses",
 ]
+
+
+# Remote deletes must remove child rows before their parents — Supabase
+# enforces journal_voucher_lines.jv_id → journal_vouchers.id.
+DELETE_ORDER = [
+    "journal_voucher_lines",
+    "journal_vouchers",
+    "sale_lines",
+    "sale_returns",
+    "purchase_returns",
+    "sale_vouchers",
+    "stock_items",
+    "purchase_vouchers",
+    "payments",
+    "journal_entries",
+    "bank_transactions",
+    "expenses",
+    "models",
+    "brands",
+    "suppliers",
+    "customers",
+    "bank_accounts",
+]
+
+
+def push_deletions():
+    """
+    Push queued local deletions (sync_deletions tombstones, written by the
+    AFTER DELETE triggers from db migration v21) to Supabase. A tombstone is
+    removed only after the remote delete succeeds, so deletions survive
+    offline periods and are retried on the next sync. Deleting a row that
+    never reached Supabase is a harmless no-op.
+    Returns (deleted_count, errors).
+    """
+    conn = _get_conn()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, table_name, row_id FROM sync_deletions ORDER BY id"
+        ).fetchall()]
+    except Exception:
+        conn.close()
+        return 0, []  # tombstone table absent — DB not migrated to v21 yet
+    if not rows:
+        conn.close()
+        return 0, []
+
+    by_table = {}
+    for r in rows:
+        by_table.setdefault(r["table_name"], []).append(r)
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Prefer": "return=minimal",
+    }
+    deleted = 0
+    errors = []
+    order = DELETE_ORDER + [t for t in by_table if t not in DELETE_ORDER]
+    for table in order:
+        entries = by_table.get(table)
+        if not entries:
+            continue
+        for i in range(0, len(entries), 100):
+            chunk = entries[i:i + 100]
+            ids = ",".join(str(e["row_id"]) for e in chunk)
+            try:
+                resp = requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/{table}?id=in.({ids})",
+                    headers=headers, timeout=30,
+                )
+            except Exception as e:
+                errors.append(f"{table}: delete request failed ({e})")
+                continue
+            if resp.status_code in (200, 204):
+                conn.executemany(
+                    "DELETE FROM sync_deletions WHERE id=?",
+                    [(e["id"],) for e in chunk],
+                )
+                conn.commit()
+                deleted += len(chunk)
+            else:
+                errors.append(
+                    f"{table}: delete failed ({resp.status_code}) {resp.text[:100]}"
+                )
+    conn.close()
+    return deleted, errors
 
 
 def get_last_sync_time():
@@ -90,7 +192,9 @@ def upsert_to_supabase(table, rows):
         if row.get('last_modified'):
             row['last_modified'] = row['last_modified'].replace(' ', 'T') + 'Z'
     url = f"{SUPABASE_URL}/rest/v1/{table}"
-    response = requests.post(url, headers=headers, data=json.dumps(rows))
+    # timeout matters: without it a network stall hangs the sync thread
+    # forever and no sync ever runs again until the app is restarted
+    response = requests.post(url, headers=headers, data=json.dumps(rows), timeout=60)
     if response.status_code not in (200, 201):
         raise RuntimeError(
             f"Upsert failed ({response.status_code}): {response.text[:200]}"
@@ -119,13 +223,22 @@ def log_sync_to_supabase(tables_synced, rows_pushed):
 def run_sync():
     if not SUPABASE_KEY:
         print("[Supabase Sync] SUPABASE_SERVICE_KEY env var not set — sync skipped.")
-        return
+        return {"total_rows": 0, "tables_synced": [], "errors": ["SUPABASE_SERVICE_KEY not set"]}
     print(f"[Supabase Sync] Starting sync at {datetime.now().strftime('%H:%M:%S')}")
     since = get_last_sync_time()
     sync_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     total_rows = 0
     synced_tables = []
     errors = []
+
+    # Push deletions FIRST so a row that was deleted and later re-created
+    # with the same id ends up present (delete, then upsert re-adds it).
+    deleted_rows, delete_errors = push_deletions()
+    if deleted_rows:
+        print(f"[Supabase Sync] Propagated {deleted_rows} deletion(s) to Supabase.")
+        synced_tables.append(f"deletions({deleted_rows})")
+    for e in delete_errors:
+        print(f"[Supabase Sync] Deletion error: {e}")
 
     for table in TABLES:
         try:
@@ -150,16 +263,20 @@ def run_sync():
             f"advanced, all tables will be retried next sync."
         )
     else:
+        # Deletion failures do NOT block the watermark: their tombstones stay
+        # in sync_deletions and are retried automatically on the next sync.
         update_last_sync_time(sync_time)
+    all_errors = delete_errors + errors
     summary = ', '.join(synced_tables) if synced_tables else 'none'
-    if errors:
-        summary += " | ERRORS: " + "; ".join(errors)
-    log_sync_to_supabase(summary, total_rows)
+    if all_errors:
+        summary += " | ERRORS: " + "; ".join(all_errors)
+    log_sync_to_supabase(summary, total_rows + deleted_rows)
     print(
-        f"[Supabase Sync] Done. {total_rows} rows pushed "
-        f"across {len(synced_tables)} tables."
+        f"[Supabase Sync] Done. {total_rows} rows pushed, "
+        f"{deleted_rows} deletions propagated."
     )
-    return {"total_rows": total_rows, "tables_synced": synced_tables, "errors": errors}
+    return {"total_rows": total_rows, "deleted_rows": deleted_rows,
+            "tables_synced": synced_tables, "errors": all_errors}
 
 
 if __name__ == "__main__":

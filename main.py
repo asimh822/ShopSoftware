@@ -1687,9 +1687,38 @@ def _auto_register_startup() -> None:
         print("Auto-launch on Windows startup enabled.")
 
 
+# Windows power management — keep the PC awake while the EPOS app runs.
+# The mobile app (API server on port 5000) and the WhatsApp session both
+# die if Windows goes to sleep. ES_SYSTEM_REQUIRED keeps the system awake;
+# the display may still turn off on its own schedule (add
+# ES_DISPLAY_REQUIRED = 0x00000002 to the flags to keep the screen on too).
+_ES_CONTINUOUS      = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _prevent_sleep():
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
+        )
+        print("Sleep prevention active — PC will stay awake while the app runs.")
+    except Exception as exc:
+        print(f"WARNING: could not disable sleep: {exc}")
+
+
+def _allow_sleep():
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
+
+
 def main():
     init_db()
     _start_api_server()
+    _prevent_sleep()
 
     # DEV PC — Supabase sync disabled. Only the shop PC should push data.
     # sync_thread = threading.Thread(target=_sync_loop, daemon=True)
@@ -1821,8 +1850,13 @@ def main():
         }
     """)
 
+    # Restore normal power behaviour however the app exits (window closed,
+    # login cancelled, sys.exit).
+    app.aboutToQuit.connect(_allow_sleep)
+
     login = LoginDialog()
     if login.exec() != QDialog.DialogCode.Accepted:
+        _allow_sleep()
         sys.exit(0)
 
     window = MainWindow()

@@ -839,8 +839,8 @@ def api_cash_in_hand():
             - _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CP'")
             - _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CP' AND source='cash_transfer'")
             + _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CR' AND source='cash_transfer'")
-            + _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='in'")
-            - _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='out'")
+            + _q("SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines WHERE party_type='cash'")
+            - _q("SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines WHERE party_type='cash'")
             - _q("SELECT COALESCE(SUM(cash_amount),0) FROM purchase_vouchers WHERE purchase_type='cash' AND cash_amount>0")
             - _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE payment_method='cash'")
         )
@@ -924,8 +924,8 @@ def _calc_cash_in_hand(conn) -> float:
         - _q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE type='CP'")
         - _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CP' AND source='cash_transfer'")
         + _q("SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE type='CR' AND source='cash_transfer'")
-        + _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='in'")
-        - _q("SELECT COALESCE(SUM(amount),0) FROM cash_journal_lines WHERE direction='out'")
+        + _q("SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines WHERE party_type='cash'")
+        - _q("SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines WHERE party_type='cash'")
         - _q("SELECT COALESCE(SUM(cash_amount),0) FROM purchase_vouchers WHERE purchase_type='cash' AND cash_amount>0")
         - _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE payment_method='cash'")
     )
@@ -1255,4 +1255,8 @@ if __name__ == "__main__":
     else:
         print("  Supabase : supabase_sync.py not found — sync disabled")
 
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # threaded=True is essential: the default single-threaded server handles
+    # one request at a time, so a phone dropping Wi-Fi mid-request blocked
+    # EVERY other salesman for the 1-5 minutes Windows takes to kill the dead
+    # socket. With a thread per request, one stalled client affects nobody.
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

@@ -285,6 +285,10 @@ def _run_migrations(conn) -> None:
         16: _migrate_v16,
         17: _migrate_v17,
         18: _migrate_v18,
+        19: _migrate_v19,
+        20: _migrate_v20,
+        21: _migrate_v21,
+        22: _migrate_v22,
     }
 
     current = _get_db_version(conn)
@@ -432,20 +436,6 @@ def _migrate_v1(conn) -> None:
         )
     except Exception:
         pass  # already exists
-
-    # ── cash_journal_lines — cash side of double-entry JV entries ─────────────
-    # direction 'in'  = Dr Cash on JV → Cash in Hand ↑
-    # direction 'out' = Cr Cash on JV → Cash in Hand ↓
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS cash_journal_lines (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            jv_number  TEXT NOT NULL,
-            date       TEXT NOT NULL,
-            amount     REAL NOT NULL,
-            direction  TEXT NOT NULL CHECK(direction IN ('in', 'out')),
-            notes      TEXT
-        )
-    """)
 
     # ── salesmen table ───────────────────────────────────────────────────────────
     c.execute("""
@@ -982,11 +972,137 @@ def _migrate_v18(conn) -> None:
         )
 
 
+def _migrate_v19(conn) -> None:
+    """
+    Version 19 — Drop dead tables.
+    • cash_journal_lines: the pre-v16 JV system stored the cash side of a JV
+      here. The unified JV system (v16) writes cash lines to
+      journal_voucher_lines with party_type='cash' instead; nothing has
+      written to this table since, and the shop DB holds 0 rows. All read
+      references were removed alongside this migration.
+    • committees: the committee feature was removed from the UI in June 2026;
+      committees.py is no longer imported anywhere and the table is empty.
+    DROP TABLE also removes the tables' last_modified triggers automatically.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    # Safety net: never drop data. Both tables are expected to be empty; if a
+    # row somehow exists, keep the table and let a human look at it.
+    for table in ("cash_journal_lines", "committees"):
+        try:
+            rows = c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except Exception:
+            continue  # table already absent
+        if rows == 0:
+            c.execute(f"DROP TABLE {table}")
+        else:
+            print(f"Database: v19 skipped dropping {table} — it has {rows} rows")
+
+
+def _migrate_v20(conn) -> None:
+    """
+    Version 20 — Normalise payment fields left stale by voucher edits.
+
+    Editing a cash purchase and assigning it a supplier converted it to a
+    credit purchase but kept payment_method='cash' / cash_amount, which
+    inflated both cash-in-hand and the supplier balance (652,800 across six
+    vouchers on the shop DB; owner confirmed these are credit purchases).
+    The edit dialog now clears these fields on conversion; this migration
+    repairs rows written before that fix. Also relabels credit sales that
+    carry payment_method='cash' with no money attached (same class of stale
+    data from sale edits).
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    c.execute("""
+        UPDATE purchase_vouchers
+        SET payment_method='', cash_amount=0, bank_amount=0,
+            bank_account_id=NULL, bank_ref=''
+        WHERE purchase_type='supplier'
+          AND (COALESCE(payment_method,'') <> ''
+               OR COALESCE(cash_amount,0) <> 0
+               OR COALESCE(bank_amount,0) <> 0)
+    """)
+    c.execute("""
+        DELETE FROM bank_transactions
+        WHERE source='cash_purchase'
+          AND voucher_number IN (
+              SELECT pv_number FROM purchase_vouchers WHERE purchase_type='supplier')
+    """)
+    c.execute("""
+        UPDATE sale_vouchers
+        SET payment_method='credit'
+        WHERE type='credit' AND payment_method='cash'
+          AND COALESCE(cash_paid,0)=0 AND COALESCE(bank_amount,0)=0
+    """)
+
+
+def _migrate_v21(conn) -> None:
+    """
+    Version 21 — Propagate local deletions to Supabase.
+
+    The sync is upsert-only, so deleting a synced voucher locally left a
+    ghost row in Supabase forever, silently distorting the mobile owner
+    figures. This adds a sync_deletions tombstone table plus an AFTER DELETE
+    trigger on every synced table, so every deletion (from any code path,
+    including future ones) is queued and pushed by supabase_sync.py on the
+    next sync. Tombstones survive offline periods and are removed only after
+    the remote delete succeeds.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sync_deletions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            row_id     INTEGER NOT NULL,
+            deleted_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    synced_tables = [
+        "suppliers", "customers", "bank_accounts", "purchase_vouchers",
+        "sale_vouchers", "sale_lines", "stock_items", "models", "brands",
+        "payments", "journal_entries", "journal_vouchers",
+        "journal_voucher_lines", "purchase_returns", "sale_returns",
+        "bank_transactions", "expenses",
+    ]
+    for table in synced_tables:
+        c.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_sync_delete
+            AFTER DELETE ON {table}
+            BEGIN
+                INSERT INTO sync_deletions (table_name, row_id)
+                VALUES ('{table}', OLD.id);
+            END;
+        """)
+
+
+def _migrate_v22(conn) -> None:
+    """
+    Version 22 — Fix incentive income lines recorded on the wrong side.
+
+    Three early JVs (JV-0013/14/15, June 2026) recorded incentive income as
+    a DEBIT of incentive_income (income should always be a credit), leaving
+    those vouchers unbalanced (Dr Supplier + Dr Incentive Income). A negation
+    hack in db_incentives_income_total() compensated while ALL lines were
+    debits, but the first correctly-entered credit line (JV-0021) made every
+    subsequent incentive REDUCE the reported income figure.
+    Flips debit-side incentive lines to credit; the negation hack is removed
+    from db_incentives_income_total() in the same change.
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    conn.execute("""
+        UPDATE journal_voucher_lines
+        SET credit = debit, debit = 0
+        WHERE party_type='incentive_income' AND debit > 0 AND credit = 0
+    """)
+
+
 _SUPABASE_SYNC_TABLES = [
     "suppliers", "customers", "bank_accounts", "purchase_vouchers",
     "sale_vouchers", "sale_lines", "stock_items", "models", "brands",
     "payments", "journal_entries", "purchase_returns", "sale_returns",
-    "bank_transactions", "cash_journal_lines", "expenses",
+    "bank_transactions", "expenses",
 ]
 
 
@@ -1077,15 +1193,17 @@ def _migrate_v12(conn) -> None:
 
 def _migrate_v13(conn) -> None:
     """
-    Version 13 — Extend Supabase sync to bank_transactions, cash_journal_lines,
-    and expenses. Adds last_modified column and INSERT/UPDATE triggers so the
+    Version 13 — Extend Supabase sync to bank_transactions and expenses.
+    Adds last_modified column and INSERT/UPDATE triggers so the
     sync service picks up changes to these tables incrementally.
     Also backfills existing rows so the next sync pushes them all to Supabase.
+    (cash_journal_lines was originally in this list; it is dropped in v19,
+    so fresh databases no longer create it and it is skipped here.)
     Do NOT add conn.commit() here — _run_migrations() commits per version.
     """
     c = conn.cursor()
 
-    for table in ["bank_transactions", "cash_journal_lines", "expenses"]:
+    for table in ["bank_transactions", "expenses"]:
         # String literal default — works on all SQLite versions (< 3.37.0 safe)
         try:
             c.execute(
@@ -1121,6 +1239,48 @@ def _migrate_v13(conn) -> None:
             f"WHERE last_modified IS NULL "
             f"   OR last_modified = '2000-01-01 00:00:01'"
         )
+
+
+def db_remove_stock_item(c, stock_item_id):
+    """
+    Take a stock item out of stock because its purchase line is being removed
+    (purchase edit / purchase delete) or it is being returned to the supplier.
+
+    A phone that was sold and later repurchased still has old sale_lines rows
+    pointing at this stock_items row, so a plain DELETE violates the
+    sale_lines.stock_item_id foreign key. For those, revert the row to its
+    pre-repurchase state instead: status='sold', sold_line_id = its latest
+    sale line, purchase_line_id/price = its previous purchase line.
+    Accepts a cursor or a connection.
+    """
+    last_sale = c.execute(
+        "SELECT id FROM sale_lines WHERE stock_item_id=? ORDER BY id DESC LIMIT 1",
+        (stock_item_id,),
+    ).fetchone()
+    if not last_sale:
+        c.execute("DELETE FROM stock_items WHERE id=?", (stock_item_id,))
+        return
+
+    row = c.execute(
+        "SELECT imei, purchase_line_id FROM stock_items WHERE id=?",
+        (stock_item_id,),
+    ).fetchone()
+    prev_pl = c.execute(
+        "SELECT id, purchase_price FROM purchase_lines "
+        "WHERE imei=? AND id <> COALESCE(?, -1) ORDER BY id DESC LIMIT 1",
+        (row["imei"], row["purchase_line_id"]),
+    ).fetchone()
+    c.execute(
+        "UPDATE stock_items SET status='sold', sold_line_id=?, "
+        "purchase_line_id=?, purchase_price=COALESCE(?, purchase_price) "
+        "WHERE id=?",
+        (
+            last_sale["id"],
+            prev_pl["id"] if prev_pl else None,
+            prev_pl["purchase_price"] if prev_pl else None,
+            stock_item_id,
+        ),
+    )
 
 
 # ── Expense helpers ───────────────────────────────────────────────────────────
@@ -1928,10 +2088,10 @@ def db_incentives_income_total() -> float:
         "FROM journal_voucher_lines WHERE party_type='incentive_income'"
     ).fetchone()
     conn.close()
-    # Negate: JVL entries are recorded on the debit side of incentive_income
-    # (Dr Incentive Income in the JV form), so the raw SUM(credit)-SUM(debit)
-    # is negative. Negating produces the correct positive income figure.
-    return -(base + float(row[0] or 0))
+    # Incentive income lines are always credits (migration v22 flipped the
+    # early debit-side entries), so net credits + the legacy account balance
+    # is the earned-to-date figure.
+    return base + float(row[0] or 0)
 
 
 def db_cash_in_hand() -> float:
@@ -1943,8 +2103,8 @@ def db_cash_in_hand() -> float:
       - CP payments (cash paid to suppliers / customer refunds)
       - bank_transactions CP where source='cash_transfer'  (cash deposited into bank)
       + bank_transactions CR where source='cash_transfer'  (cash withdrawn from bank)
-      + cash_journal_lines direction='in'   (Dr Cash in JV)
-      - cash_journal_lines direction='out'  (Cr Cash in JV)
+      + journal_voucher_lines Dr Cash  (party_type='cash' debit)
+      - journal_voucher_lines Cr Cash  (party_type='cash' credit)
     """
     conn = get_connection()
     ob_row = conn.execute(
@@ -1960,8 +2120,6 @@ def db_cash_in_hand() -> float:
                         WHERE type='CP' AND source='cash_transfer'), 0)
             + COALESCE((SELECT SUM(amount) FROM bank_transactions
                         WHERE type='CR' AND source='cash_transfer'), 0)
-            + COALESCE((SELECT SUM(amount) FROM cash_journal_lines WHERE direction='in'), 0)
-            - COALESCE((SELECT SUM(amount) FROM cash_journal_lines WHERE direction='out'), 0)
             - COALESCE((SELECT SUM(cash_amount) FROM purchase_vouchers
                         WHERE purchase_type='cash' AND cash_amount > 0), 0)
             - COALESCE((SELECT SUM(amount) FROM expenses
@@ -2301,7 +2459,8 @@ def db_perform_year_end_close(archive_path: str):
             "sale_lines", "sale_vouchers",
             "purchase_lines", "purchase_vouchers",
             "payments", "journal_entries",
-            "bank_transactions", "cash_journal_lines",
+            "journal_voucher_lines", "journal_vouchers",
+            "bank_transactions",
             "expenses",
         ]:
             c.execute(f"DELETE FROM {tbl}")
@@ -2597,7 +2756,7 @@ def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
 
         for line in lines:
             if line["stock_item_id"]:
-                conn.execute("DELETE FROM stock_items WHERE id=?", (line["stock_item_id"],))
+                db_remove_stock_item(conn, line["stock_item_id"])
 
         if lines:
             total = r["total_amount"] or 0
