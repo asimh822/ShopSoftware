@@ -2391,10 +2391,11 @@ def db_perform_year_end_close(archive_path: str):
       4. Keep only in_stock items (prior-year sold/returned items are removed)
       5. Reset all voucher number sequences to 0
     """
-    import shutil
-
     # ── 1. Archive ───────────────────────────────────────────────────────────
-    shutil.copy2(DB_PATH, archive_path)
+    # Online backup (not a raw file copy) so the archive is a consistent
+    # snapshot including WAL contents — critical here, since transactions
+    # are deleted right after this archive is written.
+    db_backup_to(archive_path)
 
     conn = get_connection()
     c = conn.cursor()
@@ -2492,7 +2493,43 @@ def db_perform_year_end_close(archive_path: str):
     conn.close()
 
 
-# ── Auto Monthly Backup ───────────────────────────────────────────────────────
+# ── Database Backup ───────────────────────────────────────────────────────────
+
+def db_backup_to(dest_path: str) -> str:
+    """
+    Consistent point-in-time backup of the live database to dest_path.
+
+    Uses sqlite3's online backup API instead of a raw file copy: the app runs
+    in WAL mode, where recent commits sit in the -wal sidecar until a
+    checkpoint, so copying just the .db file can silently miss the newest
+    transactions (or catch a checkpoint mid-write). Connection.backup()
+    snapshots main db + WAL contents even while other connections are open.
+
+    Writes to '<dest_path>.tmp' first and renames into place on success, so a
+    failure partway (disk full, unplugged USB drive) never leaves a truncated
+    file that looks like a valid backup. Raises on failure — callers surface
+    the error to the user.
+    """
+    tmp_path = dest_path + ".tmp"
+    src = sqlite3.connect(DB_PATH)
+    try:
+        src.execute("PRAGMA busy_timeout=5000")
+        dest = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+        os.replace(tmp_path, dest_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        src.close()
+    return dest_path
+
 
 def db_auto_backup_if_needed() -> str | None:
     """
@@ -2505,7 +2542,6 @@ def db_auto_backup_if_needed() -> str | None:
     Returns None if a backup for this month already exists.
     """
     import datetime as _dt
-    import shutil
 
     today = _dt.date.today()
     month_key = today.strftime("%m%Y")          # e.g. "052026"
@@ -2520,7 +2556,7 @@ def db_auto_backup_if_needed() -> str | None:
     backup_name = f"UnitedMobile_Backup_{month_key}.db"
     backup_path = os.path.join(backups_dir, backup_name)
 
-    shutil.copy2(DB_PATH, backup_path)
+    db_backup_to(backup_path)
     set_setting("last_auto_backup_month", month_key)
     return backup_path
 

@@ -1,5 +1,4 @@
 import os
-import shutil
 from datetime import date as _date
 
 from PyQt6.QtWidgets import (
@@ -14,7 +13,7 @@ from PyQt6.QtCore import Qt, QRegularExpression, QDate
 from PyQt6.QtGui import QFont, QRegularExpressionValidator
 
 from database import (
-    get_setting, set_setting, check_pin, set_pin, DB_PATH,
+    get_setting, set_setting, check_pin, set_pin, db_backup_to,
     db_bank_accounts, db_save_bank_account, db_delete_bank_account,
     db_year_end_summary, db_perform_year_end_close,
 )
@@ -845,14 +844,17 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "PIN Changed", "PIN changed successfully.")
 
     def _backup(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose Backup Folder", "")
-        if not folder:
-            return
         today = _date.today().strftime("%d%m%Y")
-        backup_name = f"UnitedMobile_Backup_{today}.db"
-        backup_path = os.path.join(folder, backup_name)
+        backup_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Database Backup",
+            f"UnitedMobile_Backup_{today}.db", "Database Files (*.db)"
+        )
+        if not backup_path:
+            return
+        if not backup_path.lower().endswith(".db"):
+            backup_path += ".db"
         try:
-            shutil.copy2(DB_PATH, backup_path)
+            db_backup_to(backup_path)
             QMessageBox.information(self, "Backup Saved", f"Backup saved to:\n{backup_path}")
         except Exception as e:
             QMessageBox.critical(self, "Backup Failed", f"Could not save backup:\n{e}")
