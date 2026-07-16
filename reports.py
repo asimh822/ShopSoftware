@@ -1,5 +1,4 @@
 import csv
-import os
 import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -136,16 +135,24 @@ def _export_table_csv(table: QTableWidget, default_name: str, parent=None):
 # Every report tab exposes a _export_payload() returning:
 #   (report_name, title, headers, rows, right_cols)
 # and places two consistently-styled buttons (Export PDF / Export CSV) top-right.
-# Files are written to a user-picked folder as <ReportName>_DDMMYYYY.<ext>.
+# A save dialog opens pre-filled with <ReportName>_DDMMYYYY.<ext>; the user can
+# pick the folder and rename the file in the same dialog.
 
 def _pick_export_path(report_name, ext, parent):
-    """Folder picker → full path <ReportName>_DDMMYYYY.<ext>, or None if cancelled."""
-    folder = QFileDialog.getExistingDirectory(parent, "Select Export Folder")
-    if not folder:
-        return None
+    """Save-file dialog pre-filled with <ReportName>_DDMMYYYY.<ext>.
+    Returns the chosen path (extension enforced), or None if cancelled."""
     today = datetime.date.today().strftime("%d%m%Y")
     safe = report_name.replace(" ", "_")
-    return os.path.join(folder, f"{safe}_{today}.{ext}")
+    filters = {"csv": "CSV Files (*.csv)", "pdf": "PDF Files (*.pdf)"}
+    path, _ = QFileDialog.getSaveFileName(
+        parent, "Export Report", f"{safe}_{today}.{ext}",
+        filters.get(ext, f"{ext.upper()} Files (*.{ext})"),
+    )
+    if not path:
+        return None
+    if not path.lower().endswith(f".{ext}"):
+        path += f".{ext}"
+    return path
 
 
 def _export_csv(report_name, headers, rows, parent=None):

@@ -541,15 +541,17 @@ class BalanceSheetPage(QWidget):
         lyt.addStretch()
 
     def _export_csv(self):
-        import os
         import csv as _csv
-        folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
-        if not folder:
+        fname = "Balance_Sheet_" + datetime.date.today().strftime("%d%m%Y") + ".csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Balance Sheet CSV", fname, "CSV Files (*.csv)"
+        )
+        if not path:
             return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
         d = self._data or bs_data()
         date_str = self._date_edit.date().toString("dd/MM/yyyy")
-        fname = "Balance_Sheet_" + datetime.date.today().strftime("%d%m%Y") + ".csv"
-        path = os.path.join(folder, fname)
 
         def _a(x):
             return int(round(x))
