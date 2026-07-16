@@ -491,7 +491,15 @@ def db_purchase_report(from_iso=None, to_iso=None, supplier_id=None,
     return rows
 
 
-def db_profit_report(from_iso=None, to_iso=None):
+def db_profit_report(from_iso=None, to_iso=None,
+                     exclude_brand_id=None, exclude_supplier_id=None):
+    """
+    Per-IMEI profit for sold stock. exclude_brand_id / exclude_supplier_id
+    drop those items from the report entirely (e.g. VIVO, whose incentive
+    arrives the following month, so its below-cost sales would distort the
+    figures). Supplier comes from the item's purchase voucher; items with no
+    purchase link (opening stock) are never excluded by supplier.
+    """
     de = _date_expr("sv.date")
     conds, params = ["si.status='sold'", "si.sold_line_id IS NOT NULL"], []
     if from_iso:
@@ -500,17 +508,27 @@ def db_profit_report(from_iso=None, to_iso=None):
     if to_iso:
         conds.append(f"{de} <= ?")
         params.append(to_iso)
+    if exclude_brand_id:
+        conds.append("b.id <> ?")
+        params.append(exclude_brand_id)
+    if exclude_supplier_id:
+        conds.append("(pv.supplier_id IS NULL OR pv.supplier_id <> ?)")
+        params.append(exclude_supplier_id)
     where = "WHERE " + " AND ".join(conds)
     conn = get_connection()
     rows = conn.execute(f"""
         SELECT sv.date date_sold, b.name brand, m.name model,
                si.imei, si.purchase_price, sl.final_price,
-               (sl.final_price - si.purchase_price) profit
+               (sl.final_price - si.purchase_price) profit,
+               sup.name supplier
         FROM stock_items si
         JOIN models m ON m.id = si.model_id
         JOIN brands b ON b.id = m.brand_id
         JOIN sale_lines sl ON sl.id = si.sold_line_id
         JOIN sale_vouchers sv ON sv.id = sl.sv_id
+        LEFT JOIN purchase_lines pl ON pl.id = si.purchase_line_id
+        LEFT JOIN purchase_vouchers pv ON pv.id = pl.pv_id
+        LEFT JOIN suppliers sup ON sup.id = pv.supplier_id
         {where}
         ORDER BY {de} DESC
     """, params).fetchall()
@@ -1732,6 +1750,20 @@ class ProfitReportTab(QWidget):
         self.to_date.setDisplayFormat("dd/MM/yyyy")
         self.to_date.setCalendarPopup(True)
 
+        # Exclude filters — e.g. VIVO pays its incentive the following month,
+        # so those below-cost sales can be left out of the profit figures.
+        self.excl_brand_combo = QComboBox()
+        self.excl_brand_combo.setMinimumWidth(130)
+        self.excl_brand_combo.addItem("— None —", None)
+        for b in db_brands_list():
+            self.excl_brand_combo.addItem(b["name"], b["id"])
+
+        self.excl_sup_combo = QComboBox()
+        self.excl_sup_combo.setMinimumWidth(150)
+        self.excl_sup_combo.addItem("— None —", None)
+        for s in db_suppliers_list():
+            self.excl_sup_combo.addItem(s["name"], s["id"])
+
         btn_search = QPushButton("Search")
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
@@ -1740,6 +1772,8 @@ class ProfitReportTab(QWidget):
         layout.addWidget(_filter_card(
             QLabel("Date Sold From:"), self.from_date,
             QLabel("To:"), self.to_date,
+            QLabel("Exclude Brand:"), self.excl_brand_combo,
+            QLabel("Exclude Supplier:"), self.excl_sup_combo,
             btn_search, None, btn_pdf, btn_csv,
         ))
 
@@ -1779,7 +1813,7 @@ class ProfitReportTab(QWidget):
         layout.addWidget(detail_lbl)
 
         self.table = _make_table(
-            ["Date Sold", "Brand", "Model", "IMEI",
+            ["Date Sold", "Brand", "Model", "IMEI", "Supplier",
              "Purchase Price (PKR)", "Sale Price (PKR)", "Profit (PKR)"]
         )
         layout.addWidget(self.table, stretch=1)
@@ -1796,7 +1830,11 @@ class ProfitReportTab(QWidget):
     def refresh(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
         to_iso   = self.to_date.date().toString("yyyy-MM-dd")
-        rows = db_profit_report(from_iso, to_iso)
+        rows = db_profit_report(
+            from_iso, to_iso,
+            exclude_brand_id=self.excl_brand_combo.currentData(),
+            exclude_supplier_id=self.excl_sup_combo.currentData(),
+        )
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
@@ -1811,12 +1849,13 @@ class ProfitReportTab(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(r["brand"]))
             self.table.setItem(row, 2, QTableWidgetItem(r["model"]))
             self.table.setItem(row, 3, QTableWidgetItem(r["imei"]))
+            self.table.setItem(row, 4, QTableWidgetItem(r["supplier"] or "—"))
             for col, val in [
-                (4, r["purchase_price"]), (5, r["final_price"]), (6, r["profit"])
+                (5, r["purchase_price"]), (6, r["final_price"]), (7, r["profit"])
             ]:
                 item = QTableWidgetItem(fmt_pkr(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                if col == 6:
+                if col == 7:
                     profit = r["profit"] or 0
                     item.setForeground(
                         QBrush(QColor("#16a34a") if profit >= 0 else QColor("#dc2626"))
@@ -1912,8 +1951,17 @@ class ProfitReportTab(QWidget):
         # ── Footer ───────────────────────────────────────────────────────
         n = len(rows)
         profit_color = "#16a34a" if total_profit >= 0 else "#dc2626"
+        excl_parts = []
+        if self.excl_brand_combo.currentData():
+            excl_parts.append(f"brand {self.excl_brand_combo.currentText()}")
+        if self.excl_sup_combo.currentData():
+            excl_parts.append(f"supplier {self.excl_sup_combo.currentText()}")
+        excl_note = (
+            f"    |    <span style='color:#d97706;'>Excluding "
+            f"{' and '.join(excl_parts)}</span>" if excl_parts else ""
+        )
         self.footer.setText(
-            f"{n} item{'s' if n != 1 else ''} sold    |    "
+            f"{n} item{'s' if n != 1 else ''} sold{excl_note}    |    "
             f"<span style='color:{profit_color};'>Gross Profit: Rs. {fmt_pkr(total_profit)}</span>"
             f"    |    "
             f"Other Income (Incentives): Rs. {fmt_pkr(incentives)}"
@@ -1928,17 +1976,22 @@ class ProfitReportTab(QWidget):
     def _export_payload(self):
         headers, rows = _table_to_rows(self.table)
         # Append the summary figures (shown as cards on screen) as trailing rows.
-        blank = ["", "", "", "", "", "", ""]
+        blank = ["", "", "", "", "", "", "", ""]
         summary = [
-            ["", "", "", "", "", "Sales Revenue",     self._lbl_revenue.text()],
-            ["", "", "", "", "", "Purchase Cost",     self._lbl_cost.text()],
-            ["", "", "", "", "", "Gross Profit",      self._lbl_gross.text()],
-            ["", "", "", "", "", "Other Income (Incentives Income)", self._lbl_incentive.text()],
-            ["", "", "", "", "", "Total Expenses",    self._lbl_expenses.text()],
-            ["", "", "", "", "", "Net Profit",        self._lbl_net.text()],
+            ["", "", "", "", "", "", "Sales Revenue",     self._lbl_revenue.text()],
+            ["", "", "", "", "", "", "Purchase Cost",     self._lbl_cost.text()],
+            ["", "", "", "", "", "", "Gross Profit",      self._lbl_gross.text()],
+            ["", "", "", "", "", "", "Other Income (Incentives Income)", self._lbl_incentive.text()],
+            ["", "", "", "", "", "", "Total Expenses",    self._lbl_expenses.text()],
+            ["", "", "", "", "", "", "Net Profit",        self._lbl_net.text()],
         ]
-        return ("Profit_Report", "Profit Report", headers,
-                rows + [blank] + summary, {4, 5, 6})
+        title = "Profit Report"
+        if self.excl_brand_combo.currentData():
+            title += f" — excl. brand {self.excl_brand_combo.currentText()}"
+        if self.excl_sup_combo.currentData():
+            title += f" — excl. supplier {self.excl_sup_combo.currentText()}"
+        return ("Profit_Report", title, headers,
+                rows + [blank] + summary, {5, 6, 7})
 
 
 # ── Tab 6: IMEI Stock (flat table: Brand | Model | IMEI | Supplier | Date | Price | Use) ──

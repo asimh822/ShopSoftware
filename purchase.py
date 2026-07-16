@@ -1201,11 +1201,17 @@ class PurchaseForm(QWidget):
         row2.setSpacing(10)
         row2.addWidget(QLabel("IMEI (15 digits):"))
         self.imei_edit = QLineEdit()
-        self.imei_edit.setPlaceholderText("Enter 15-digit IMEI")
+        self.imei_edit.setPlaceholderText("Enter 15-digit IMEI  ·  Ctrl = edit prices")
+        self.imei_edit.setToolTip(
+            "Press Ctrl (alone) to update the price of all added\n"
+            "IMEIs of a model in one go."
+        )
         self.imei_edit.setMaxLength(15)
         self.imei_edit.setMinimumWidth(200)
         self.imei_edit.setProperty("enterKeepDefault", True)
         self.imei_edit.returnPressed.connect(self._add_line)
+        self._ctrl_pending = False
+        self.imei_edit.installEventFilter(self)
         row2.addWidget(self.imei_edit, stretch=1)
 
         self.btn_add_line = QPushButton("+ Add IMEI")
@@ -1554,6 +1560,48 @@ class PurchaseForm(QWidget):
         self._lines.pop(idx)
         self._refresh_lines_table()
 
+    # ── Bulk price editor (Ctrl in the IMEI field) ────────────────────────────
+
+    def eventFilter(self, obj, event):
+        if obj is self.imei_edit:
+            # A *bare* Ctrl press-and-release opens the bulk price editor;
+            # Ctrl held as a modifier (Ctrl+V paste etc.) must not trigger it.
+            if event.type() == QEvent.Type.KeyPress:
+                self._ctrl_pending = (event.key() == Qt.Key.Key_Control)
+            elif event.type() == QEvent.Type.KeyRelease:
+                if event.key() == Qt.Key.Key_Control and self._ctrl_pending:
+                    self._ctrl_pending = False
+                    self._open_bulk_price_dialog()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _open_bulk_price_dialog(self):
+        if not self._lines:
+            QMessageBox.information(
+                self, "No Items", "Add at least one IMEI first."
+            )
+            return
+        from bulk_price_dialog import BulkPriceDialog
+        groups = {}
+        for model_id, brand, model, imei, price in self._lines:
+            g = groups.get(model_id)
+            if g is None:
+                groups[model_id] = {
+                    "model_id": model_id, "label": f"{brand} {model}",
+                    "qty": 1, "price": price, "net": price,
+                }
+            else:
+                g["qty"] += 1
+        dlg = BulkPriceDialog(list(groups.values()), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_nets = dlg.result_prices()
+            self._lines = [
+                (mid, b, m, imei, new_nets.get(mid, price))
+                for (mid, b, m, imei, price) in self._lines
+            ]
+            self._refresh_lines_table()
+        self.imei_edit.setFocus()
+
     def _save(self):
         if not self._lines:
             QMessageBox.warning(self, "Missing", "Add at least one IMEI line.")
@@ -1634,13 +1682,6 @@ class PurchaseForm(QWidget):
             except sqlite3.IntegrityError as e:
                 QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
                 return
-
-            # Print cash purchase receipt
-            try:
-                from receipt import print_cash_purchase_receipt
-                print_cash_purchase_receipt(pv_number, parent=self)
-            except Exception:
-                pass
 
             QMessageBox.information(self, "Saved",
                 f"Cash Purchase {pv_number} saved.\n"

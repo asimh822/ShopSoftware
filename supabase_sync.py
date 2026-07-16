@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import sqlite3
 import requests
 import json
@@ -31,6 +32,29 @@ def _load_key() -> str:
 SUPABASE_KEY = _load_key()
 
 DB_PATH = os.path.join(_BASE_DIR, "united_mobile.db")
+
+
+def _request_with_retry(method, url, attempts=3, **kwargs):
+    """
+    requests.request() with retries on transient network failures
+    (ConnectionResetError 10054, timeouts, DNS blips on shop Wi-Fi).
+    HTTP error responses are NOT retried — those are real API errors
+    and are handled by status-code checks at the call sites.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.request(method, url, **kwargs)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            if attempt == attempts:
+                raise
+            wait = 3 * attempt
+            print(
+                f"[Supabase Sync] Network error on {method} "
+                f"({e.__class__.__name__}) — retrying in {wait}s "
+                f"(attempt {attempt}/{attempts - 1})"
+            )
+            time.sleep(wait)
 
 
 def _get_conn():
@@ -128,7 +152,8 @@ def push_deletions():
             chunk = entries[i:i + 100]
             ids = ",".join(str(e["row_id"]) for e in chunk)
             try:
-                resp = requests.delete(
+                resp = _request_with_retry(
+                    "DELETE",
                     f"{SUPABASE_URL}/rest/v1/{table}?id=in.({ids})",
                     headers=headers, timeout=30,
                 )
@@ -192,13 +217,21 @@ def upsert_to_supabase(table, rows):
         if row.get('last_modified'):
             row['last_modified'] = row['last_modified'].replace(' ', 'T') + 'Z'
     url = f"{SUPABASE_URL}/rest/v1/{table}"
+    # Chunked so one giant payload can't stall the connection long enough
+    # for the server/router to reset it. A chunk that fails after retries
+    # raises; already-pushed chunks are re-upserted next sync harmlessly
+    # (merge-duplicates) because the watermark is not advanced on error.
     # timeout matters: without it a network stall hangs the sync thread
     # forever and no sync ever runs again until the app is restarted
-    response = requests.post(url, headers=headers, data=json.dumps(rows), timeout=60)
-    if response.status_code not in (200, 201):
-        raise RuntimeError(
-            f"Upsert failed ({response.status_code}): {response.text[:200]}"
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i + 500]
+        response = _request_with_retry(
+            "POST", url, headers=headers, data=json.dumps(chunk), timeout=60
         )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Upsert failed ({response.status_code}): {response.text[:200]}"
+            )
     return len(rows)
 
 

@@ -945,6 +945,10 @@ class SaleForm(QWidget):
         imei_row.setSpacing(8)
         self.imei_input = QLineEdit()
         self.imei_input.setPlaceholderText("Type 5+ digits to search…")
+        self.imei_input.setToolTip(
+            "Press Ctrl (alone) to update the price of all added\n"
+            "IMEIs of a model in one go."
+        )
         self.imei_input.setFixedWidth(148)
         self.imei_input.setProperty("enterKeepDefault", True)
         self.imei_input.textChanged.connect(self._on_imei_changed)
@@ -953,6 +957,7 @@ class SaleForm(QWidget):
 
         self._imei_dropdown = ImeiDropdown(self)
         self._imei_dropdown.imei_chosen.connect(self._on_dropdown_select)
+        self._ctrl_pending = False
         self.imei_input.installEventFilter(self)
 
         btn_browse = QPushButton("Browse All Stock")
@@ -1545,6 +1550,36 @@ class SaleForm(QWidget):
         self._lines.pop(idx)
         self._refresh_lines_table()
 
+    # ── Bulk price editor (Ctrl in the IMEI field) ────────────────────────────
+
+    def _open_bulk_price_dialog(self):
+        if not self._lines:
+            QMessageBox.information(
+                self, "No Items", "Add at least one IMEI first."
+            )
+            return
+        self._imei_dropdown.hide()
+        from bulk_price_dialog import BulkPriceDialog
+        groups = {}
+        for sid, mid, brand, model, imei, ref, final, pp in self._lines:
+            g = groups.get(mid)
+            if g is None:
+                groups[mid] = {
+                    "model_id": mid, "label": f"{brand} {model}",
+                    "qty": 1, "price": ref or 0, "net": final,
+                }
+            else:
+                g["qty"] += 1
+        dlg = BulkPriceDialog(list(groups.values()), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_nets = dlg.result_prices()
+            self._lines = [
+                (sid, mid, b, m, im, ref, new_nets.get(mid, final), pp)
+                for (sid, mid, b, m, im, ref, final, pp) in self._lines
+            ]
+            self._refresh_lines_table()
+        self.imei_input.setFocus()
+
     def _get_total(self):
         subtotal = sum(l[6] for l in self._lines)
         return subtotal - self.discount_spin.value()
@@ -1699,6 +1734,9 @@ class SaleForm(QWidget):
     def eventFilter(self, obj, event):
         if obj is self.imei_input:
             if event.type() == QEvent.Type.KeyPress:
+                # A *bare* Ctrl press-and-release opens the bulk price editor;
+                # Ctrl held as a modifier (Ctrl+V paste etc.) must not trigger it.
+                self._ctrl_pending = (event.key() == Qt.Key.Key_Control)
                 if self._imei_dropdown.isVisible():
                     key = event.key()
                     if key == Qt.Key.Key_Down:
@@ -1710,6 +1748,11 @@ class SaleForm(QWidget):
                     elif key == Qt.Key.Key_Escape:
                         self._imei_dropdown.hide()
                         return True
+            elif event.type() == QEvent.Type.KeyRelease:
+                if event.key() == Qt.Key.Key_Control and self._ctrl_pending:
+                    self._ctrl_pending = False
+                    self._open_bulk_price_dialog()
+                    return True
             elif event.type() == QEvent.Type.FocusOut:
                 # Small delay so a click on the dropdown is processed before it hides
                 def _maybe_hide_sale():
