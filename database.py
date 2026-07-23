@@ -289,6 +289,7 @@ def _run_migrations(conn) -> None:
         20: _migrate_v20,
         21: _migrate_v21,
         22: _migrate_v22,
+        23: _migrate_v23,
     }
 
     current = _get_db_version(conn)
@@ -1096,6 +1097,109 @@ def _migrate_v22(conn) -> None:
         SET credit = debit, debit = 0
         WHERE party_type='incentive_income' AND debit > 0 AND credit = 0
     """)
+
+
+def _migrate_v23(conn) -> None:
+    """
+    Version 23 — One JV format, once and for all.
+
+    Pre-unification JVs stored their party side in journal_entries (legacy
+    debit/credit convention) and their bank side as bank_transactions rows
+    with source='jv'. Every balance formula since has had to read BOTH
+    generations of data — a recurring source of drift bugs (Cash Book and
+    the mobile dashboard each got the bank balance wrong by missing one
+    generation). This migration rewrites each legacy JV as standard
+    double-entry journal_voucher_lines and deletes the originals, so there
+    is exactly one representation of every JV from here on. The remaining
+    legacy readers (they all pair journal_entries sums with
+    db_jvl_legacy_equivalent) keep working: their legacy terms become 0 and
+    their jvl terms grow by the same amounts.
+
+    Sign mapping is identical to db_jvl_legacy_equivalent:
+      supplier  — inverted (legacy credit = owe less → new DEBIT)
+      customer/other/expense — direct
+      bank bt   — CP (money in) → debit, CR (money out) → credit
+
+    Row ids are fixed offsets from the legacy ids so the migration is
+    deterministic: the dev and shop PCs produce identical rows, and
+    Supabase upserts from either machine converge instead of colliding.
+    The last_modified triggers stamp the new rows (so they sync up) and
+    the sync_delete triggers tombstone the removed ones (so remote copies
+    are cleaned too).
+    Do NOT add conn.commit() here — _run_migrations() commits per version.
+    """
+    c = conn.cursor()
+
+    legacy = c.execute(
+        "SELECT id, jv_number, party_type, party_id, date, amount, type, notes "
+        "FROM journal_entries ORDER BY id"
+    ).fetchall()
+
+    groups: dict = {}
+    for je in legacy:
+        groups.setdefault(je[1], []).append(je)
+
+    def _header_id(jv_number, fallback_id):
+        row = c.execute(
+            "SELECT id FROM journal_vouchers WHERE jv_number=?", (jv_number,)
+        ).fetchone()
+        return row[0] if row else fallback_id
+
+    for jv_number, entries in groups.items():
+        head = entries[0]
+        jv_id = _header_id(jv_number, 900000 + head[0])
+        c.execute(
+            "INSERT OR IGNORE INTO journal_vouchers (id, jv_number, date, notes) "
+            "VALUES (?,?,?,?)",
+            (jv_id, jv_number, head[4], head[7] or ""),
+        )
+        for je in entries:
+            amount = float(je[5] or 0)
+            if je[2] == "supplier":
+                dr, cr = (amount, 0.0) if je[6] == "credit" else (0.0, amount)
+            else:
+                dr, cr = (amount, 0.0) if je[6] == "debit" else (0.0, amount)
+            c.execute(
+                "INSERT OR REPLACE INTO journal_voucher_lines "
+                "(id, jv_id, party_type, party_id, debit, credit, reference) "
+                "VALUES (?,?,?,?,?,?, '')",
+                (910000 + je[0], jv_id, je[2], je[3], dr, cr),
+            )
+        for bt in c.execute(
+            "SELECT id, type, bank_account_id, amount FROM bank_transactions "
+            "WHERE source='jv' AND voucher_number=?", (jv_number,)
+        ).fetchall():
+            dr, cr = (float(bt[3]), 0.0) if bt[1] == "CP" else (0.0, float(bt[3]))
+            c.execute(
+                "INSERT OR REPLACE INTO journal_voucher_lines "
+                "(id, jv_id, party_type, party_id, debit, credit, reference) "
+                "VALUES (?,?,?,?,?,?, '')",
+                (920000 + bt[0], jv_id, "bank", bt[2], dr, cr),
+            )
+            c.execute("DELETE FROM bank_transactions WHERE id=?", (bt[0],))
+        for je in entries:
+            c.execute("DELETE FROM journal_entries WHERE id=?", (je[0],))
+
+    # Defensive: bank-side jv rows whose journal_entries partner is gone
+    # (none exist today, but the shop DB is migrated later and separately).
+    for bt in c.execute(
+        "SELECT id, voucher_number, type, bank_account_id, date, amount, notes "
+        "FROM bank_transactions WHERE source='jv'"
+    ).fetchall():
+        jv_id = _header_id(bt[1], 905000 + bt[0])
+        c.execute(
+            "INSERT OR IGNORE INTO journal_vouchers (id, jv_number, date, notes) "
+            "VALUES (?,?,?,?)",
+            (jv_id, bt[1], bt[4], bt[6] or ""),
+        )
+        dr, cr = (float(bt[5]), 0.0) if bt[2] == "CP" else (0.0, float(bt[5]))
+        c.execute(
+            "INSERT OR REPLACE INTO journal_voucher_lines "
+            "(id, jv_id, party_type, party_id, debit, credit, reference) "
+            "VALUES (?,?,?,?,?,?, '')",
+            (920000 + bt[0], jv_id, "bank", bt[3], dr, cr),
+        )
+        c.execute("DELETE FROM bank_transactions WHERE id=?", (bt[0],))
 
 
 _SUPABASE_SYNC_TABLES = [
@@ -2706,40 +2810,12 @@ def db_delete_sale_voucher(sv_id: int, deleted_by: str, reason: str):
                 (line["stock_item_id"],)
             )
 
-        if r["type"] == "credit" and lines:
-            total = r["total_amount"] or 0
-            cust_id = lines[0]["customer_id"]
-            conn.execute(
-                "UPDATE customers SET opening_balance = opening_balance - ? WHERE id=?",
-                (total, cust_id)
-            )
-
-        pm = r["payment_method"]
-        total = r["total_amount"] or 0
-        cash_amt = r["cash_paid"] or 0
-        bank_amt = r["bank_amount"] or 0
-        bank_acct_id = r["bank_account_id"]
-        if pm == "cash":
-            conn.execute(
-                "UPDATE settings SET value = CAST(CAST(value AS REAL) - ? AS TEXT) WHERE key='cash_opening_balance'",
-                (total,)
-            )
-        elif pm == "bank":
-            if bank_acct_id:
-                conn.execute(
-                    "UPDATE bank_accounts SET opening_balance = opening_balance - ? WHERE id=?",
-                    (total, bank_acct_id)
-                )
-        elif pm == "split":
-            conn.execute(
-                "UPDATE settings SET value = CAST(CAST(value AS REAL) - ? AS TEXT) WHERE key='cash_opening_balance'",
-                (cash_amt,)
-            )
-            if bank_acct_id:
-                conn.execute(
-                    "UPDATE bank_accounts SET opening_balance = opening_balance - ? WHERE id=?",
-                    (bank_amt, bank_acct_id)
-                )
+        # Customer balances and cash/bank in hand are computed live from
+        # voucher rows (_party_closing_balance, db_cash_in_hand,
+        # db_bank_account_closing_balance) — deleting the voucher rows below
+        # IS the complete reversal. Do NOT touch any opening_balance here:
+        # doing so double-counts the removal (this corrupted
+        # cash_opening_balance by -119,000 across SV-0242 and SV-0300).
 
         conn.execute("DELETE FROM sale_lines WHERE sv_id=?", (sv_id,))
         conn.execute("DELETE FROM sale_vouchers WHERE id=?", (sv_id,))
@@ -2794,36 +2870,18 @@ def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
             if line["stock_item_id"]:
                 db_remove_stock_item(conn, line["stock_item_id"])
 
-        if lines:
-            total = r["total_amount"] or 0
-            sup_id = lines[0]["supplier_id"]
-            if sup_id:
-                conn.execute(
-                    "UPDATE suppliers SET opening_balance = opening_balance - ? WHERE id=?",
-                    (total, sup_id)
-                )
-
-        # Reverse cash/bank outflow recorded at purchase time
+        # Supplier balances and cash in hand are computed live from voucher
+        # rows — deleting the voucher rows below is the complete reversal;
+        # adjusting opening_balance here would double-count (see the same
+        # note in db_delete_sale_voucher). The one thing that DOES need
+        # explicit cleanup is the bank_transactions outflow row written at
+        # purchase time, since it is a separate record.
         ptype = (r.get("purchase_type") or "").strip().lower()
-        if ptype == "cash":
-            cash_amt = float(r.get("cash_amount") or 0)
-            bank_amt = float(r.get("bank_amount") or 0)
-            bank_acct_id = r.get("bank_account_id")
-            if cash_amt > 0:
-                conn.execute(
-                    "UPDATE settings SET value = CAST(CAST(value AS REAL) + ? AS TEXT) "
-                    "WHERE key='cash_opening_balance'",
-                    (cash_amt,)
-                )
-            if bank_amt > 0 and bank_acct_id:
-                conn.execute(
-                    "UPDATE bank_accounts SET opening_balance = opening_balance + ? WHERE id=?",
-                    (bank_amt, bank_acct_id)
-                )
-                conn.execute(
-                    "DELETE FROM bank_transactions WHERE voucher_number=?",
-                    (r["pv_number"],)
-                )
+        if ptype == "cash" and float(r.get("bank_amount") or 0) > 0:
+            conn.execute(
+                "DELETE FROM bank_transactions WHERE voucher_number=?",
+                (r["pv_number"],)
+            )
 
         conn.execute("DELETE FROM purchase_lines WHERE pv_id=?", (pv_id,))
         conn.execute("DELETE FROM purchase_vouchers WHERE id=?", (pv_id,))
@@ -2840,6 +2898,24 @@ def db_delete_purchase_voucher(pv_id: int, deleted_by: str, reason: str):
         conn.commit()
     finally:
         conn.close()
+
+
+def _delete_return_journal_entry(conn, notes_text: str) -> bool:
+    """
+    Remove the one-line JV a sales/purchase return wrote at creation time
+    (via _insert_party_journal_line, notes like 'Sales Return — SR-0001').
+    Returns True if a matching JV was found and deleted; the caller then
+    skips its opening_balance fallback (needed only for returns created
+    before returns recorded their balance effect as JV lines).
+    """
+    row = conn.execute(
+        "SELECT id FROM journal_vouchers WHERE notes=?", (notes_text,)
+    ).fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM journal_voucher_lines WHERE jv_id=?", (row[0],))
+    conn.execute("DELETE FROM journal_vouchers WHERE id=?", (row[0],))
+    return True
 
 
 def db_delete_sale_return(sr_id: int, deleted_by: str, reason: str):
@@ -2869,10 +2945,12 @@ def db_delete_sale_return(sr_id: int, deleted_by: str, reason: str):
             )
 
         if r["customer_id"]:
-            conn.execute(
-                "UPDATE customers SET opening_balance = opening_balance + ? WHERE id=?",
-                (total, r["customer_id"])
-            )
+            if not _delete_return_journal_entry(
+                    conn, f"Sales Return — {r['sr_number']}"):
+                conn.execute(
+                    "UPDATE customers SET opening_balance = opening_balance + ? WHERE id=?",
+                    (total, r["customer_id"])
+                )
 
         conn.execute("DELETE FROM sale_return_lines WHERE sr_id=?", (sr_id,))
         conn.execute("DELETE FROM sale_returns WHERE id=?", (sr_id,))
@@ -2920,10 +2998,12 @@ def db_delete_purchase_return(pr_id: int, deleted_by: str, reason: str):
             """, (line["model_id"], line["imei"], line["return_price"] or 0))
 
         if r["supplier_id"]:
-            conn.execute(
-                "UPDATE suppliers SET opening_balance = opening_balance + ? WHERE id=?",
-                (total, r["supplier_id"])
-            )
+            if not _delete_return_journal_entry(
+                    conn, f"Purchase Return — {r['pr_number']}"):
+                conn.execute(
+                    "UPDATE suppliers SET opening_balance = opening_balance + ? WHERE id=?",
+                    (total, r["supplier_id"])
+                )
 
         conn.execute("DELETE FROM purchase_return_lines WHERE pr_id=?", (pr_id,))
         conn.execute("DELETE FROM purchase_returns WHERE id=?", (pr_id,))
