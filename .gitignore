@@ -13,6 +13,9 @@ dist/
 # ── Secrets — never commit ────────────────────────────────────────────────────
 supabase_key.txt
 
+# ── Dev-PC marker — disables auto Supabase sync locally, never deploy ─────────
+NO_SYNC.flag
+
 # ── Shop deployment staging (contains DB, key, APK) ───────────────────────────
 Shop/
 Shop.rar

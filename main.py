@@ -1720,7 +1720,9 @@ def main():
     _start_api_server()
     _prevent_sleep()
 
-    # DEV PC — Supabase sync disabled. Only the shop PC should push data.
+    # Automatic Supabase sync runs inside api_server.py (launched above),
+    # NOT here. A NO_SYNC.flag file next to api_server.py disables it —
+    # that flag exists only on the dev PC, so only the shop PC pushes data.
     # sync_thread = threading.Thread(target=_sync_loop, daemon=True)
     # sync_thread.start()
 

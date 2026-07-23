@@ -26,6 +26,12 @@ except ImportError:
 # ── Database path — same resolution as main.py / database.py ─────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "united_mobile.db")
 
+# Marker file — exists ONLY on the dev PC (gitignored, never deployed).
+# When present, the automatic hourly Supabase sync is skipped so a stale
+# dev database can never overwrite fresh shop data in the cloud.
+# The manual "Sync to Cloud" button in the desktop app is unaffected.
+NO_SYNC_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NO_SYNC.flag")
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -934,11 +940,12 @@ def _calc_cash_in_hand(conn) -> float:
 def _calc_bank_account_balance(conn, account_id: int) -> float:
     """Compute current balance for one bank account.
 
-    Formula:
+    Mirrors database.py db_bank_account_closing_balance() exactly:
       opening_balance
       + sale_vouchers.bank_amount  (bank/split sales paid into this account)
-      + payments CP (party=bank)   (cash deposited to bank via ledger)
-      - payments CR (party=bank)   (cash withdrawn from bank via ledger)
+      + bank_transactions CP  (money in: cash deposits, pre-unification JV Dr)
+      - bank_transactions CR  (money out: withdrawals, bank purchases/expenses,
+                               pre-unification JV Cr)
       + journal_voucher_lines debit   (bank DR in JV = bank receives)
       - journal_voucher_lines credit  (bank CR in JV = bank pays)
     """
@@ -954,14 +961,14 @@ def _calc_bank_account_balance(conn, account_id: int) -> float:
     ).fetchone()[0] or 0)
 
     cp = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM payments "
-        "WHERE party_type='bank' AND party_id=? AND type='CP'",
+        "SELECT COALESCE(SUM(amount),0) FROM bank_transactions "
+        "WHERE bank_account_id=? AND type='CP'",
         (account_id,)
     ).fetchone()[0] or 0)
 
     cr = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM payments "
-        "WHERE party_type='bank' AND party_id=? AND type='CR'",
+        "SELECT COALESCE(SUM(amount),0) FROM bank_transactions "
+        "WHERE bank_account_id=? AND type='CR'",
         (account_id,)
     ).fetchone()[0] or 0)
 
@@ -1248,7 +1255,9 @@ if __name__ == "__main__":
     print("  Listening: http://0.0.0.0:5000")
     print("=" * 54)
 
-    if _SUPABASE_AVAILABLE:
+    if os.path.exists(NO_SYNC_FLAG):
+        print("  Supabase : NO_SYNC.flag present — auto-sync disabled (dev PC)")
+    elif _SUPABASE_AVAILABLE:
         _t = threading.Thread(target=_sync_loop, daemon=True)
         _t.start()
         print("  Supabase : sync thread started (first run in 30 s)")

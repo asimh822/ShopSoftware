@@ -103,6 +103,27 @@ def _filter_card(*widgets) -> QFrame:
     return card
 
 
+def _filter_card_rows(*rows) -> QFrame:
+    """Filter card with multiple widget rows — for tabs whose filters do not
+    fit on a single line without getting squeezed. Each argument is a
+    list/tuple of widgets; None inserts a stretch."""
+    card = QFrame()
+    card.setStyleSheet(CARD_STYLE)
+    v = QVBoxLayout(card)
+    v.setContentsMargins(12, 10, 12, 10)
+    v.setSpacing(8)
+    for widgets in rows:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        for w in widgets:
+            if w is None:
+                row.addStretch()
+            else:
+                row.addWidget(w)
+        v.addLayout(row)
+    return card
+
+
 def _date_expr(col):
     return f"substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2)"
 
@@ -704,6 +725,9 @@ def db_cash_book(date_str: str) -> dict:
     )
 
     # ── Opening Bank — all bank movements BEFORE iso ──────────────────────
+    # JV bank effects live in two places: pre-unification JVs wrote
+    # bank_transactions rows (source='jv'), post-unification JVs write only
+    # journal_voucher_lines — both must be counted, each exactly once.
     bank_ob = _q("SELECT COALESCE(SUM(opening_balance),0) FROM bank_accounts")
     opening_bank = (
         bank_ob
@@ -713,6 +737,12 @@ def db_cash_book(date_str: str) -> dict:
              f" WHERE bt.type='CP' AND {de_bt}<?", (iso,))
         - _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
              f" WHERE bt.type='CR' AND {de_bt}<?", (iso,))
+        + _q(f"SELECT COALESCE(SUM(jvl.debit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='bank' AND {de_jv}<?", (iso,))
+        - _q(f"SELECT COALESCE(SUM(jvl.credit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='bank' AND {de_jv}<?", (iso,))
     )
 
     # ── Today's transaction rows ──────────────────────────────────────────
@@ -890,16 +920,22 @@ def db_cash_book(date_str: str) -> dict:
     total_cash_in  = sum(r["cash_in"]  for r in rows)
     total_cash_out = sum(r["cash_out"] for r in rows)
 
-    # Bank in today: bank portion of sales + all bank CP transactions
+    # Bank in today: bank portion of sales + bank CP transactions + JV Dr Bank
     total_bank_in = (
         _q(f"SELECT COALESCE(SUM(sv.bank_amount),0) FROM sale_vouchers sv"
            f" WHERE sv.bank_amount>0 AND {de_sv}=?", (iso,))
         + _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
              f" WHERE bt.type='CP' AND {de_bt}=?", (iso,))
+        + _q(f"SELECT COALESCE(SUM(jvl.debit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='bank' AND {de_jv}=?", (iso,))
     )
-    total_bank_out = _q(
-        f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
-        f" WHERE bt.type='CR' AND {de_bt}=?", (iso,)
+    total_bank_out = (
+        _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
+           f" WHERE bt.type='CR' AND {de_bt}=?", (iso,))
+        + _q(f"SELECT COALESCE(SUM(jvl.credit),0) FROM journal_voucher_lines jvl"
+             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
+             f" WHERE jvl.party_type='bank' AND {de_jv}=?", (iso,))
     )
 
     closing_cash = opening_cash + total_cash_in  - total_cash_out
@@ -2139,6 +2175,10 @@ class BrandProfitReportTab(QWidget):
         for s in db_suppliers_list():
             self.excl_sup_combo.addItem(s["name"], s["id"])
 
+        btn_current_month = QPushButton("Current Month")
+        btn_current_month.setStyleSheet(BTN_SECONDARY)
+        btn_current_month.clicked.connect(self._set_current_month)
+
         btn_last_month = QPushButton("Last Month")
         btn_last_month.setStyleSheet(BTN_SECONDARY)
         btn_last_month.clicked.connect(self._set_last_month)
@@ -2152,13 +2192,15 @@ class BrandProfitReportTab(QWidget):
         btn_clear.clicked.connect(self._clear_filters)
 
         btn_pdf, btn_csv = _make_export_buttons(self)
-        layout.addWidget(_filter_card(
-            QLabel("Brand:"), self.brand_combo,
-            QLabel("From:"), self.from_date,
-            QLabel("To:"), self.to_date,
-            QLabel("Exclude Brand:"), self.excl_brand_combo,
-            QLabel("Exclude Supplier:"), self.excl_sup_combo,
-            btn_last_month, btn_search, btn_clear, None, btn_pdf, btn_csv,
+        # Two rows — everything on one line was too squeezed to use.
+        layout.addWidget(_filter_card_rows(
+            [QLabel("Brand:"), self.brand_combo,
+             QLabel("From:"), self.from_date,
+             QLabel("To:"), self.to_date,
+             btn_current_month, btn_last_month, btn_search, btn_clear, None],
+            [QLabel("Exclude Brand:"), self.excl_brand_combo,
+             QLabel("Exclude Supplier:"), self.excl_sup_combo,
+             None, btn_pdf, btn_csv],
         ))
 
         self.table = _make_table(
@@ -2196,6 +2238,12 @@ class BrandProfitReportTab(QWidget):
         last_month_end = last_month_start.addDays(last_month_start.daysInMonth() - 1)
         self.from_date.setDate(last_month_start)
         self.to_date.setDate(last_month_end)
+        self.refresh()
+
+    def _set_current_month(self):
+        today = QDate.currentDate()
+        self.from_date.setDate(QDate(today.year(), today.month(), 1))
+        self.to_date.setDate(today)
         self.refresh()
 
     def _clear_filters(self):

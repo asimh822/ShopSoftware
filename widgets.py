@@ -44,6 +44,12 @@ class SearchableComboBox(QComboBox):
         self.lineEdit().setProperty("enterKeepDefault", True)
         self.lineEdit().returnPressed.connect(self._on_return_pressed)
 
+        # When Enter selects an item from the popup, QCompleter emits
+        # activated() AND forwards the same key press to the line edit,
+        # firing returnPressed too. Without this guard both handlers would
+        # advance focus, skipping one field (e.g. Brand → Ref Price).
+        self._activated_pending = False
+
     # ── Focus handling — auto-clear placeholder, restore on blur ─────────────
 
     def focusInEvent(self, event):
@@ -82,11 +88,21 @@ class SearchableComboBox(QComboBox):
         if idx >= 0:
             self.setCurrentIndex(idx)
         # Advance to next field after selection (Enter=Tab rule)
-        QTimer.singleShot(0, self.focusNextChild)
+        self._activated_pending = True
+        QTimer.singleShot(0, self._advance_after_activated)
+
+    def _advance_after_activated(self):
+        self._activated_pending = False
+        self.focusNextChild()
 
     # ── Enter pressed when popup is NOT open ─────────────────────────────────
 
     def _on_return_pressed(self):
+        if self._activated_pending:
+            # This Enter was already handled by the completer popup
+            # (activated fired); the forwarded key event must not advance
+            # focus a second time.
+            return
         text = self.lineEdit().text()
         idx = self.findText(text, Qt.MatchFlag.MatchExactly)
         if idx < 0:

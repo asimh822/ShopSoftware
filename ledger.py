@@ -12,6 +12,7 @@ from PyQt6.QtGui import QFont, QColor, QBrush, QShortcut, QKeySequence
 
 from database import (
     get_connection, db_bank_accounts,
+    db_bank_account_closing_balance,
     db_save_bank_cp_cr,
     db_income_account,
     db_save_journal_voucher, db_load_journal_voucher,
@@ -526,7 +527,7 @@ def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
 # ── Payment Dialog ────────────────────────────────────────────────────────────
 
 class PaymentDialog(QDialog):
-    def __init__(self, party_type, party_name, parent=None):
+    def __init__(self, party_type, party_name, parent=None, party_id=None):
         super().__init__(parent)
         self._party_type = party_type
         # Supplier → always CP (you pay).  Customer → always CR (they pay).
@@ -545,6 +546,27 @@ class PaymentDialog(QDialog):
         form = QFormLayout(self)
         form.setSpacing(12)
         form.setContentsMargins(20, 20, 20, 20)
+
+        # Current balance of the party this payment is for
+        if party_id is not None:
+            try:
+                entries = db_ledger_entries(party_type, party_id)
+                bal = float(entries[-1]["balance"]) if entries else 0.0
+                if bal == 0:
+                    label = ""
+                elif party_type == "supplier":
+                    label = "Payable" if bal < 0 else "Receivable"
+                elif party_type == "customer":
+                    label = "Receivable" if bal > 0 else "Payable"
+                else:
+                    label = "DR" if bal > 0 else "CR"
+                bal_lbl = QLabel(
+                    f"Rs. {fmt_pkr(abs(bal))}  {label}".rstrip())
+                bal_lbl.setStyleSheet(
+                    "color:#b45309; font-weight:bold; font-size:10pt;")
+                form.addRow("Balance:", bal_lbl)
+            except Exception:
+                pass
 
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setDisplayFormat("dd/MM/yyyy")
@@ -803,11 +825,17 @@ class MultiLineCpCrDialog(QDialog):
         fld_row.addWidget(self.amount_spin)
         fld_row.addWidget(btn_add)
         ec.addLayout(fld_row)
+
+        # Current balance of the selected party — shown as soon as a party
+        # is picked so the operator knows how much is outstanding.
+        self.balance_lbl = QLabel("")
+        self.balance_lbl.setStyleSheet(
+            "color:#b45309; font-weight:bold; font-size:9.5pt; padding-top:3px;")
+        ec.addWidget(self.balance_lbl)
         layout.addWidget(entry_card)
 
-        self.type_combo.currentIndexChanged.connect(
-            lambda _: self._refresh_names(self.type_combo, self.name_combo)
-        )
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+        self.name_combo.currentIndexChanged.connect(self._update_party_balance)
 
         # ── Lines grid — entered lines land here (read-only) ─────────────────
         self.table = QTableWidget(0, 6)
@@ -972,6 +1000,42 @@ class MultiLineCpCrDialog(QDialog):
                 name_combo.addItem(f"— No {lbl.lower()}s found —", None)
         name_combo.blockSignals(False)
 
+    def _on_type_changed(self):
+        self._refresh_names(self.type_combo, self.name_combo)
+        # _refresh_names repopulates with signals blocked, so refresh the
+        # balance label explicitly.
+        self._update_party_balance()
+
+    def _update_party_balance(self):
+        ptype = self.type_combo.currentData()
+        pid = self.name_combo.currentData()
+        if pid is None or ptype == "expense":
+            self.balance_lbl.setText("")
+            return
+        try:
+            if ptype == "bank":
+                bal = db_bank_account_closing_balance(pid)
+                self.balance_lbl.setText(
+                    f"Current Bank Balance: Rs. {fmt_pkr(abs(bal))}"
+                    + ("" if bal >= 0 else "  (overdrawn)"))
+                return
+            entries = db_ledger_entries(ptype, pid)
+            bal = float(entries[-1]["balance"]) if entries else 0.0
+        except Exception:
+            self.balance_lbl.setText("")
+            return
+        # Same direction wording as the party ledger's closing balance line.
+        if bal == 0:
+            label = ""
+        elif ptype == "supplier":
+            label = "Payable" if bal < 0 else "Receivable"
+        elif ptype == "customer":
+            label = "Receivable" if bal > 0 else "Payable"
+        else:
+            label = "DR" if bal > 0 else "CR"
+        self.balance_lbl.setText(
+            f"Current Balance: Rs. {fmt_pkr(abs(bal))}  {label}".rstrip())
+
     def _update_total(self):
         total = sum(l["amount"] for l in self._lines)
         self._total_lbl.setText(f"Total: PKR {fmt_pkr(total)}")
@@ -1064,8 +1128,8 @@ class DoubleEntryJournalDialog(QDialog):
     Accounting logic applied on save:
       Dr Supplier  → reduces supplier balance   (credit entry in supplier ledger)
       Cr Customer  → reduces customer balance   (credit entry in customer ledger)
-      Dr Bank      → bank balance increases     (bank_transactions CP)
-      Cr Bank      → bank balance decreases     (bank_transactions CR)
+      Dr Bank      → bank balance increases     (journal_voucher_lines party_type='bank' debit)
+      Cr Bank      → bank balance decreases     (journal_voucher_lines party_type='bank' credit)
       Dr Cash      → cash in hand increases     (journal_voucher_lines party_type='cash' debit)
       Cr Cash      → cash in hand decreases     (journal_voucher_lines party_type='cash' credit)
     """
@@ -2263,7 +2327,8 @@ class LedgerPage(QWidget):
     def _add_payment(self):
         if self._party_id is None:
             return
-        dlg = PaymentDialog(self._party_type, self._party_name, self)
+        dlg = PaymentDialog(self._party_type, self._party_name, self,
+                            party_id=self._party_id)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         date_str, amount, ptype, notes = dlg.get_data()
