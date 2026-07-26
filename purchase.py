@@ -10,7 +10,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate, QPoint, QTimer, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QBrush, QColor, QShortcut, QKeySequence
 
-from database import get_connection, _insert_party_journal_line, db_remove_stock_item
+from database import (
+    get_connection, _insert_party_journal_line, db_remove_stock_item,
+    _party_closing_balance,
+)
 from widgets import SearchableComboBox
 
 # ── Shared styles (mirrors masters.py) ───────────────────────────────────────
@@ -139,19 +142,16 @@ def db_credit_customers_for_purchase():
 
 
 def db_supplier_balance(supplier_id):
-    """Return outstanding balance for a single supplier (amount you owe them)."""
+    """Return outstanding balance for a single supplier (amount you owe them).
+
+    Delegates to _party_closing_balance so the figure always matches the
+    supplier's ledger (CR receipts, journal voucher lines, returns, sales to
+    supplier — all included).
+    """
     conn = get_connection()
-    row = conn.execute("""
-        SELECT COALESCE(s.opening_balance, 0)
-               + COALESCE((SELECT SUM(pv.total_amount) FROM purchase_vouchers pv WHERE pv.supplier_id=s.id), 0)
-               - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='supplier' AND p.party_id=s.id AND p.type='CP'), 0)
-               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='supplier' AND je.party_id=s.id AND je.type='debit'), 0)
-               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='supplier' AND je.party_id=s.id AND je.type='credit'), 0)
-               AS balance
-        FROM suppliers s WHERE s.id=?
-    """, (supplier_id,)).fetchone()
+    bal = _party_closing_balance(conn, "supplier", supplier_id)
     conn.close()
-    return row["balance"] if row else 0
+    return bal
 
 
 def db_brands_list():
@@ -1422,15 +1422,8 @@ class PurchaseForm(QWidget):
             self.supplier_balance_lbl.setText(f"Outstanding: Rs. {fmt_pkr(bal)}")
         else:
             conn = get_connection()
-            row = conn.execute("""
-                SELECT COALESCE(c.opening_balance, 0)
-                       + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id = c.id), 0)
-                       - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id = c.id AND p.type='CR'), 0)
-                       AS balance
-                FROM customers c WHERE c.id = ?
-            """, (data["id"],)).fetchone()
+            bal = _party_closing_balance(conn, "customer", data["id"])
             conn.close()
-            bal = row["balance"] if row else 0
             self.supplier_balance_lbl.setText(f"Customer Balance: Rs. {fmt_pkr(bal)}")
 
     def _on_brand_change(self):

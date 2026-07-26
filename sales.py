@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont, QBrush, QColor, QPainter, QPixmap, QShortcut, QKe
 
 from database import (
     get_connection, db_bank_accounts, db_active_salesmen,
-    _insert_party_journal_line,
+    _insert_party_journal_line, _party_closing_balance,
 )
 from widgets import SearchableComboBox
 
@@ -145,19 +145,16 @@ def db_suppliers_for_sale():
 
 
 def db_customer_balance(customer_id):
-    """Return outstanding balance for a single credit customer (amount they owe)."""
+    """Return outstanding balance for a single credit customer (amount they owe).
+
+    Delegates to _party_closing_balance so the figure always matches the
+    customer's ledger (CP refunds, journal voucher lines, returns, purchases
+    from customer — all included).
+    """
     conn = get_connection()
-    row = conn.execute("""
-        SELECT COALESCE(c.opening_balance, 0)
-               + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
-               - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
-               AS balance
-        FROM customers c WHERE c.id=?
-    """, (customer_id,)).fetchone()
+    bal = _party_closing_balance(conn, "customer", customer_id)
     conn.close()
-    return row["balance"] if row else 0
+    return bal
 
 
 def db_lookup_cash_customer(contact: str):

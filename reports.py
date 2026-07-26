@@ -725,25 +725,10 @@ def db_cash_book(date_str: str) -> dict:
     )
 
     # ── Opening Bank — all bank movements BEFORE iso ──────────────────────
-    # JV bank effects live in two places: pre-unification JVs wrote
-    # bank_transactions rows (source='jv'), post-unification JVs write only
-    # journal_voucher_lines — both must be counted, each exactly once.
     bank_ob = _q("SELECT COALESCE(SUM(opening_balance),0) FROM bank_accounts")
-    opening_bank = (
-        bank_ob
-        + _q(f"SELECT COALESCE(SUM(sv.bank_amount),0) FROM sale_vouchers sv"
-             f" WHERE sv.bank_amount>0 AND {de_sv}<?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
-             f" WHERE bt.type='CP' AND {de_bt}<?", (iso,))
-        - _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
-             f" WHERE bt.type='CR' AND {de_bt}<?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(jvl.debit),0) FROM journal_voucher_lines jvl"
-             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
-             f" WHERE jvl.party_type='bank' AND {de_jv}<?", (iso,))
-        - _q(f"SELECT COALESCE(SUM(jvl.credit),0) FROM journal_voucher_lines jvl"
-             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
-             f" WHERE jvl.party_type='bank' AND {de_jv}<?", (iso,))
-    )
+    opening_bank = bank_ob + _q(
+        "SELECT COALESCE(SUM(money_in - money_out),0) FROM bank_movements"
+        " WHERE date_iso<?", (iso,))
 
     # ── Today's transaction rows ──────────────────────────────────────────
     rows = []
@@ -920,23 +905,13 @@ def db_cash_book(date_str: str) -> dict:
     total_cash_in  = sum(r["cash_in"]  for r in rows)
     total_cash_out = sum(r["cash_out"] for r in rows)
 
-    # Bank in today: bank portion of sales + bank CP transactions + JV Dr Bank
-    total_bank_in = (
-        _q(f"SELECT COALESCE(SUM(sv.bank_amount),0) FROM sale_vouchers sv"
-           f" WHERE sv.bank_amount>0 AND {de_sv}=?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
-             f" WHERE bt.type='CP' AND {de_bt}=?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(jvl.debit),0) FROM journal_voucher_lines jvl"
-             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
-             f" WHERE jvl.party_type='bank' AND {de_jv}=?", (iso,))
-    )
-    total_bank_out = (
-        _q(f"SELECT COALESCE(SUM(bt.amount),0) FROM bank_transactions bt"
-           f" WHERE bt.type='CR' AND {de_bt}=?", (iso,))
-        + _q(f"SELECT COALESCE(SUM(jvl.credit),0) FROM journal_voucher_lines jvl"
-             f" JOIN journal_vouchers jv ON jv.id=jvl.jv_id"
-             f" WHERE jvl.party_type='bank' AND {de_jv}=?", (iso,))
-    )
+    # Today's bank movements — from the bank_movements view.
+    total_bank_in = _q(
+        "SELECT COALESCE(SUM(money_in),0) FROM bank_movements"
+        " WHERE date_iso=?", (iso,))
+    total_bank_out = _q(
+        "SELECT COALESCE(SUM(money_out),0) FROM bank_movements"
+        " WHERE date_iso=?", (iso,))
 
     closing_cash = opening_cash + total_cash_in  - total_cash_out
     closing_bank = opening_bank + total_bank_in  - total_bank_out
@@ -1796,11 +1771,19 @@ class ProfitReportTab(QWidget):
         btn_search.setStyleSheet(BTN_SECONDARY)
         btn_search.clicked.connect(self.refresh)
 
+        btn_today = QPushButton("Today")
+        btn_today.setStyleSheet(BTN_SECONDARY)
+        btn_today.clicked.connect(lambda: self._set_range_and_refresh(0))
+
+        btn_yesterday = QPushButton("Yesterday")
+        btn_yesterday.setStyleSheet(BTN_SECONDARY)
+        btn_yesterday.clicked.connect(lambda: self._set_range_and_refresh(-1))
+
         btn_pdf, btn_csv = _make_export_buttons(self)
         layout.addWidget(_filter_card(
             QLabel("Date Sold From:"), self.from_date,
             QLabel("To:"), self.to_date,
-            btn_search, None, btn_pdf, btn_csv,
+            btn_search, btn_today, btn_yesterday, None, btn_pdf, btn_csv,
         ))
 
         # ── Summary cards row ─────────────────────────────────────────────
@@ -1852,6 +1835,12 @@ class ProfitReportTab(QWidget):
         if not self._loaded:
             self.refresh()
             self._loaded = True
+
+    def _set_range_and_refresh(self, day_offset: int):
+        d = QDate.currentDate().addDays(day_offset)
+        self.from_date.setDate(d)
+        self.to_date.setDate(d)
+        self.refresh()
 
     def refresh(self):
         from_iso = self.from_date.date().toString("yyyy-MM-dd")
@@ -3244,12 +3233,12 @@ def db_fifo_aging() -> dict:
     For each credit customer / supplier with a non-zero balance, builds the full
     transaction stream (same sources as _party_closing_balance), allocates credits
     against oldest debits first (FIFO), then buckets remaining unallocated debits
-    by age from today.
+    by age from today: 1-7 | 8-15 | 15+ days.
 
     Returns:
         {
-          "receivables": [{"name", "balance", "b0_30", "b31_60", "b61_90", "b90plus"}, ...],
-          "payables":    [{"name", "balance", "b0_30", "b31_60", "b61_90", "b90plus"}, ...],
+          "receivables": [{"name", "balance", "b1_7", "b8_15", "b15p"}, ...],
+          "payables":    [{"name", "balance", "b1_7", "b8_15", "b15p"}, ...],
         }
     """
     conn = get_connection()
@@ -3381,18 +3370,16 @@ def db_fifo_aging() -> dict:
                 if pay > 0.001:
                     advance_credit += pay
 
-        b0_30 = b31_60 = b61_90 = b90plus = 0.0
+        b1_7 = b8_15 = b15p = 0.0
         for d0, amt in open_debits:
             age = (today - d0).days
-            if age <= 30:
-                b0_30 += amt
-            elif age <= 60:
-                b31_60 += amt
-            elif age <= 90:
-                b61_90 += amt
+            if age <= 7:
+                b1_7 += amt
+            elif age <= 15:
+                b8_15 += amt
             else:
-                b90plus += amt
-        return b0_30, b31_60, b61_90, b90plus
+                b15p += amt
+        return b1_7, b8_15, b15p
 
     customers = conn.execute(
         "SELECT id, name, opening_balance FROM customers WHERE type='credit' ORDER BY name"
@@ -3403,13 +3390,12 @@ def db_fifo_aging() -> dict:
         bal = _party_closing_balance(conn, "customer", c["id"])
         if abs(bal) < 0.01:
             continue
-        b0_30, b31_60, b61_90, b90plus = _fifo_buckets(
+        b1_7, b8_15, b15p = _fifo_buckets(
             _build_stream("customer", c["id"], ob)
         )
         receivables.append({
             "name": c["name"], "balance": bal,
-            "b0_30": b0_30, "b31_60": b31_60,
-            "b61_90": b61_90, "b90plus": b90plus,
+            "b1_7": b1_7, "b8_15": b8_15, "b15p": b15p,
         })
 
     suppliers = conn.execute(
@@ -3423,13 +3409,12 @@ def db_fifo_aging() -> dict:
         bal = _party_closing_balance(conn, "supplier", s["id"])
         if abs(bal) < 0.01:
             continue
-        b0_30, b31_60, b61_90, b90plus = _fifo_buckets(
+        b1_7, b8_15, b15p = _fifo_buckets(
             _build_stream("supplier", s["id"], ob)
         )
         payables.append({
             "name": s["name"], "balance": bal,
-            "b0_30": b0_30, "b31_60": b31_60,
-            "b61_90": b61_90, "b90plus": b90plus,
+            "b1_7": b1_7, "b8_15": b8_15, "b15p": b15p,
         })
 
     conn.close()
@@ -3637,10 +3622,10 @@ class AgingFifoTab(QWidget):
     """
     Stage B — FIFO true aging.
     Allocates credits against oldest debits first, then shows remaining
-    unallocated debt bucketed by age: 0-30 | 31-60 | 61-90 | 90+ days.
+    unallocated debt bucketed by age: 1-7 | 8-15 | 15+ days.
     """
 
-    _NCOLS = 6
+    _NCOLS = 5
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3666,7 +3651,7 @@ class AgingFifoTab(QWidget):
         layout.addLayout(header)
 
         self.table = _make_table(
-            ["Name", "Balance (Rs.)", "0-30 Days", "31-60 Days", "61-90 Days", "90+ Days"]
+            ["Name", "Balance (Rs.)", "1-7 Days", "8-15 Days", "15+ Days"]
         )
         self.table.setSortingEnabled(False)
         layout.addWidget(self.table, stretch=1)
@@ -3690,7 +3675,7 @@ class AgingFifoTab(QWidget):
         self.table.setRowCount(0)
 
         total_rec = total_pay = 0.0
-        alert_90plus = 0
+        alert_15plus = 0
 
         def _section_header(label: str, bg: str):
             row = self.table.rowCount()
@@ -3712,45 +3697,39 @@ class AgingFifoTab(QWidget):
             return it
 
         def _add_party(entry: dict):
-            nonlocal alert_90plus
+            nonlocal alert_15plus
             balance = entry["balance"]
-            b0_30   = entry["b0_30"]
-            b31_60  = entry["b31_60"]
-            b61_90  = entry["b61_90"]
-            b90plus = entry["b90plus"]
+            b1_7  = entry["b1_7"]
+            b8_15 = entry["b8_15"]
+            b15p  = entry["b15p"]
 
             row = self.table.rowCount()
             self.table.insertRow(row)
 
-            name_item  = _ri(entry["name"])
-            bal_item   = _ri(fmt_pkr(balance), right=True)
-            b030_item  = _ri(fmt_pkr(b0_30)  if b0_30  > 0.01 else "—", right=True)
-            b3160_item = _ri(fmt_pkr(b31_60) if b31_60 > 0.01 else "—", right=True)
-            b6190_item = _ri(fmt_pkr(b61_90) if b61_90 > 0.01 else "—", right=True)
-            b90p_item  = _ri(fmt_pkr(b90plus) if b90plus > 0.01 else "—", right=True)
+            name_item = _ri(entry["name"])
+            bal_item  = _ri(fmt_pkr(balance), right=True)
+            b17_item  = _ri(fmt_pkr(b1_7)  if b1_7  > 0.01 else "—", right=True)
+            b815_item = _ri(fmt_pkr(b8_15) if b8_15 > 0.01 else "—", right=True)
+            b15p_item = _ri(fmt_pkr(b15p)  if b15p  > 0.01 else "—", right=True)
 
             if balance < 0:
                 bal_item.setForeground(QBrush(QColor("#16a34a")))
 
-            if b31_60 > 0.01:
-                b3160_item.setForeground(QBrush(QColor("#c2410c")))
-            if b61_90 > 0.01:
-                b6190_item.setForeground(QBrush(QColor("#c2410c")))
-                b6190_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            if b90plus > 0.01:
-                b90p_item.setForeground(QBrush(QColor("#dc2626")))
-                b90p_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                alert_90plus += 1
+            if b8_15 > 0.01:
+                b815_item.setForeground(QBrush(QColor("#c2410c")))
+            if b15p > 0.01:
+                b15p_item.setForeground(QBrush(QColor("#dc2626")))
+                b15p_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+                alert_15plus += 1
 
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, bal_item)
-            self.table.setItem(row, 2, b030_item)
-            self.table.setItem(row, 3, b3160_item)
-            self.table.setItem(row, 4, b6190_item)
-            self.table.setItem(row, 5, b90p_item)
+            self.table.setItem(row, 2, b17_item)
+            self.table.setItem(row, 3, b815_item)
+            self.table.setItem(row, 4, b15p_item)
 
-        def _subtotal_row(label: str, bal: float, b0_30: float,
-                          b31_60: float, b61_90: float, b90plus: float):
+        def _subtotal_row(label: str, bal: float, b1_7: float,
+                          b8_15: float, b15p: float):
             row = self.table.rowCount()
             self.table.insertRow(row)
             bg   = QBrush(QColor("#f1f5f9"))
@@ -3768,54 +3747,51 @@ class AgingFifoTab(QWidget):
 
             self.table.setItem(row, 0, _si(label))
             self.table.setItem(row, 1, _si(fmt_pkr(bal), right=True))
-            self.table.setItem(row, 2, _si(fmt_pkr(b0_30)  if b0_30  > 0.01 else "—", right=True))
-            self.table.setItem(row, 3, _si(fmt_pkr(b31_60) if b31_60 > 0.01 else "—", right=True))
-            self.table.setItem(row, 4, _si(fmt_pkr(b61_90) if b61_90 > 0.01 else "—", right=True))
-            self.table.setItem(row, 5, _si(fmt_pkr(b90plus) if b90plus > 0.01 else "—", right=True))
+            self.table.setItem(row, 2, _si(fmt_pkr(b1_7)  if b1_7  > 0.01 else "—", right=True))
+            self.table.setItem(row, 3, _si(fmt_pkr(b8_15) if b8_15 > 0.01 else "—", right=True))
+            self.table.setItem(row, 4, _si(fmt_pkr(b15p)  if b15p  > 0.01 else "—", right=True))
 
         # ── Receivables ───────────────────────────────────────────────────────
         _section_header(
             f"RECEIVABLES — Credit Customers  ({len(d['receivables'])} with balance)",
             "#dbeafe",
         )
-        s_bal = s_030 = s_3160 = s_6190 = s_90p = 0.0
+        s_bal = s_17 = s_815 = s_15p = 0.0
         for r in d["receivables"]:
             _add_party(r)
             total_rec += r["balance"]
-            s_bal  += r["balance"]
-            s_030  += r["b0_30"]
-            s_3160 += r["b31_60"]
-            s_6190 += r["b61_90"]
-            s_90p  += r["b90plus"]
+            s_bal += r["balance"]
+            s_17  += r["b1_7"]
+            s_815 += r["b8_15"]
+            s_15p += r["b15p"]
         if d["receivables"]:
-            _subtotal_row("Total Receivables", s_bal, s_030, s_3160, s_6190, s_90p)
+            _subtotal_row("Total Receivables", s_bal, s_17, s_815, s_15p)
 
         # ── Payables ─────────────────────────────────────────────────────────
         _section_header(
             f"PAYABLES — Suppliers  ({len(d['payables'])} with balance)",
             "#fef9c3",
         )
-        p_bal = p_030 = p_3160 = p_6190 = p_90p = 0.0
+        p_bal = p_17 = p_815 = p_15p = 0.0
         for p in d["payables"]:
             _add_party(p)
             total_pay += p["balance"]
-            p_bal  += p["balance"]
-            p_030  += p["b0_30"]
-            p_3160 += p["b31_60"]
-            p_6190 += p["b61_90"]
-            p_90p  += p["b90plus"]
+            p_bal += p["balance"]
+            p_17  += p["b1_7"]
+            p_815 += p["b8_15"]
+            p_15p += p["b15p"]
         if d["payables"]:
-            _subtotal_row("Total Payables", p_bal, p_030, p_3160, p_6190, p_90p)
+            _subtotal_row("Total Payables", p_bal, p_17, p_815, p_15p)
 
         footer_parts = [
             f"Total Receivable: Rs. {fmt_pkr(total_rec)}",
             f"Total Payable: Rs. {fmt_pkr(total_pay)}",
         ]
-        if alert_90plus:
+        if alert_15plus:
             footer_parts.append(
                 f"<span style='color:#dc2626;font-weight:bold;'>"
-                f"{alert_90plus} part{'ies' if alert_90plus != 1 else 'y'} "
-                f"with 90+ day outstanding debt</span>"
+                f"{alert_15plus} part{'ies' if alert_15plus != 1 else 'y'} "
+                f"with 15+ day outstanding debt</span>"
             )
         self.footer.setText("    |    ".join(footer_parts))
         self.footer.setTextFormat(Qt.TextFormat.RichText)
@@ -3826,7 +3802,7 @@ class AgingFifoTab(QWidget):
         return (
             "FIFO_Aging",
             f"FIFO Aging — as at {today}",
-            headers, rows, {1, 2, 3, 4, 5},
+            headers, rows, {1, 2, 3, 4},
         )
 
 

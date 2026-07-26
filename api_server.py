@@ -44,7 +44,7 @@ def get_conn():
 
 
 # ── Bootstrap: run all DB migrations, then ensure sessions table exists ──────
-from database import init_db as _init_db, db_jvl_legacy_equivalent
+from database import init_db as _init_db, _party_closing_balance
 _init_db()
 
 
@@ -289,18 +289,7 @@ def api_customers_search():
     ).fetchone()
 
     if customer:
-        bal_row = conn.execute("""
-            SELECT
-                COALESCE(c.opening_balance, 0)
-                + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
-                - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-                + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-                - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
-                AS balance
-            FROM customers c WHERE c.id=?
-        """, (customer["id"],)).fetchone()
-        jvl_dr, jvl_cr = db_jvl_legacy_equivalent("customer", customer["id"])
-        balance = _fmt_pkr((bal_row["balance"] if bal_row else 0.0) + jvl_dr - jvl_cr)
+        balance = _fmt_pkr(_party_closing_balance(conn, "customer", customer["id"]))
 
         # Last purchase for this credit customer
         last = conn.execute("""
@@ -409,33 +398,20 @@ def api_suppliers():
 @require_auth
 def api_customers_list():
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT c.id, c.name, c.contact,
-               COALESCE(c.opening_balance, 0)
-               + COALESCE((SELECT SUM(sv.total_amount) FROM sale_vouchers sv WHERE sv.customer_id=c.id AND sv.type='credit'), 0)
-               - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id AND p.type='CR'), 0)
-               + COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='debit'), 0)
-               - COALESCE((SELECT SUM(je.amount) FROM journal_entries je WHERE je.party_type='customer' AND je.party_id=c.id AND je.type='credit'), 0)
-               + COALESCE((SELECT SUM(jvl.debit) FROM journal_voucher_lines jvl WHERE jvl.party_type='customer' AND jvl.party_id=c.id), 0)
-               - COALESCE((SELECT SUM(jvl.credit) FROM journal_voucher_lines jvl WHERE jvl.party_type='customer' AND jvl.party_id=c.id), 0)
-               AS balance
-        FROM customers c
-        WHERE c.type = 'credit'
-        ORDER BY c.name
-    """).fetchall()
+    rows = conn.execute(
+        "SELECT id, name, contact FROM customers WHERE type='credit' ORDER BY name"
+    ).fetchall()
+    customers = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "contact": r["contact"] or "",
+            "balance": _fmt_pkr(_party_closing_balance(conn, "customer", r["id"])),
+        }
+        for r in rows
+    ]
     conn.close()
-    return jsonify({
-        "success": True,
-        "customers": [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "contact": r["contact"] or "",
-                "balance": _fmt_pkr(r["balance"]),
-            }
-            for r in rows
-        ],
-    })
+    return jsonify({"success": True, "customers": customers})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -938,58 +914,24 @@ def _calc_cash_in_hand(conn) -> float:
 
 
 def _calc_bank_account_balance(conn, account_id: int) -> float:
-    """Compute current balance for one bank account.
+    """Current balance for one bank account.
 
-    Mirrors database.py db_bank_account_closing_balance() exactly:
-      opening_balance
-      + sale_vouchers.bank_amount  (bank/split sales paid into this account)
-      + bank_transactions CP  (money in: cash deposits, pre-unification JV Dr)
-      - bank_transactions CR  (money out: withdrawals, bank purchases/expenses,
-                               pre-unification JV Cr)
-      + journal_voucher_lines debit   (bank DR in JV = bank receives)
-      - journal_voucher_lines credit  (bank CR in JV = bank pays)
+    Reads the bank_movements view (created by database._create_views at
+    startup) — the single definition of bank money, shared with
+    db_bank_account_closing_balance() on the desktop side.
     """
     ba = conn.execute(
         "SELECT opening_balance FROM bank_accounts WHERE id=?", (account_id,)
     ).fetchone()
     ob = float(ba["opening_balance"] or 0) if ba else 0.0
 
-    sales = float(conn.execute(
-        "SELECT COALESCE(SUM(bank_amount),0) FROM sale_vouchers "
-        "WHERE bank_account_id=? AND bank_amount>0",
+    net = float(conn.execute(
+        "SELECT COALESCE(SUM(money_in - money_out),0) FROM bank_movements "
+        "WHERE bank_account_id=?",
         (account_id,)
     ).fetchone()[0] or 0)
 
-    cp = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM bank_transactions "
-        "WHERE bank_account_id=? AND type='CP'",
-        (account_id,)
-    ).fetchone()[0] or 0)
-
-    cr = float(conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM bank_transactions "
-        "WHERE bank_account_id=? AND type='CR'",
-        (account_id,)
-    ).fetchone()[0] or 0)
-
-    # NOTE: 'bank' has never been a legal party_type in journal_entries (its
-    # CHECK constraint only allows supplier/customer/other/expense) — all bank
-    # JV postings live in journal_voucher_lines, standard double-entry (Debit
-    # increases the bank balance, Credit decreases it), matching
-    # db_bank_account_closing_balance in database.py.
-    jvl_dr = float(conn.execute(
-        "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
-        "WHERE party_type='bank' AND party_id=?",
-        (account_id,)
-    ).fetchone()[0] or 0)
-
-    jvl_cr = float(conn.execute(
-        "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
-        "WHERE party_type='bank' AND party_id=?",
-        (account_id,)
-    ).fetchone()[0] or 0)
-
-    return ob + sales + cp - cr + jvl_dr - jvl_cr
+    return ob + net
 
 
 def _date_iso_to_dmy(iso_date):
@@ -1116,24 +1058,7 @@ def api_owner_balances():
         ).fetchall()
         suppliers = []
         for s in sup_rows:
-            ob = float(s["opening_balance"] or 0)
-            pv = float(conn.execute(
-                "SELECT COALESCE(SUM(total_amount),0) FROM purchase_vouchers WHERE supplier_id=?",
-                (s["id"],)
-            ).fetchone()[0] or 0)
-            pr = float(conn.execute(
-                "SELECT COALESCE(SUM(prl.return_price),0) "
-                "FROM purchase_return_lines prl "
-                "JOIN purchase_returns pr ON pr.id=prl.pr_id "
-                "WHERE pr.supplier_id=?",
-                (s["id"],)
-            ).fetchone()[0] or 0)
-            cp = float(conn.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM payments "
-                "WHERE party_type='supplier' AND party_id=? AND type='CP'",
-                (s["id"],)
-            ).fetchone()[0] or 0)
-            balance = ob + pv - pr - cp
+            balance = _party_closing_balance(conn, "supplier", s["id"])
             if abs(balance) < 0.01:
                 continue
             last_iso = conn.execute(f"""
@@ -1157,25 +1082,7 @@ def api_owner_balances():
         ).fetchall()
         customers = []
         for c in cust_rows:
-            ob = float(c["opening_balance"] or 0)
-            sv = float(conn.execute(
-                "SELECT COALESCE(SUM(total_amount),0) FROM sale_vouchers "
-                "WHERE customer_id=? AND type='credit'",
-                (c["id"],)
-            ).fetchone()[0] or 0)
-            sr = float(conn.execute(
-                "SELECT COALESCE(SUM(srl.return_price),0) "
-                "FROM sale_return_lines srl "
-                "JOIN sale_returns sr ON sr.id=srl.sr_id "
-                "WHERE sr.customer_id=?",
-                (c["id"],)
-            ).fetchone()[0] or 0)
-            cr = float(conn.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM payments "
-                "WHERE party_type='customer' AND party_id=? AND type='CR'",
-                (c["id"],)
-            ).fetchone()[0] or 0)
-            balance = ob + sv - sr - cr
+            balance = _party_closing_balance(conn, "customer", c["id"])
             if abs(balance) < 0.01:
                 continue
             last_iso = conn.execute(f"""

@@ -1179,6 +1179,8 @@ class VouchersPage(QWidget):
             party_combo.addItem(f"[Supplier] {r['name']}", {"ptype": "supplier", "pid": r["id"]})
         for r in _conn.execute("SELECT id, name FROM customers ORDER BY name"):
             party_combo.addItem(f"[Customer] {r['name']}", {"ptype": "customer", "pid": r["id"]})
+        for r in _conn.execute("SELECT id, name FROM bank_accounts ORDER BY name"):
+            party_combo.addItem(f"[Bank] {r['name']}", {"ptype": "bank", "pid": r["id"]})
         _conn.close()
         fl.addWidget(party_combo)
 
@@ -1262,28 +1264,55 @@ class VouchersPage(QWidget):
         to_iso   = state["to_date"].date().toString("yyyy-MM-dd")
         party_data = state["party_combo"].currentData()
 
-        params = [from_iso, to_iso, ptype]
-        extra = ""
-        if party_data is not None:
-            extra = " AND p.party_type=? AND p.party_id=?"
-            params += [party_data["ptype"], party_data["pid"]]
+        # Bank lines of a CP/CR live in bank_transactions (source='cash_transfer'),
+        # not payments — query both and merge, unless a party filter narrows it.
+        want_payments = party_data is None or party_data["ptype"] != "bank"
+        want_bank     = party_data is None or party_data["ptype"] == "bank"
 
-        sql = f"""
-            SELECT p.id, p.date, p.voucher_number, p.party_type,
-                   COALESCE(s.name, c.name, op.name, '') AS party_name,
-                   p.amount
-            FROM payments p
-            LEFT JOIN suppliers s  ON s.id=p.party_id  AND p.party_type='supplier'
-            LEFT JOIN customers c  ON c.id=p.party_id  AND p.party_type='customer'
-            LEFT JOIN other_parties op ON op.id=p.party_id AND p.party_type='other'
-            WHERE substr(p.date,7,4)||'-'||substr(p.date,4,2)||'-'||substr(p.date,1,2)
-                  BETWEEN ? AND ?
-              AND p.type=?{extra}
-            ORDER BY p.id DESC
-        """
+        queries = []
+        if want_payments:
+            params = [from_iso, to_iso, ptype]
+            extra = ""
+            if party_data is not None:
+                extra = " AND p.party_type=? AND p.party_id=?"
+                params += [party_data["ptype"], party_data["pid"]]
+            queries.append((f"""
+                SELECT p.id, p.date, p.voucher_number, p.party_type,
+                       COALESCE(s.name, c.name, op.name, '') AS party_name,
+                       p.amount, 'payment' AS src,
+                       substr(p.date,7,4)||'-'||substr(p.date,4,2)||'-'||substr(p.date,1,2) AS iso
+                FROM payments p
+                LEFT JOIN suppliers s  ON s.id=p.party_id  AND p.party_type='supplier'
+                LEFT JOIN customers c  ON c.id=p.party_id  AND p.party_type='customer'
+                LEFT JOIN other_parties op ON op.id=p.party_id AND p.party_type='other'
+                WHERE substr(p.date,7,4)||'-'||substr(p.date,4,2)||'-'||substr(p.date,1,2)
+                      BETWEEN ? AND ?
+                  AND p.type=?{extra}
+            """, params))
+        if want_bank:
+            params = [from_iso, to_iso, ptype]
+            extra = ""
+            if party_data is not None:
+                extra = " AND bt.bank_account_id=?"
+                params += [party_data["pid"]]
+            queries.append((f"""
+                SELECT bt.id, bt.date, bt.voucher_number, 'bank' AS party_type,
+                       COALESCE(ba.name, '') AS party_name,
+                       bt.amount, 'bank' AS src,
+                       substr(bt.date,7,4)||'-'||substr(bt.date,4,2)||'-'||substr(bt.date,1,2) AS iso
+                FROM bank_transactions bt
+                LEFT JOIN bank_accounts ba ON ba.id=bt.bank_account_id
+                WHERE substr(bt.date,7,4)||'-'||substr(bt.date,4,2)||'-'||substr(bt.date,1,2)
+                      BETWEEN ? AND ?
+                  AND bt.type=? AND bt.source='cash_transfer'{extra}
+            """, params))
+
         conn = get_connection()
-        rows = conn.execute(sql, params).fetchall()
+        rows = []
+        for sql, params in queries:
+            rows += conn.execute(sql, params).fetchall()
         conn.close()
+        rows.sort(key=lambda r: (r["iso"], r["voucher_number"]), reverse=True)
 
         table = state["table"]
         table.setRowCount(0)
@@ -1302,7 +1331,7 @@ class VouchersPage(QWidget):
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if col == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, r["id"])
+                    item.setData(Qt.ItemDataRole.UserRole, (r["src"], r["id"]))
                 table.setItem(row, col, item)
             total += float(r["amount"])
 
@@ -1334,17 +1363,31 @@ class VouchersPage(QWidget):
         row = table.currentRow()
         if row < 0:
             return
-        pay_id = table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        src, row_id = table.item(row, 0).data(Qt.ItemDataRole.UserRole)
         from database import get_connection
         conn = get_connection()
-        r = conn.execute("SELECT * FROM payments WHERE id=?", (pay_id,)).fetchone()
+        if src == "bank":
+            r = conn.execute("""
+                SELECT bt.*, COALESCE(ba.name, '') AS bank_name
+                FROM bank_transactions bt
+                LEFT JOIN bank_accounts ba ON ba.id = bt.bank_account_id
+                WHERE bt.id=?
+            """, (row_id,)).fetchone()
+        else:
+            r = conn.execute("SELECT * FROM payments WHERE id=?", (row_id,)).fetchone()
         conn.close()
         if not r:
             return
-        from edit_vouchers import PaymentEditDialog
-        dlg = PaymentEditDialog(dict(r), self)
+        if src == "bank":
+            from edit_vouchers import BankTransactionEditDialog
+            dlg = BankTransactionEditDialog(dict(r), self)
+            deleted = BankTransactionEditDialog.DELETED
+        else:
+            from edit_vouchers import PaymentEditDialog
+            dlg = PaymentEditDialog(dict(r), self)
+            deleted = PaymentEditDialog.DELETED
         result = dlg.exec()
-        if result in (QDialog.DialogCode.Accepted, PaymentEditDialog.DELETED):
+        if result in (QDialog.DialogCode.Accepted, deleted):
             self._refresh_cp_cr(state)
 
     # ── Go to voucher ─────────────────────────────────────────────────────────
@@ -1359,8 +1402,8 @@ class VouchersPage(QWidget):
                 "Please enter a full voucher number, e.g. CP-0001")
             return
         from edit_vouchers import (
-            PaymentEditDialog, JVEditDialog,
-            db_lookup_payment, db_lookup_journal_entry,
+            PaymentEditDialog, JVEditDialog, BankTransactionEditDialog,
+            db_lookup_payment, db_lookup_journal_entry, db_lookup_bank_transaction,
         )
         opened = False
         if raw.startswith("CP-") or raw.startswith("CR-"):
@@ -1371,6 +1414,15 @@ class VouchersPage(QWidget):
                 if result in (QDialog.DialogCode.Accepted, PaymentEditDialog.DELETED):
                     self.refresh()
                 opened = True
+            else:
+                tx = db_lookup_bank_transaction(raw)
+                if tx and tx.get("source") == "cash_transfer":
+                    dlg = BankTransactionEditDialog(tx, self)
+                    result = dlg.exec()
+                    if result in (QDialog.DialogCode.Accepted,
+                                  BankTransactionEditDialog.DELETED):
+                        self.refresh()
+                    opened = True
         elif raw.startswith("JV-"):
             from database import get_connection
             conn = get_connection()
