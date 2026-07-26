@@ -437,11 +437,8 @@ def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
     """
     Running statement for one bank account.
     Debit column = money IN (balance ↑).  Credit column = money OUT (balance ↓).
-    Sources:
-      - opening_balance from bank_accounts
-      - bank_amount on sale_vouchers  (customer paid via this bank)
-      - bank_transactions CP  (money in: cash deposit OR JV Dr Bank)
-      - bank_transactions CR  (money out: cash withdrawal OR JV Cr Bank)
+    All movements come from the bank_movements view (database._create_views) —
+    the single definition of what counts as bank money.
     """
     conn = get_connection()
     ob_row = conn.execute(
@@ -449,51 +446,14 @@ def db_bank_ledger_entries(bank_account_id: int, from_iso=None, to_iso=None):
     ).fetchone()
     ob = float(ob_row["opening_balance"] or 0) if ob_row else 0.0
 
-    raw = []
-
-    # Sale payments via bank
-    for r in conn.execute("""
-        SELECT sv.date, sv.sv_number,
-               COALESCE(c.name, sv.cash_customer_name, 'Customer') AS cust,
-               sv.bank_amount
-        FROM sale_vouchers sv
-        LEFT JOIN customers c ON c.id = sv.customer_id
-        WHERE sv.bank_account_id=? AND sv.bank_amount > 0
-    """, (bank_account_id,)):
-        raw.append({"date": r["date"], "voucher": r["sv_number"],
-                    "desc": f"Sale — {r['cust']}",
-                    "dr": float(r["bank_amount"]), "cr": 0.0})
-
-    # Bank transactions (CP=in, CR=out)
-    for r in conn.execute("""
-        SELECT date, voucher_number, type, amount, notes, source
-        FROM bank_transactions WHERE bank_account_id=?
-    """, (bank_account_id,)):
-        source = r["source"] or "cash_transfer"
-        if r["notes"] and r["notes"].strip():
-            desc = r["notes"]
-        elif r["type"] == "CP":
-            desc = "Cash Deposit" if source == "cash_transfer" else "Journal Entry"
-        else:
-            desc = "Cash Withdrawal" if source == "cash_transfer" else "Journal Entry"
-        if r["type"] == "CP":
-            raw.append({"date": r["date"], "voucher": r["voucher_number"],
-                        "desc": desc, "dr": float(r["amount"]), "cr": 0.0})
-        else:
-            raw.append({"date": r["date"], "voucher": r["voucher_number"],
-                        "desc": desc, "dr": 0.0, "cr": float(r["amount"])})
-
-    # New-style journal_voucher_lines for this bank account
-    for r in conn.execute("""
-        SELECT jv.date, jv.jv_number, COALESCE(jv.notes,'Journal Entry') AS notes,
-               jvl.debit, jvl.credit
-        FROM journal_voucher_lines jvl
-        JOIN journal_vouchers jv ON jv.id = jvl.jv_id
-        WHERE jvl.party_type='bank' AND jvl.party_id=?
-    """, (bank_account_id,)):
-        raw.append({"date": r["date"], "voucher": r["jv_number"],
-                    "desc": r["notes"],
-                    "dr": float(r["debit"] or 0), "cr": float(r["credit"] or 0)})
+    raw = [
+        {"date": r["date"], "voucher": r["voucher_number"],
+         "desc": r["description"],
+         "dr": float(r["money_in"] or 0), "cr": float(r["money_out"] or 0)}
+        for r in conn.execute(
+            "SELECT date, voucher_number, description, money_in, money_out "
+            "FROM bank_movements WHERE bank_account_id=?", (bank_account_id,))
+    ]
 
     conn.close()
 

@@ -3,12 +3,34 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QFrame, QMessageBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from whatsapp_handler import (
-    get_pending_whatsapp_sales, send_sale_whatsapp, mark_sent_manual
+    get_pending_whatsapp_sales, send_sale_whatsapp, mark_sent_manual,
+    get_backlog_contacts, drip_quota_left, send_backlog_batch,
 )
+
+
+class _BatchWorker(QThread):
+    """Runs send_backlog_batch off the UI thread. pywhatkit types into the
+    browser, so the PC must be left alone while this runs."""
+    progress = pyqtSignal(int, int, str)   # done, total, customer name
+    finished_batch = pyqtSignal(int, str)  # sent count, status message
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        sent, msg = send_backlog_batch(
+            progress_cb=lambda d, t, n: self.progress.emit(d, t, n),
+            should_stop=lambda: self._stop,
+        )
+        self.finished_batch.emit(sent, msg)
 
 TABLE_STYLE = """
     QTableWidget {
@@ -86,6 +108,49 @@ class WhatsAppPage(QWidget):
 
         layout.addWidget(info)
 
+        # ── Backlog campaign card ─────────────────────────────────────────
+        camp = QFrame()
+        camp.setStyleSheet(CARD_STYLE)
+        cl = QVBoxLayout(camp)
+        cl.setContentsMargins(20, 14, 20, 14)
+        cl.setSpacing(6)
+
+        ch = QLabel("Backlog Campaign — old customers")
+        ch.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        ch.setStyleSheet("color:#1e293b;")
+        cl.addWidget(ch)
+
+        note = QLabel(
+            "Sends one message per customer (their latest purchase), max 10 per "
+            "day, with a 25–55 second gap between messages so WhatsApp does not "
+            "flag the number. A batch takes about 10 minutes — "
+            "<b>do not use the mouse or keyboard while it runs</b>. "
+            "New sales keep sending instantly and don't count against the 10."
+        )
+        note.setTextFormat(Qt.TextFormat.RichText)
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#475569; font-size:9pt;")
+        cl.addWidget(note)
+
+        row = QHBoxLayout()
+        self.camp_status = QLabel("")
+        self.camp_status.setStyleSheet("color:#334155; font-size:10pt;")
+        row.addWidget(self.camp_status)
+        row.addStretch()
+        self.btn_stop_batch = QPushButton("Stop After Current")
+        self.btn_stop_batch.setStyleSheet(BTN_SECONDARY)
+        self.btn_stop_batch.setVisible(False)
+        self.btn_stop_batch.clicked.connect(self._stop_batch)
+        row.addWidget(self.btn_stop_batch)
+        self.btn_batch = QPushButton("Send Today's Batch")
+        self.btn_batch.setStyleSheet(BTN_GREEN)
+        self.btn_batch.clicked.connect(self._start_batch)
+        row.addWidget(self.btn_batch)
+        cl.addLayout(row)
+
+        layout.addWidget(camp)
+        self._worker = None
+
         # Pending section
         pending_title = QHBoxLayout()
         pt = QLabel("Pending / Unsent Messages")
@@ -120,7 +185,57 @@ class WhatsAppPage(QWidget):
 
         self.refresh()
 
+    def _update_camp_status(self):
+        backlog = len(get_backlog_contacts())
+        quota = drip_quota_left()
+        self.camp_status.setText(
+            f"{backlog} customer(s) in backlog  •  {quota} send(s) left today"
+        )
+
+    def _start_batch(self):
+        quota = drip_quota_left()
+        if quota <= 0:
+            QMessageBox.information(
+                self, "WhatsApp",
+                "Today's limit of 10 is already used. Next batch tomorrow.")
+            return
+        n = min(quota, len(get_backlog_contacts()))
+        if n == 0:
+            QMessageBox.information(self, "WhatsApp", "Backlog is clear!")
+            return
+        if QMessageBox.question(
+            self, "Send Batch",
+            f"Send WhatsApp messages to {n} customer(s) now?\n\n"
+            "This takes about a minute per customer.\n"
+            "Leave the PC alone until it finishes.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.btn_batch.setEnabled(False)
+        self.btn_stop_batch.setVisible(True)
+        self.camp_status.setText("Starting…")
+        self._worker = _BatchWorker(self)
+        self._worker.progress.connect(
+            lambda d, t, name: self.camp_status.setText(
+                f"Sending {d}/{t} — {name} ✓  (waiting before next…)"))
+        self._worker.finished_batch.connect(self._batch_done)
+        self._worker.start()
+
+    def _stop_batch(self):
+        if self._worker:
+            self._worker.request_stop()
+            self.btn_stop_batch.setEnabled(False)
+            self.camp_status.setText("Stopping after current message…")
+
+    def _batch_done(self, sent: int, msg: str):
+        self.btn_batch.setEnabled(True)
+        self.btn_stop_batch.setVisible(False)
+        self.btn_stop_batch.setEnabled(True)
+        self._worker = None
+        self.refresh()
+        QMessageBox.information(self, "WhatsApp Batch", msg)
+
     def refresh(self):
+        self._update_camp_status()
         rows = get_pending_whatsapp_sales()
         self.table.setRowCount(0)
 

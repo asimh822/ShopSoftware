@@ -3,12 +3,19 @@ WhatsApp message sending.
 Primary:  pywhatkit.sendwhatmsg_instantly()  (opens WhatsApp Web, sends automatically)
 Fallback: open wa.me URL in browser          (user clicks Send manually)
 Either way, whatsapp_sent flag is updated in DB after success or manual send.
+
+Backlog drip campaign (send_backlog_batch): clears old unsent sales at a
+capped rate — max wa_daily_limit customers per day, one message per customer,
+random gaps between sends — so WhatsApp never sees a bulk-send pattern.
 """
+import datetime
+import random
 import re
+import time
 import webbrowser
 from urllib.parse import quote
 
-from database import get_connection, get_setting
+from database import get_connection, get_setting, set_setting
 
 
 def _clean_phone(raw: str) -> str | None:
@@ -149,6 +156,162 @@ def get_pending_whatsapp_sales() -> list:
 
 def mark_sent_manual(sv_id: int):
     _mark_sent(sv_id)
+
+
+# ── Backlog drip campaign ─────────────────────────────────────────────────────
+
+DEFAULT_BACKLOG_TEMPLATE = (
+    "Assalam o Alaikum {customer_name}! This is {shop_name}, Multan. "
+    "Thank you for purchasing {model_name} (IMEI: {imei}) from us. "
+    "Please save this number — for any query or after-sales support "
+    "call {shop_contact}."
+)
+
+
+def _skip_numbers() -> set:
+    """Digit-only numbers that must never receive campaign messages
+    (the shop's own numbers used for test/walk-in entries)."""
+    raw = get_setting("wa_skip_numbers") or ""
+    nums = {re.sub(r"\D", "", part) for part in raw.split(",") if part.strip()}
+    shop = re.sub(r"\D", "", get_setting("shop_contact") or "")
+    if shop:
+        nums.add(shop)
+    return nums
+
+
+def get_backlog_contacts() -> list:
+    """
+    Unique customers with an unsent cash sale, oldest first.
+    One entry per contact number; the voucher kept is the customer's most
+    recent one (its model/IMEI go in the message). Shop numbers excluded.
+    """
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT id, sv_number, date, cash_customer_name AS name,
+               cash_customer_contact AS contact
+        FROM sale_vouchers
+        WHERE type='cash' AND COALESCE(whatsapp_sent,0)=0
+          AND cash_customer_contact IS NOT NULL
+          AND LENGTH(cash_customer_contact)=11
+        ORDER BY id DESC
+    """).fetchall()
+    conn.close()
+    skip = _skip_numbers()
+    seen, newest_first = set(), []
+    for r in rows:                      # newest voucher wins the dedup
+        digits = re.sub(r"\D", "", r["contact"])
+        if digits in skip or digits in seen:
+            continue
+        seen.add(digits)
+        newest_first.append({"id": r["id"], "sv_number": r["sv_number"],
+                             "date": r["date"], "name": r["name"],
+                             "contact": digits})
+    return list(reversed(newest_first))  # drip oldest customers first
+
+
+def _mark_contact_sent(contact_digits: str):
+    """Mark every unsent cash voucher of this contact as sent — the customer
+    got their one campaign message; never message them again for old sales."""
+    conn = get_connection()
+    conn.execute("""
+        UPDATE sale_vouchers SET whatsapp_sent=1
+        WHERE type='cash' AND COALESCE(whatsapp_sent,0)=0
+          AND REPLACE(REPLACE(REPLACE(cash_customer_contact,'-',''),' ',''),'+','')=?
+    """, (contact_digits,))
+    conn.commit()
+    conn.close()
+
+
+def drip_quota_left() -> int:
+    """How many campaign messages may still be sent today."""
+    limit = int(get_setting("wa_daily_limit") or 10)
+    today = datetime.date.today().isoformat()
+    if (get_setting("wa_drip_date") or "") != today:
+        return limit
+    return max(0, limit - int(get_setting("wa_drip_count") or 0))
+
+
+def _bump_drip_count():
+    today = datetime.date.today().isoformat()
+    if (get_setting("wa_drip_date") or "") != today:
+        set_setting("wa_drip_date", today)
+        set_setting("wa_drip_count", "1")
+    else:
+        set_setting("wa_drip_count",
+                    str(int(get_setting("wa_drip_count") or 0) + 1))
+
+
+def send_backlog_batch(progress_cb=None, should_stop=None) -> tuple[int, str]:
+    """
+    Send today's drip batch: up to drip_quota_left() unique customers,
+    one personalised message each, random 25–55 s gap between sends.
+
+    progress_cb(done, total, name) — optional, called after each send.
+    should_stop() -> bool          — optional, checked before each send.
+
+    Returns (sent_count, status_message). Aborts on the first send failure
+    so a broken WhatsApp Web session can't burn through the quota.
+    Real-time sale messages do NOT count against this quota.
+    """
+    try:
+        import pywhatkit
+    except ImportError:
+        return 0, ("pywhatkit is not installed — the batch needs auto-send. "
+                   "Run:  pip install pywhatkit")
+
+    quota = drip_quota_left()
+    if quota <= 0:
+        return 0, "Daily limit already reached — next batch available tomorrow."
+
+    batch = get_backlog_contacts()[:quota]
+    if not batch:
+        return 0, "Backlog is clear — nothing to send."
+
+    template = get_setting("whatsapp_backlog_template") or DEFAULT_BACKLOG_TEMPLATE
+    shop_name    = get_setting("shop_name") or "United Mobile"
+    shop_contact = get_setting("shop_contact") or ""
+
+    sent = 0
+    for i, cust in enumerate(batch):
+        if should_stop and should_stop():
+            break
+        data = fetch_whatsapp_data(cust["id"])
+        if not data or not data["lines"]:
+            _mark_contact_sent(cust["contact"])   # unusable voucher — skip forever
+            continue
+        model_name, imei = data["lines"][0]
+        if len(data["lines"]) > 1:
+            model_name += f" (+{len(data['lines']) - 1} more)"
+        msg = _format_message(
+            template,
+            customer_name=data["customer_name"],
+            model_name=model_name,
+            imei=imei,
+            shop_name=shop_name,
+            shop_contact=shop_contact,
+            date=data["date"],
+        )
+        phone = _clean_phone(cust["contact"])
+        try:
+            pywhatkit.sendwhatmsg_instantly(
+                phone_no=phone, message=msg,
+                wait_time=15, tab_close=True, close_time=4,
+            )
+        except Exception as ex:
+            return sent, (f"Stopped after {sent} send(s): sending to {phone} "
+                          f"failed ({ex}). Check WhatsApp Web login and retry.")
+        _mark_contact_sent(cust["contact"])
+        _bump_drip_count()
+        sent += 1
+        if progress_cb:
+            progress_cb(sent, len(batch), data["customer_name"])
+        if i < len(batch) - 1:
+            time.sleep(random.uniform(25, 55))
+
+    left = drip_quota_left()
+    return sent, (f"Done — {sent} customer(s) messaged today. "
+                  f"{len(get_backlog_contacts())} still in backlog, "
+                  f"{left} more allowed today.")
 
 
 def send_digest_whatsapp(digest: dict) -> tuple[bool, str]:

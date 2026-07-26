@@ -150,6 +150,7 @@ def init_db():
     _seed_settings(c)
     _run_migrations(conn)
     _ensure_columns(conn)
+    _create_views(conn)
     conn.commit()
     from capital import migrate_capital_tables
     migrate_capital_tables(conn)
@@ -195,6 +196,11 @@ def _seed_settings(c):
         "cash_opening_balance": "0",
         # Auto Monthly Backup
         "last_auto_backup_month": "",
+        # WhatsApp backlog drip campaign
+        "wa_daily_limit": "10",
+        # Numbers never messaged by the campaign (shop's own numbers used on
+        # test/walk-in sales). shop_contact is always skipped as well.
+        "wa_skip_numbers": "03219637000",
     }
     for key, value in defaults.items():
         c.execute(
@@ -231,6 +237,89 @@ def _ensure_columns(conn) -> None:
     """
     # No pending columns at this time.
     pass
+
+
+# ── Views ─────────────────────────────────────────────────────────────────────
+
+def _iso_expr(col: str) -> str:
+    """SQL expression converting a DD/MM/YYYY column to YYYY-MM-DD (pass-through
+    if the value is already ISO)."""
+    return (
+        f"CASE WHEN substr({col},3,1)='/' "
+        f"THEN substr({col},7,4)||'-'||substr({col},4,2)||'-'||substr({col},1,2) "
+        f"ELSE {col} END"
+    )
+
+
+def _create_views(conn) -> None:
+    """
+    Recreated on every startup so the definition in this file is always the one
+    in the database — no migration needed to change a view.
+
+    bank_movements — THE single definition of "money moving through a bank
+    account". One row per movement, signed via money_in / money_out. Every
+    bank balance, ledger and report must read this view instead of re-listing
+    the underlying tables. The three physical sources are:
+
+      1. sale_vouchers.bank_amount        (bank / split sales)
+      2. bank_transactions CP / CR        (cash transfers, bank expenses,
+                                           bank-paid cash purchases)
+      3. journal_voucher_lines 'bank'     (JV double-entry: Dr = in, Cr = out)
+
+    A future feature that moves bank money must either write one of these
+    sources or be added HERE — never directly to a balance formula.
+    """
+    conn.execute("DROP VIEW IF EXISTS bank_movements")
+    conn.execute(f"""
+        CREATE VIEW bank_movements AS
+        SELECT
+            sv.bank_account_id                          AS bank_account_id,
+            sv.date                                     AS date,
+            {_iso_expr('sv.date')}                      AS date_iso,
+            sv.sv_number                                AS voucher_number,
+            'sale'                                      AS source,
+            'Sale — ' || COALESCE(c.name, sv.cash_customer_name, 'Customer')
+                                                        AS description,
+            sv.bank_amount                              AS money_in,
+            0                                           AS money_out
+        FROM sale_vouchers sv
+        LEFT JOIN customers c ON c.id = sv.customer_id
+        WHERE sv.bank_account_id IS NOT NULL AND sv.bank_amount > 0
+
+        UNION ALL
+
+        SELECT
+            bt.bank_account_id,
+            bt.date,
+            {_iso_expr('bt.date')},
+            bt.voucher_number,
+            COALESCE(bt.source, 'cash_transfer'),
+            CASE
+                WHEN bt.notes IS NOT NULL AND TRIM(bt.notes) <> '' THEN bt.notes
+                WHEN COALESCE(bt.source,'cash_transfer') <> 'cash_transfer'
+                    THEN 'Journal Entry'
+                WHEN bt.type = 'CP' THEN 'Cash Deposit'
+                ELSE 'Cash Withdrawal'
+            END,
+            CASE WHEN bt.type = 'CP' THEN bt.amount ELSE 0 END,
+            CASE WHEN bt.type = 'CR' THEN bt.amount ELSE 0 END
+        FROM bank_transactions bt
+
+        UNION ALL
+
+        SELECT
+            jvl.party_id,
+            jv.date,
+            {_iso_expr('jv.date')},
+            jv.jv_number,
+            'jv',
+            COALESCE(jv.notes, 'Journal Entry'),
+            COALESCE(jvl.debit, 0),
+            COALESCE(jvl.credit, 0)
+        FROM journal_voucher_lines jvl
+        JOIN journal_vouchers jv ON jv.id = jvl.jv_id
+        WHERE jvl.party_type = 'bank'
+    """)
 
 
 # ── Versioned migration system ────────────────────────────────────────────────
@@ -1791,33 +1880,12 @@ def db_delete_bank_account(account_id: int) -> bool:
 
 
 def db_bank_total_balance() -> float:
-    """
-    Total bank balance:
-      opening balances
-    + bank portion of sales (bank_amount on sale_vouchers)
-    + CP bank transactions  (cash deposited into bank)
-    - CR bank transactions  (cash withdrawn from bank)
-    + JVL debit  (money IN via journal voucher)
-    - JVL credit (money OUT via journal voucher)
-    """
+    """Total bank balance = opening balances + net of the bank_movements view."""
     conn = get_connection()
     result = conn.execute("""
         SELECT
             COALESCE((SELECT SUM(opening_balance) FROM bank_accounts), 0)
-            + COALESCE((SELECT SUM(bank_amount) FROM sale_vouchers
-                        WHERE bank_account_id IS NOT NULL AND bank_amount > 0), 0)
-            + COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE type='CP'), 0)
-            - COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE type='CR'), 0)
-            + COALESCE((
-                SELECT SUM(jvl.debit)
-                FROM journal_voucher_lines jvl
-                WHERE jvl.party_type = 'bank'
-            ), 0)
-            - COALESCE((
-                SELECT SUM(jvl.credit)
-                FROM journal_voucher_lines jvl
-                WHERE jvl.party_type = 'bank'
-            ), 0)
+            + COALESCE((SELECT SUM(money_in - money_out) FROM bank_movements), 0)
     """).fetchone()[0]
     conn.close()
     return float(result or 0.0)
@@ -2377,37 +2445,18 @@ def _party_closing_balance(conn, party_type: str, party_id: int) -> float:
 
 
 def db_bank_account_closing_balance(account_id: int) -> float:
-    """Compute the current balance for a single bank account."""
+    """Current balance for one bank account, from the bank_movements view."""
     conn = get_connection()
     ba = conn.execute(
         "SELECT opening_balance FROM bank_accounts WHERE id=?", (account_id,)
     ).fetchone()
     ob = float(ba["opening_balance"] or 0) if ba else 0.0
-    sales = conn.execute(
-        "SELECT COALESCE(SUM(bank_amount), 0) FROM sale_vouchers "
-        "WHERE bank_account_id=? AND bank_amount > 0",
-        (account_id,)
-    ).fetchone()[0]
-    cp = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM bank_transactions "
-        "WHERE bank_account_id=? AND type='CP'",
-        (account_id,)
-    ).fetchone()[0]
-    cr = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM bank_transactions "
-        "WHERE bank_account_id=? AND type='CR'",
-        (account_id,)
-    ).fetchone()[0]
-    jvl_dr = conn.execute(
-        "SELECT COALESCE(SUM(debit),0) FROM journal_voucher_lines "
-        "WHERE party_type='bank' AND party_id=?", (account_id,)
-    ).fetchone()[0]
-    jvl_cr = conn.execute(
-        "SELECT COALESCE(SUM(credit),0) FROM journal_voucher_lines "
-        "WHERE party_type='bank' AND party_id=?", (account_id,)
+    net = conn.execute(
+        "SELECT COALESCE(SUM(money_in - money_out), 0) FROM bank_movements "
+        "WHERE bank_account_id=?", (account_id,)
     ).fetchone()[0]
     conn.close()
-    return ob + float(sales) + float(cp) - float(cr) + float(jvl_dr) - float(jvl_cr)
+    return ob + float(net)
 
 
 def db_year_end_summary(year_start_iso: str, year_end_iso: str) -> dict:
